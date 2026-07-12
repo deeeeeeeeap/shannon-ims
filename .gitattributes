@@ -1,0 +1,14 @@
+* text=auto
+*.go text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+
+# Preserve vendored SIP torture fixtures byte-for-byte and ignore upstream
+# whitespace conventions in the vendored module.
+third_party/sipgo/** -whitespace
+third_party/sipgo/sip/testdata/** -text -whitespace

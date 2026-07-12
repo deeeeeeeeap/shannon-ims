@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/vohive
+CONFIG=/etc/vohive/config.yaml
+WORKDIR=/var/lib/vohive
+
+start_service() {
+	mkdir -p "$WORKDIR/data" "$WORKDIR/logs"
+
+	procd_open_instance
+	procd_set_param command "$PROG" -c "$CONFIG"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONFIG"
+	procd_set_param limits core="0"
+	procd_set_param env HOME="$WORKDIR"
+	procd_set_param cwd "$WORKDIR"
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger vohive
+}

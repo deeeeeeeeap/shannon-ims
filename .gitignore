@@ -1,0 +1,114 @@
+# 构建产物
+/vo-hive
+/mbimprobe
+/vohive
+/vohive-relay
+/udprelaytest
+/udprelayunit
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+
+# 数据和日志目录
+/data/
+/logs/
+*.db
+*.db-journal
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.trace
+*.dump
+*.pcap
+*.pcapng
+*.har
+
+# 前端构建产物 (由 npm run build 生成)
+/web/dist/
+/web/node_modules/
+/web-reader/dist/
+/web-reader/node_modules/
+/internal/web/dist/
+/dist/*
+/vowifi-go/cacertsloadtest
+/vowifi-go/pcscfloopback
+/vowifi-go/spike/
+
+# IDE 和编辑器
+.idea/
+.vscode/
+.agent/
+.shared/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 配置文件 (包含敏感信息)
+/config/config.yaml
+/config/*.yaml
+!config/config.example.yaml
+
+# 测试覆盖率
+coverage.out
+*.cover
+*.coverprofile
+
+# 临时文件
+*.tmp
+*.temp
+.cache/
+/server
+/reader
+vohive.code-workspace
+PushNotification.pdf
+Quectel_LTE_Standard_UAC_应用指导_V1.0.pdf
+go.work
+go.work.sum
+
+# macOS AppleDouble metadata
+**/._*
+.superpowers/*
+docs/vohive-forum-tutorial-short.md
+docs/vohive-forum-tutorial.md
+.codex/
+docs/*
+web/tests
+.worktrees/
+Quectel_EC2xEG2xEG9xEM05_Series_AT_Commands_Manual_V2.2.pdf
+Quectel_EC2xEG2xEG9xEM05_Series_QCFG_AT_Commands_Manual_V1.6.pdf
+410sim自动激活脚本/*
+
+# StrongSwan 源码和补丁 (大型第三方文件)
+/strongswan-5.9.1/
+/strongswan_*.tar.*
+/strongswan_*.dsc
+
+# 凭据和本地环境文件
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileconfig
+*.kdbx
+/secrets/
+/credentials/
+/scripts/sync-vowifi-go.sh
+
+# 旧版容器构建文件依赖外部私有目录，不纳入本发行仓库
+/Dockerfile
+/Dockerfile.github
+/docker-compose.yml
+/docker-compose.hub.yml
+/DOCKERHUB.md
+/.dockerignore

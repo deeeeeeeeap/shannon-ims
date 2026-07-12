@@ -1,0 +1,3176 @@
+openapi: 3.0.3
+info:
+  title: VoHive Main API
+  version: 1.0.0-main
+  description: |
+    VoHive 主服务控制面 API。
+    - 服务器前缀：`/api`
+    - 登录方式：`POST /auth/login`
+    - 受保护接口统一使用 `Authorization: Bearer <token>`
+    - 文档页面：`GET /docs`
+servers:
+  - url: /api
+    description: VoHive main API prefix
+security:
+  - BearerAuth: []
+tags:
+  - name: auth
+    description: 登录、会话与 IP 轮换
+  - name: dashboard
+    description: 仪表盘与全局状态
+  - name: sms
+    description: 短信收发与会话
+  - name: settings
+    description: 系统信息、密码与通知设置
+  - name: devices
+    description: 设备配置、控制与运维
+  - name: proxy-instances
+    description: 本地代理实例管理
+  - name: upstream-proxies
+    description: 前置代理与国家规则
+  - name: esim
+    description: eSIM 与 eUICC 管理
+  - name: vowifi
+    description: VoWiFi 控制
+  - name: logs
+    description: 日志历史与实时流
+paths:
+  /docs:
+    get:
+      tags: [settings]
+      summary: Swagger UI 文档页
+      description: |
+        公开可访问的文档壳页面。
+        页面本身不要求 Bearer 鉴权，但会在浏览器内读取 `localStorage.token`，
+        再用 Bearer 方式请求 `/openapi.json` 并给 Try it out 自动注入认证头。
+      security: []
+      responses:
+        '200':
+          description: HTML 页面
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /openapi.yaml:
+    get:
+      tags: [settings]
+      summary: 获取 OpenAPI YAML
+      responses:
+        '200':
+          description: OpenAPI YAML 文档
+          content:
+            application/yaml:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /openapi.json:
+    get:
+      tags: [settings]
+      summary: 获取 OpenAPI JSON
+      responses:
+        '200':
+          description: OpenAPI JSON 文档
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: 登录
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /rotateip:
+    post:
+      tags: [auth]
+      summary: 执行公网 IP 轮换
+      description: |
+        支持两种鉴权方式：
+        1. Bearer token
+        2. 请求体或表单里的 `username/password`
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RotateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/RotateRequest'
+      parameters:
+        - in: query
+          name: device_id
+          schema:
+            type: string
+          description: 优先级高于请求体中的 device_id
+      responses:
+        '200':
+          description: 轮换结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /dashboard/devices:
+    get:
+      tags: [dashboard]
+      summary: 仪表盘设备概览
+      responses:
+        '200':
+          description: 设备卡片列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DashboardDevice'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /devices/{device_id}/status:
+    get:
+      tags: [dashboard]
+      summary: 单设备详细状态
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 详细状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceStatusDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /health:
+    get:
+      tags: [dashboard]
+      summary: 服务健康检查
+      responses:
+        '200':
+          description: 所有设备健康
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: 至少一个设备不健康
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /traffic/analysis:
+    get:
+      tags: [dashboard]
+      summary: 流量统计分析
+      parameters:
+        - in: query
+          name: range
+          schema:
+            type: string
+            enum: [hour, day, week, month]
+            default: day
+        - in: query
+          name: device_id
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 聚合流量与图表数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficAnalysisResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /sms/send:
+    post:
+      tags: [sms]
+      summary: 发送短信
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SMSSendRequest'
+      responses:
+        '200':
+          description: 发送成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMSSendResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /sms/delivery/{message_id}:
+    get:
+      tags: [sms]
+      summary: 查询短信投递状态
+      parameters:
+        - in: path
+          name: message_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 投递状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMSDeliveryResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /sms/contacts:
+    get:
+      tags: [sms]
+      summary: 短信联系人会话列表
+      parameters:
+        - in: query
+          name: device_id
+          schema:
+            type: string
+        - in: query
+          name: imsi
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+        - in: query
+          name: before_ts
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: before_peer
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 联系人列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SMSContact'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /sms/thread:
+    get:
+      tags: [sms]
+      summary: 获取与指定对端的短信会话
+      parameters:
+        - in: query
+          name: device_id
+          schema:
+            type: string
+        - in: query
+          name: imsi
+          schema:
+            type: string
+        - in: query
+          name: peer
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+        - in: query
+          name: before_ts
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: before_id
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 短信会话消息列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SMSMessage'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+    delete:
+      tags: [sms]
+      summary: 永久删除指定短信会话历史
+      description: 仅删除短信中心历史记录，不删除设备侧短信槽位
+      parameters:
+        - in: query
+          name: device_id
+          schema:
+            type: string
+        - in: query
+          name: imsi
+          schema:
+            type: string
+        - in: query
+          name: peer
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  deleted:
+                    type: integer
+                  imsi:
+                    type: string
+                  peer:
+                    type: string
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /sms/messages/{id}:
+    delete:
+      tags: [sms]
+      summary: 永久删除单条短信历史
+      description: 仅删除短信中心历史记录，不删除设备侧短信槽位
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  thread_empty:
+                    type: boolean
+                  imsi:
+                    type: string
+                  peer:
+                    type: string
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /settings/notifications:
+    get:
+      tags: [settings]
+      summary: 获取通知设置
+      responses:
+        '200':
+          description: 当前通知配置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationSettings'
+    put:
+      tags: [settings]
+      summary: 保存通知设置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNotificationSettingsRequest'
+      responses:
+        '200':
+          description: 保存结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppliedResult'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /settings/notifications/webhook/test:
+    post:
+      tags: [settings]
+      summary: 使用当前 Webhook 配置发送测试通知（不落盘）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestWebhookRequest'
+      responses:
+        '200':
+          description: 测试发送结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestWebhookResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /settings/notifications/weixin/qr/start:
+    post:
+      tags: [settings]
+      summary: 开始微信二维码登录会话
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartWeixinQRRequest'
+      responses:
+        '200':
+          description: 二维码会话已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WeixinQRStartResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '502':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /settings/notifications/weixin/qr/status:
+    get:
+      tags: [settings]
+      summary: 查询微信二维码会话状态
+      parameters:
+        - in: query
+          name: session_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 二维码状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WeixinQRStatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /settings/notifications/weixin/qr/cancel:
+    post:
+      tags: [settings]
+      summary: 取消微信二维码会话
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelWeixinQRRequest'
+      responses:
+        '200':
+          description: 已取消
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /settings/password:
+    post:
+      tags: [settings]
+      summary: 修改登录密码
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /system/info:
+    get:
+      tags: [settings]
+      summary: 获取系统信息与文档入口
+      responses:
+        '200':
+          description: 系统信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemInfoResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /devices:
+    get:
+      tags: [devices]
+      summary: 设备管理列表
+      responses:
+        '200':
+          description: 设备管理页列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeviceMgmtListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [devices]
+      summary: 添加设备配置并尝试启动
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDeviceRequest'
+      responses:
+        '200':
+          description: 添加结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeApplyResult'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/discovered:
+    get:
+      tags: [devices]
+      summary: 发现可接管设备
+      parameters:
+        - in: query
+          name: with_imei
+          schema:
+            type: string
+            enum: ['0', '1']
+      responses:
+        '200':
+          description: 发现结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DiscoveredDevice'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /devices/{device_id}/overview:
+    get:
+      tags: [devices]
+      summary: 设备详情轻量总览
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 轻量总览
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeviceMgmtOverviewLiteItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /devices/{device_id}/config:
+    get:
+      tags: [devices]
+      summary: 获取单设备配置
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 配置详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config:
+                    $ref: '#/components/schemas/DeviceConfigDTO'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}:
+    put:
+      tags: [devices]
+      summary: 更新设备配置
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDeviceRequest'
+      responses:
+        '200':
+          description: 保存与运行时应用结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeApplyResult'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+    delete:
+      tags: [devices]
+      summary: 删除设备配置
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/actions/refresh:
+    post:
+      tags: [devices]
+      summary: 立即刷新设备底层状态缓存
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 刷新完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/actions/reboot:
+    post:
+      tags: [devices]
+      summary: 重启模组
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 指令已发送
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RebootResponse'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/actions/at:
+    post:
+      tags: [devices]
+      summary: 执行 AT 命令
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteATRequest'
+      responses:
+        '200':
+          description: 执行结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteATResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/actions/ussd:
+    post:
+      tags: [devices]
+      summary: 执行 USSD 指令
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteUSSDRequest'
+      responses:
+        '200':
+          description: USSD 返回结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteUSSDResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/usbnet-mode:
+    patch:
+      tags: [devices]
+      summary: 设置 Quectel USBNET 模式
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetUSBNetModeRequest'
+      responses:
+        '200':
+          description: 指令已发送
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/flight-mode:
+    patch:
+      tags: [devices]
+      summary: 切换飞行模式
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetFlightModeRequest'
+      responses:
+        '200':
+          description: 切换结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightModeResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/network:
+    patch:
+      tags: [devices]
+      summary: 设置 QMI 数据网络启停状态
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnabledStateRequest'
+      responses:
+        '200':
+          description: 网络状态已更新
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetworkActionResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/actions/rescan:
+    post:
+      tags: [devices]
+      summary: 重新扫描并重连设备
+      responses:
+        '200':
+          description: 扫描完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /proxy-instances/overview:
+    get:
+      tags: [proxy-instances]
+      summary: 获取代理实例概览
+      responses:
+        '200':
+          description: 代理概览、设备列表与运行状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxyOverviewResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /proxy-instances/config:
+    put:
+      tags: [proxy-instances]
+      summary: 保存代理实例配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProxyConfigRequest'
+      responses:
+        '200':
+          description: 保存结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppliedResult'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /proxy-instances/{instance_id}:
+    get:
+      tags: [proxy-instances]
+      summary: 获取单个代理实例
+      parameters:
+        - $ref: '#/components/parameters/InstanceIDPath'
+      responses:
+        '200':
+          description: 代理实例配置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxyInstanceDTO'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /proxy-instances/{instance_id}/actions/start:
+    post:
+      tags: [proxy-instances]
+      summary: 启动代理实例
+      parameters:
+        - $ref: '#/components/parameters/InstanceIDPath'
+      responses:
+        '200':
+          description: 已启动
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /proxy-instances/{instance_id}/actions/stop:
+    post:
+      tags: [proxy-instances]
+      summary: 停止代理实例
+      parameters:
+        - $ref: '#/components/parameters/InstanceIDPath'
+      responses:
+        '200':
+          description: 已停止
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /proxy-instances/{instance_id}/actions/restart:
+    post:
+      tags: [proxy-instances]
+      summary: 重启代理实例
+      parameters:
+        - $ref: '#/components/parameters/InstanceIDPath'
+      responses:
+        '200':
+          description: 已重启
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /upstream-proxies:
+    get:
+      tags: [upstream-proxies]
+      summary: 列出前置代理
+      responses:
+        '200':
+          description: 前置代理列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UpstreamProxy'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+    post:
+      tags: [upstream-proxies]
+      summary: 新增前置代理并即时探测
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpstreamProxy'
+      responses:
+        '200':
+          description: 保存并探测成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxySaveResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '502':
+          description: 探测失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxySaveResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /upstream-proxies/{proxy_id}:
+    put:
+      tags: [upstream-proxies]
+      summary: 更新前置代理并即时探测
+      parameters:
+        - $ref: '#/components/parameters/UpstreamProxyIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpstreamProxy'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxySaveResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '502':
+          description: 探测失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxySaveResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+    delete:
+      tags: [upstream-proxies]
+      summary: 删除前置代理
+      parameters:
+        - $ref: '#/components/parameters/UpstreamProxyIDPath'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /upstream-proxies/{proxy_id}/actions/probe:
+    post:
+      tags: [upstream-proxies]
+      summary: 手动探测前置代理能力
+      parameters:
+        - $ref: '#/components/parameters/UpstreamProxyIDPath'
+      responses:
+        '200':
+          description: 探测成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxySaveResponse'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '502':
+          description: 探测失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxySaveResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /upstream-proxy-countries:
+    get:
+      tags: [upstream-proxies]
+      summary: 列出 MCC/MNC 表中的国家分组
+      responses:
+        '200':
+          description: 国家分组列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UpstreamProxyCountry'
+        '503':
+          description: MCC/MNC 表不可用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /upstream-proxy-country-rules:
+    get:
+      tags: [upstream-proxies]
+      summary: 列出国家前置代理规则
+      responses:
+        '200':
+          description: 国家规则列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UpstreamProxyCountryRule'
+
+  /upstream-proxy-country-rules/{country_code}:
+    put:
+      tags: [upstream-proxies]
+      summary: 新增或更新国家前置代理规则
+      parameters:
+        - $ref: '#/components/parameters/CountryCodePath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpstreamProxyCountryRuleRequest'
+      responses:
+        '200':
+          description: 国家规则
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamProxyCountryRule'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+        '503':
+          description: MCC/MNC 表不可用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [upstream-proxies]
+      summary: 删除国家前置代理规则
+      parameters:
+        - $ref: '#/components/parameters/CountryCodePath'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim:
+    get:
+      tags: [esim]
+      summary: 获取 eSIM 总览
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: eSIM 总览
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EsimOverviewResponse'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/profiles:
+    get:
+      tags: [esim]
+      summary: 获取设备 eSIM Profiles
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: Profile 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EsimProfile'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/notifications:
+    get:
+      tags: [esim]
+      summary: 获取当前 eSIM 通知列表
+      description: |
+        返回当前 eUICC 仍保留的通知列表，仅表示当前可见状态，不承诺完整历史审计。
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - in: query
+          name: aid_hex
+          schema:
+            type: string
+          description: 可选的目标 eUICC AID，缺省时使用默认 ISD-R AID。
+      responses:
+        '200':
+          description: 当前通知列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EsimNotificationListResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/notifications/{sequence}/actions/retry:
+    post:
+      tags: [esim]
+      summary: 重试发送当前 eSIM 通知
+      description: |
+        对当前仍可 retrieve 的 pending notification 执行一次手动重试发送。
+        成功只表示本次重试发送已提交；该接口不提供通知历史审计。
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - in: path
+          name: sequence
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: 通知序号。
+        - in: query
+          name: aid_hex
+          schema:
+            type: string
+          description: 可选的目标 eUICC AID，缺省时使用默认 ISD-R AID。
+      responses:
+        '200':
+          description: 通知重试发送成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/actions/switch:
+    post:
+      tags: [esim]
+      summary: 切换 eSIM Profile
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EsimSwitchRequest'
+      responses:
+        '200':
+          description: 切换已提交
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EsimSwitchResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/eids:
+    get:
+      tags: [esim]
+      summary: 获取设备 EID 列表
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: EID 列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EsimEIDsResponse'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/chip-info:
+    get:
+      tags: [esim]
+      summary: 获取 eUICC 芯片信息
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - in: query
+          name: refresh
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: 芯片信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EsimChipInfo'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/actions/download:
+    get:
+      tags: [esim]
+      summary: 下载 eSIM Profile（SSE）
+      description: |
+        返回 `text/event-stream`。
+        每条 `data` 负载格式为：
+        `{"step":"preflight|auth_client|auth_server|install|notify|done|error","msg":"...","pct":10}`
+        当最终 `step=done` 但通知未完全确认时，会额外附带 `warning` / `warning_code`。
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - in: query
+          name: smdp
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: matching_id
+          schema:
+            type: string
+        - in: query
+          name: confirmation_code
+          schema:
+            type: string
+        - in: query
+          name: aid_hex
+          schema:
+            type: string
+        - in: query
+          name: imei
+          schema:
+            type: string
+          description: 可选，下载 profile 时使用的 IMEI；为空则使用设备 IMEI
+      responses:
+        '200':
+          description: SSE 下载进度流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/esim/profiles/{iccid}:
+    patch:
+      tags: [esim]
+      summary: 重命名 eSIM Profile
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - $ref: '#/components/parameters/ICCIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EsimRenameProfileRequest'
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+    delete:
+      tags: [esim]
+      summary: 删除 eSIM Profile
+      description: |
+        删除指定的 eSIM Profile。
+        `200` 表示 Profile 删除成功；若删除通知未完全确认不会改变该状态码，响应体会附带 `warning` / `warning_code`。
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - $ref: '#/components/parameters/ICCIDPath'
+        - in: query
+          name: aid_hex
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StatusResponse'
+                  - type: object
+                    properties:
+                      warning:
+                        type: string
+                      warning_code:
+                        type: string
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/vowifi:
+    patch:
+      tags: [vowifi]
+      summary: 设置设备 VoWiFi 启停状态
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnabledStateRequest'
+      responses:
+        '200':
+          description: 设置成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceStatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /devices/{device_id}/vowifi/actions/reconnect:
+    post:
+      tags: [vowifi]
+      summary: 触发设备 VoWiFi 重连
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+      responses:
+        '200':
+          description: 已触发重连
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '404':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /logs/stream:
+    get:
+      tags: [logs]
+      summary: 实时日志 SSE 流
+      description: |
+        返回 `text/event-stream`。
+        - 初始化时会发送一次 `connected` 事件
+        - 后续事件名为 `log`
+        - `level` 过滤规则：`debug >= info >= warn >= error`
+      parameters:
+        - in: query
+          name: level
+          schema:
+            type: string
+            enum: [debug, info, warn, error]
+      responses:
+        '200':
+          description: SSE 日志流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /logs/history:
+    get:
+      tags: [logs]
+      summary: 获取历史日志
+      parameters:
+        - in: query
+          name: lines
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2000
+            default: 500
+      responses:
+        '200':
+          description: 历史日志列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogHistoryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: SessionToken
+
+  parameters:
+    DeviceIDPath:
+      in: path
+      name: device_id
+      required: true
+      schema:
+        type: string
+      description: 设备 ID
+    InstanceIDPath:
+      in: path
+      name: instance_id
+      required: true
+      schema:
+        type: string
+      description: 代理实例 ID
+    UpstreamProxyIDPath:
+      in: path
+      name: proxy_id
+      required: true
+      schema:
+        type: string
+      description: 前置代理 ID
+    CountryCodePath:
+      in: path
+      name: country_code
+      required: true
+      schema:
+        type: string
+        minLength: 2
+        maxLength: 2
+      description: ISO 3166-1 alpha-2 国家代码
+    ICCIDPath:
+      in: path
+      name: iccid
+      required: true
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: 未授权
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ErrorMessage:
+      description: 错误信息
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: error
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+        error:
+          type: string
+        warning:
+          type: string
+        result:
+          type: object
+          additionalProperties: true
+        busy:
+          type: boolean
+
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        message:
+          type: string
+        warning:
+          type: string
+
+    AppliedResult:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        applied:
+          type: boolean
+        warning:
+          type: string
+
+    MessageOnlyResponse:
+      type: object
+      properties:
+        message:
+          type: string
+
+    DocsLinks:
+      type: object
+      properties:
+        swagger_ui:
+          type: string
+          example: /api/docs
+        openapi_yaml:
+          type: string
+          example: /api/openapi.yaml
+        openapi_json:
+          type: string
+          example: /api/openapi.json
+
+    SystemInfoResponse:
+      type: object
+      properties:
+        version:
+          type: string
+        build_time:
+          type: string
+        config:
+          type: string
+        docs:
+          $ref: '#/components/schemas/DocsLinks'
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+
+    LoginResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+
+    RotateRequest:
+      type: object
+      properties:
+        device_id:
+          type: string
+        device:
+          type: string
+        username:
+          type: string
+        password:
+          type: string
+
+    RotateResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        device:
+          type: string
+        old_ip:
+          type: string
+        new_ip:
+          type: string
+        duration:
+          type: string
+
+    StringMap:
+      type: object
+      additionalProperties:
+        type: string
+
+    Int64Map:
+      type: object
+      additionalProperties:
+        type: integer
+        format: int64
+
+    TrafficMeta:
+      type: object
+      properties:
+        interface:
+          type: string
+        period_start:
+          type: string
+          format: date-time
+        age_seconds:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [ok, waiting_sample, stale]
+
+    RealtimeTrafficSnapshot:
+      type: object
+      properties:
+        device_id:
+          type: string
+        interface:
+          type: string
+        source:
+          type: string
+          enum: [qmi_wds]
+        timestamp:
+          type: string
+          format: date-time
+        interval_ms:
+          type: integer
+          format: int64
+        rx_bps:
+          type: integer
+          format: int64
+        tx_bps:
+          type: integer
+          format: int64
+        rx_delta_bytes:
+          type: integer
+          format: int64
+        tx_delta_bytes:
+          type: integer
+          format: int64
+        total_rx_bytes:
+          type: integer
+          format: int64
+        total_tx_bytes:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [ok, waiting_sample, reset, error]
+        error:
+          type: string
+
+    UnknownObject:
+      type: object
+      additionalProperties: true
+
+    VoWiFiRuntime:
+      type: object
+      properties:
+        device_id:
+          type: string
+        dataplane_mode:
+          type: string
+        sim_ready:
+          type: boolean
+        access_ready:
+          type: boolean
+        tunnel_ready:
+          type: boolean
+        ims_ready:
+          type: boolean
+        sms_ready:
+          type: boolean
+        reg_status:
+          type: integer
+        reg_status_text:
+          type: string
+        network_mode:
+          type: string
+        last_error_class:
+          type: string
+        last_error:
+          type: string
+        last_reason:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+
+    PNNRecord:
+      type: object
+      properties:
+        record:
+          type: integer
+        full_name:
+          type: string
+        short_name:
+          type: string
+        raw_hex:
+          type: string
+
+    OPLRecord:
+      type: object
+      properties:
+        record:
+          type: integer
+        plmn:
+          type: string
+        lac_start:
+          type: integer
+        lac_end:
+          type: integer
+        pnn_record:
+          type: integer
+        raw_hex:
+          type: string
+
+    SIMServiceTable:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [UST, SST]
+        raw_hex:
+          type: string
+        enabled_services:
+          type: array
+          items:
+            type: integer
+
+    ModemStatus:
+      type: object
+      properties:
+        imei:
+          type: string
+        firmware:
+          type: string
+        iccid:
+          type: string
+        imsi:
+          type: string
+        native_spn:
+          type: string
+          description: SIM EF_SPN 解码得到的原始服务提供商名称，区别于当前驻网 operator。
+        native_mcc:
+          type: string
+          description: SIM EF_AD/EF_IMSI 推导得到的原生 MCC，区别于当前驻网 MCC。
+        native_mnc:
+          type: string
+          description: SIM EF_AD/EF_IMSI 推导得到的原生 MNC，区别于当前驻网 MNC。
+        gid1:
+          type: string
+          description: SIM EF_GID1 原始十六进制内容。
+        gid2:
+          type: string
+          description: SIM EF_GID2 原始十六进制内容。
+        pnn:
+          type: array
+          items:
+            $ref: '#/components/schemas/PNNRecord'
+        opl:
+          type: array
+          items:
+            $ref: '#/components/schemas/OPLRecord'
+        sim_service_table:
+          $ref: '#/components/schemas/SIMServiceTable'
+        operator:
+          type: string
+        sim_inserted:
+          type: boolean
+        signal_dbm:
+          type: integer
+        signal_rsrp:
+          type: integer
+        signal_rsrq:
+          type: integer
+        signal_sinr:
+          type: integer
+          description: LTE SINR/RSSNR。
+        nr5g_signal_sinr:
+          type: integer
+          description: NR5G SINR。
+        radio_band:
+          type: string
+          description: 当前服务小区/无线接口的频段信息。
+        radio_channel:
+          type: integer
+          format: uint32
+          description: 当前服务小区/无线接口的 EARFCN/ARFCN/channel。
+        reg_status:
+          type: integer
+        reg_status_text:
+          type: string
+        lac:
+          type: string
+        cell_id:
+          type: string
+        apn:
+          type: string
+        ims_status:
+          type: integer
+        network_mode:
+          type: string
+        usbnet_mode:
+          type: integer
+        operating_mode:
+          type: integer
+          nullable: true
+
+    DashboardDevice:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        interface:
+          type: string
+        proxy_port:
+          type: integer
+        public_ip:
+          type: string
+        healthy:
+          type: boolean
+        operator:
+          type: string
+        signal_dbm:
+          type: integer
+        network_mode:
+          type: string
+        vowifi_active:
+          type: boolean
+        vowifi_runtime:
+          $ref: '#/components/schemas/VoWiFiRuntime'
+        traffic:
+          $ref: '#/components/schemas/StringMap'
+        network_connected:
+          type: boolean
+
+    DeviceStatusDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        imei:
+          type: string
+        firmware:
+          type: string
+        iccid:
+          type: string
+        imsi:
+          type: string
+        native_spn:
+          type: string
+          description: SIM EF_SPN 解码得到的原始服务提供商名称，区别于当前驻网 operator。
+        native_mcc:
+          type: string
+          description: SIM EF_AD/EF_IMSI 推导得到的原生 MCC，区别于当前驻网 MCC。
+        native_mnc:
+          type: string
+          description: SIM EF_AD/EF_IMSI 推导得到的原生 MNC，区别于当前驻网 MNC。
+        gid1:
+          type: string
+          description: SIM EF_GID1 原始十六进制内容。
+        gid2:
+          type: string
+          description: SIM EF_GID2 原始十六进制内容。
+        pnn:
+          type: array
+          items:
+            $ref: '#/components/schemas/PNNRecord'
+        opl:
+          type: array
+          items:
+            $ref: '#/components/schemas/OPLRecord'
+        sim_service_table:
+          $ref: '#/components/schemas/SIMServiceTable'
+        operator:
+          type: string
+        sim_inserted:
+          type: boolean
+        signal_dbm:
+          type: integer
+        signal_rsrp:
+          type: integer
+        signal_rsrq:
+          type: integer
+        signal_sinr:
+          type: integer
+          description: LTE SINR/RSSNR。
+        nr5g_signal_sinr:
+          type: integer
+          description: NR5G SINR。
+        radio_band:
+          type: string
+          description: 当前服务小区/无线接口的频段信息。
+        radio_channel:
+          type: integer
+          format: uint32
+          description: 当前服务小区/无线接口的 EARFCN/ARFCN/channel。
+        reg_status:
+          type: integer
+        reg_status_text:
+          type: string
+        lac:
+          type: string
+        cell_id:
+          type: string
+        apn:
+          type: string
+        ims_status:
+          type: integer
+        public_ip:
+          type: string
+        interface:
+          type: string
+        proxy_port:
+          type: integer
+        healthy:
+          type: boolean
+        network_connected:
+          type: boolean
+        traffic:
+          $ref: '#/components/schemas/StringMap'
+        vowifi:
+          $ref: '#/components/schemas/UnknownObject'
+
+    HealthDevice:
+      type: object
+      properties:
+        healthy:
+          type: boolean
+        modem_ok:
+          type: boolean
+        iface_up:
+          type: boolean
+        network_connected:
+          type: boolean
+        signal:
+          type: integer
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: healthy
+        devices:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/HealthDevice'
+
+    TrafficAnalysisResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        range:
+          type: string
+        buckets:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        chart:
+          type: object
+          additionalProperties: true
+
+    SMSSendRequest:
+      type: object
+      required: [phone, message]
+      properties:
+        device_id:
+          type: string
+        imsi:
+          type: string
+        phone:
+          type: string
+        message:
+          type: string
+
+    SMSSendResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        device:
+          type: string
+        phone:
+          type: string
+        message_id:
+          type: string
+        parts_total:
+          type: integer
+        delivery_state:
+          type: string
+
+    SMSDeliveryResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        delivery:
+          type: object
+          additionalProperties: true
+
+    SMSMessage:
+      type: object
+      properties:
+        id:
+          type: integer
+        imsi:
+          type: string
+        peer:
+          type: string
+        local_phone:
+          type: string
+        sender:
+          type: string
+        recipient:
+          type: string
+        content:
+          type: string
+        type:
+          type: integer
+        status:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        device_name:
+          type: string
+
+    SMSContact:
+      type: object
+      properties:
+        imsi:
+          type: string
+        peer:
+          type: string
+        last_sms_id:
+          type: integer
+        last_timestamp:
+          type: string
+          format: date-time
+        last_content:
+          type: string
+        last_type:
+          type: integer
+        unread_count:
+          type: integer
+        device_id:
+          type: string
+        device_name:
+          type: string
+        local_phone:
+          type: string
+
+    TelegramSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        bot_token:
+          type: string
+        chat_id:
+          type: integer
+          format: int64
+        admin_id:
+          type: integer
+          format: int64
+        base_url:
+          type: string
+        proxy:
+          type: string
+
+    FeishuSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        app_id:
+          type: string
+        app_secret:
+          type: string
+        chat_ids:
+          type: array
+          items:
+            type: string
+
+    QQSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        app_id:
+          type: string
+        app_secret:
+          type: string
+        group_ids:
+          type: string
+        direct_ids:
+          type: string
+
+    WebhookSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        urls:
+          type: array
+          items:
+            type: string
+        secret:
+          type: string
+        timeout_ms:
+          type: integer
+        retry_max:
+          type: integer
+        text_template:
+          type: string
+
+    WeixinSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        base_url:
+          type: string
+        allowed_user_ids:
+          type: array
+          items:
+            type: string
+
+    NotificationSettings:
+      type: object
+      properties:
+        telegram:
+          $ref: '#/components/schemas/TelegramSettings'
+        feishu:
+          $ref: '#/components/schemas/FeishuSettings'
+        qq:
+          $ref: '#/components/schemas/QQSettings'
+        webhook:
+          $ref: '#/components/schemas/WebhookSettings'
+        weixin:
+          $ref: '#/components/schemas/WeixinSettings'
+
+    UpdateNotificationSettingsRequest:
+      allOf:
+        - $ref: '#/components/schemas/NotificationSettings'
+
+    TestWebhookRequest:
+      type: object
+      required: [enabled, urls, timeout_ms, retry_max]
+      properties:
+        enabled:
+          type: boolean
+        urls:
+          type: array
+          items:
+            type: string
+        secret:
+          type: string
+        timeout_ms:
+          type: integer
+        retry_max:
+          type: integer
+        text_template:
+          type: string
+
+    TestWebhookResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        failed_urls:
+          type: array
+          items:
+            type: string
+
+    StartWeixinQRRequest:
+      type: object
+      properties:
+        base_url:
+          type: string
+
+    CancelWeixinQRRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: string
+
+    WeixinQRStartResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        qr_token:
+          type: string
+        qr_url:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [wait, scaned, confirmed, expired, error]
+
+    WeixinQRStatusResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+          enum: [wait, scaned, confirmed, expired, error]
+        qr_url:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        applied:
+          type: boolean
+        apply_warning:
+          type: string
+        error:
+          type: string
+        bot_account_id:
+          type: string
+        bot_user_id:
+          type: string
+        base_url:
+          type: string
+
+    ChangePasswordRequest:
+      type: object
+      required: [old_password, new_password, confirm_password]
+      properties:
+        old_password:
+          type: string
+        new_password:
+          type: string
+        confirm_password:
+          type: string
+
+    DeviceConfigDTO:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        modem_imei:
+          type: string
+        usb_path:
+          type: string
+        at_port:
+          type: string
+        proxy_port:
+          type: integer
+        interface:
+          type: string
+        control_device:
+          type: string
+        qmi_use_proxy:
+          type: boolean
+        qmi_proxy_path:
+          type: string
+        qmi_proxy_executable:
+          type: string
+        esim_transport:
+          type: string
+          enum: [at, qmi]
+        baud_rate:
+          type: integer
+        data_bits:
+          type: integer
+        stop_bits:
+          type: integer
+        parity:
+          type: string
+        sms_enabled:
+          type: boolean
+        apn:
+          type: string
+        network_enabled:
+          type: boolean
+        vowifi_enabled:
+          type: boolean
+        device_backend:
+          type: string
+          enum: [at, qmi]
+
+    DeviceMgmtListModem:
+      type: object
+      properties:
+        operator:
+          type: string
+        native_spn:
+          type: string
+          description: SIM EF_SPN 解码得到的原始服务提供商名称，区别于当前驻网 operator。
+        native_mcc:
+          type: string
+          description: SIM EF_AD/EF_IMSI 推导得到的原生 MCC，区别于当前驻网 MCC。
+        native_mnc:
+          type: string
+          description: SIM EF_AD/EF_IMSI 推导得到的原生 MNC，区别于当前驻网 MNC。
+        network_mode:
+          type: string
+        network_duplex:
+          type: string
+        radio_band:
+          type: string
+        radio_channel:
+          type: integer
+          format: uint32
+        signal_dbm:
+          type: integer
+        signal_sinr:
+          type: integer
+        imei:
+          type: string
+        iccid:
+          type: string
+
+    DeviceMgmtListItem:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        running:
+          type: boolean
+        healthy:
+          type: boolean
+        control_online:
+          type: boolean
+        public_ip:
+          type: string
+        interface:
+          type: string
+        esim_transport:
+          type: string
+        sms_enabled:
+          type: boolean
+        network_enabled:
+          type: boolean
+        vowifi_enabled:
+          type: boolean
+        vowifi_runtime:
+          $ref: '#/components/schemas/VoWiFiRuntime'
+        modem:
+          $ref: '#/components/schemas/DeviceMgmtListModem'
+        network_connected:
+          type: boolean
+        registration_state_label:
+          type: string
+          enum: [registered, searching, denied, unknown]
+
+    DeviceMgmtOverviewLiteItem:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        running:
+          type: boolean
+        healthy:
+          type: boolean
+        control_online:
+          type: boolean
+        private_ip:
+          type: string
+        public_ip:
+          type: string
+        interface:
+          type: string
+        control_device:
+          type: string
+        esim_transport:
+          type: string
+        at_port:
+          type: string
+        audio_device:
+          type: string
+        sms_enabled:
+          type: boolean
+        network_enabled:
+          type: boolean
+        vowifi_enabled:
+          type: boolean
+        vowifi_active:
+          type: boolean
+        vowifi_runtime:
+          $ref: '#/components/schemas/VoWiFiRuntime'
+        radio_live_ok:
+          type: boolean
+          nullable: true
+        modem:
+          $ref: '#/components/schemas/ModemStatus'
+        traffic:
+          $ref: '#/components/schemas/StringMap'
+        traffic_raw:
+          $ref: '#/components/schemas/Int64Map'
+        traffic_meta:
+          $ref: '#/components/schemas/TrafficMeta'
+        backend_mode:
+          type: string
+        network_connected:
+          type: boolean
+        registration_state_label:
+          type: string
+          enum: [registered, searching, denied, unknown]
+
+    DiscoveredDevice:
+      type: object
+      properties:
+        discovery_key:
+          type: string
+        control_path:
+          type: string
+        net_interface:
+          type: string
+        usb_path:
+          type: string
+        imei:
+          type: string
+        vendor_id:
+          type: integer
+        product_id:
+          type: integer
+        driver_name:
+          type: string
+        at_ports:
+          type: array
+          items:
+            type: string
+        at_port:
+          type: string
+        audio_device:
+          type: string
+        mode:
+          type: string
+        network_capable:
+          type: boolean
+        configured:
+          type: boolean
+        configured_id:
+          type: string
+        usbnet_mode:
+          type: integer
+          nullable: true
+
+    UpdateDeviceRequest:
+      type: object
+      required: [config]
+      properties:
+        config:
+          $ref: '#/components/schemas/DeviceConfigDTO'
+
+    AddDeviceRequest:
+      type: object
+      required: [config]
+      properties:
+        config:
+          $ref: '#/components/schemas/DeviceConfigDTO'
+
+    RuntimeApplyResult:
+      type: object
+      properties:
+        status:
+          type: string
+        started:
+          type: boolean
+        requires_restart:
+          type: boolean
+        applied:
+          type: boolean
+        warning:
+          type: string
+        vowifi_error:
+          type: string
+
+    ExecuteATRequest:
+      type: object
+      required: [cmd]
+      properties:
+        cmd:
+          type: string
+        timeout_ms:
+          type: integer
+
+    ExecuteATResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        response:
+          type: string
+
+    ExecuteUSSDRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+        timeout_ms:
+          type: integer
+
+    ExecuteUSSDResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        result:
+          type: string
+
+    SetUSBNetModeRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: integer
+
+    SetFlightModeRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+
+    EnabledStateRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+
+    FlightModeResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        operating_mode:
+          type: integer
+        flight_mode:
+          type: boolean
+
+    RebootResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        response:
+          type: string
+
+    NetworkActionResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        device:
+          type: string
+        network_connected:
+          type: boolean
+        private_ip:
+          type: string
+        public_ip:
+          type: string
+
+    ProxyInstanceDTO:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        device_id:
+          type: string
+        enabled:
+          type: boolean
+        mode:
+          type: string
+          enum: [socks5, http]
+        listen_addr:
+          type: string
+        listen_port:
+          type: integer
+        auth_enabled:
+          type: boolean
+        username:
+          type: string
+        password:
+          type: string
+
+    ProxyDeviceDTO:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        interface:
+          type: string
+
+    ProxyInstanceStatus:
+      type: object
+      properties:
+        id:
+          type: string
+        mode:
+          type: string
+        running:
+          type: boolean
+        started_at:
+          type: string
+          format: date-time
+        last_exit_at:
+          type: string
+          format: date-time
+        last_exit_ok:
+          type: boolean
+        last_error:
+          type: string
+        listen_addr:
+          type: string
+        listen_port:
+          type: integer
+        interface:
+          type: string
+        auth_enabled:
+          type: boolean
+
+    ProxyOverviewResponse:
+      type: object
+      properties:
+        instances:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyInstanceDTO'
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyDeviceDTO'
+        status:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyInstanceStatus'
+
+    ProxyConfigRequest:
+      type: object
+      properties:
+        instances:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyInstanceDTO'
+
+    UpstreamProxy:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        addr:
+          type: string
+        username:
+          type: string
+        password:
+          type: string
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    UpstreamProxyCountry:
+      type: object
+      properties:
+        country_code:
+          type: string
+        country_name:
+          type: string
+        mccs:
+          type: array
+          items:
+            type: string
+
+    UpstreamProxyCountryRule:
+      type: object
+      properties:
+        country_code:
+          type: string
+        country_name:
+          type: string
+        mccs:
+          type: array
+          items:
+            type: string
+        upstream_proxy_id:
+          type: string
+        enabled:
+          type: boolean
+        updated_at:
+          type: string
+          format: date-time
+
+    UpstreamProxyCountryRuleRequest:
+      type: object
+      required: [upstream_proxy_id]
+      properties:
+        upstream_proxy_id:
+          type: string
+        enabled:
+          type: boolean
+
+    UpstreamProxyProbeResult:
+      type: object
+      properties:
+        proxy_addr:
+          type: string
+        stage:
+          type: string
+        reachable:
+          type: boolean
+        handshake_ok:
+          type: boolean
+        udp_associate_ok:
+          type: boolean
+        auth_method:
+          type: string
+        relay_addr:
+          type: string
+        duration_ms:
+          type: integer
+          format: int64
+        diagnosis:
+          type: string
+        hint:
+          type: string
+        error:
+          type: string
+
+    UpstreamProxySaveResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        result:
+          $ref: '#/components/schemas/UpstreamProxyProbeResult'
+
+    EsimProfile:
+      type: object
+      properties:
+        iccid:
+          type: string
+        name:
+          type: string
+        service_provider_name:
+          type: string
+        state:
+          type: integer
+        state_text:
+          type: string
+        class_text:
+          type: string
+
+    EsimNotificationItem:
+      type: object
+      properties:
+        sequence_number:
+          type: integer
+          format: int64
+        event:
+          type: string
+          description: install、enable、disable、delete 或 unknown。
+        iccid:
+          type: string
+        address:
+          type: string
+        aid_hex:
+          type: string
+        can_retry:
+          type: boolean
+
+    EsimNotificationListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EsimNotificationItem'
+
+    EsimSwitchRequest:
+      type: object
+      required: [iccid]
+      properties:
+        iccid:
+          type: string
+        aid_hex:
+          type: string
+
+    EsimSwitchResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        target_iccid:
+          type: string
+        switch_token:
+          type: integer
+          format: uint64
+        switch_phase:
+          type: string
+        switch_accepted:
+          type: boolean
+        recovery_pending:
+          type: boolean
+        degraded_reason:
+          type: string
+        post_switch_async:
+          type: boolean
+        cache_patched:
+          type: boolean
+        sim_reload_attempted:
+          type: boolean
+        sim_reload_ok:
+          type: boolean
+        sim_reload_warning:
+          type: string
+
+    EsimEIDsResponse:
+      type: object
+      properties:
+        eids:
+          type: array
+          items:
+            type: string
+
+    EsimEUICCInfo:
+      type: object
+      properties:
+        aid:
+          type: string
+        eid:
+          type: string
+        spec:
+          type: string
+          enum: [sgp22, sgp32, sgp02]
+        spec_guess:
+          type: string
+          enum: [unknown, sgp22_compatible, possible_sgp02, possible_sgp32]
+        spec_confidence:
+          type: string
+          enum: [unknown, inferred, verified]
+        free_nvram_bytes:
+          type: integer
+        free_nvram:
+          type: string
+        firmware:
+          type: string
+        manufacturer:
+          type: string
+        certificates:
+          type: array
+          items:
+            type: string
+        info_source:
+          type: string
+        info_version:
+          type: string
+        info_error:
+          type: string
+        sas_accreditation_number:
+          type: string
+        default_smdp_address:
+          type: string
+        root_ds_address:
+          type: string
+
+    EsimChipInfo:
+      type: object
+      properties:
+        eids:
+          type: array
+          items:
+            $ref: '#/components/schemas/EsimEUICCInfo'
+        sku_name:
+          type: string
+        serial_number:
+          type: string
+        firmware:
+          type: string
+
+    EsimEUICCProfiles:
+      type: object
+      properties:
+        eid:
+          type: string
+        aid_hex:
+          type: string
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/EsimProfile'
+
+    EsimOverviewResponse:
+      type: object
+      properties:
+        chip_info:
+          $ref: '#/components/schemas/EsimChipInfo'
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/EsimEUICCProfiles'
+
+    EsimRenameProfileRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        aid_hex:
+          type: string
+
+    DeviceStatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        device:
+          type: string
+
+    LogEntry:
+      type: object
+      properties:
+        time:
+          type: string
+        level:
+          type: string
+        caller:
+          type: string
+        message:
+          type: string
+        fields:
+          type: string
+
+    LogHistoryResponse:
+      type: object
+      properties:
+        logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogEntry'
+        error:
+          type: string

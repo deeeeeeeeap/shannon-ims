@@ -1,0 +1,231 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 修复 Tailwind preflight 对 button 背景的重置。
+   仅作用于“实心按钮”，避免把 plain/text/link 按钮误刷成色块。 */
+.el-button:not(.is-plain):not(.is-text):not(.is-link) {
+  background-color: var(--el-button-bg-color, var(--el-color-white));
+}
+
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
+  background-color: var(--el-color-primary);
+}
+
+.el-button--success:not(.is-plain):not(.is-text):not(.is-link) {
+  background-color: var(--el-color-success);
+}
+
+.el-button--warning:not(.is-plain):not(.is-text):not(.is-link) {
+  background-color: var(--el-color-warning);
+}
+
+.el-button--danger:not(.is-plain):not(.is-text):not(.is-link) {
+  background-color: var(--el-color-danger);
+}
+
+.el-button--info:not(.is-plain):not(.is-text):not(.is-link) {
+  background-color: var(--el-color-info);
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+}
+
+:root {
+  --ui-surface: rgba(255, 255, 255, 0.72);
+  --ui-surface-strong: rgba(255, 255, 255, 0.86);
+  --ui-surface-muted: rgba(249, 250, 251, 0.7);
+  --ui-border: rgba(226, 232, 240, 0.9);
+  --ui-border-muted: rgba(226, 232, 240, 0.55);
+  --ui-backdrop: blur(18px);
+  --ui-radius-sm: 10px;
+  --ui-radius-md: 14px;
+  --ui-radius-lg: 16px;
+  --ui-radius-xl: 20px;
+  --ui-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --ui-shadow-md: 0 12px 30px rgba(15, 23, 42, 0.10);
+  --ui-shadow-lg: 0 18px 50px rgba(15, 23, 42, 0.14);
+  --ui-btn-shadow: 0 2px 8px rgba(15, 23, 42, 0.08), 0 1px 3px rgba(15, 23, 42, 0.05);
+  --ui-btn-shadow-hover: 0 4px 12px rgba(15, 23, 42, 0.11), 0 2px 5px rgba(15, 23, 42, 0.06);
+  --ui-btn-primary-shadow: 0 6px 16px rgba(37, 99, 235, 0.22), 0 2px 6px rgba(15, 23, 42, 0.08);
+  --ui-btn-primary-shadow-hover: 0 8px 20px rgba(37, 99, 235, 0.26), 0 3px 8px rgba(15, 23, 42, 0.10);
+}
+
+html.dark {
+  --ui-surface: rgba(255, 255, 255, 0.06);
+  --ui-surface-strong: rgba(255, 255, 255, 0.08);
+  --ui-surface-muted: rgba(255, 255, 255, 0.05);
+  --ui-border: rgba(255, 255, 255, 0.08);
+  --ui-border-muted: rgba(255, 255, 255, 0.12);
+  --ui-btn-primary-shadow: 0 6px 16px rgba(59, 130, 246, 0.28), 0 2px 6px rgba(15, 23, 42, 0.18);
+  --ui-btn-primary-shadow-hover: 0 8px 20px rgba(59, 130, 246, 0.32), 0 3px 8px rgba(15, 23, 42, 0.22);
+}
+
+.el-button:not(.is-text):not(.is-link) {
+  box-shadow: var(--ui-btn-shadow);
+  transition: box-shadow 180ms ease, transform 180ms ease;
+}
+
+.el-button:not(.is-text):not(.is-link):hover {
+  box-shadow: var(--ui-btn-shadow-hover);
+}
+
+.el-button:not(.is-text):not(.is-link):focus-visible {
+  box-shadow: var(--ui-btn-shadow-hover);
+}
+
+.el-button:not(.is-text):not(.is-link):active {
+  transform: translateY(0.5px);
+}
+
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link),
+.ui-action-btn-primary {
+  box-shadow: var(--ui-btn-primary-shadow);
+}
+
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link):hover,
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link):focus-visible,
+.ui-action-btn-primary:hover,
+.ui-action-btn-primary:focus-visible {
+  box-shadow: var(--ui-btn-primary-shadow-hover);
+}
+
+.ui-action-btn {
+  box-shadow: var(--ui-btn-shadow);
+}
+
+.ui-surface {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  backdrop-filter: var(--ui-backdrop);
+}
+
+.ui-surface-strong {
+  background: var(--ui-surface-strong);
+  border: 1px solid var(--ui-border);
+  backdrop-filter: var(--ui-backdrop);
+}
+
+.ui-surface-muted {
+  background: var(--ui-surface-muted);
+  border: 1px solid var(--ui-border-muted);
+  backdrop-filter: var(--ui-backdrop);
+}
+
+.ui-glass {
+  background: var(--ui-surface);
+  backdrop-filter: var(--ui-backdrop);
+}
+
+.ui-glass-border {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  backdrop-filter: var(--ui-backdrop);
+}
+
+.ui-card {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  backdrop-filter: var(--ui-backdrop);
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-shadow-md);
+}
+
+.ui-card-hover {
+  transition: transform 200ms ease, box-shadow 200ms ease;
+}
+
+.ui-card-hover:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--ui-shadow-lg);
+}
+
+.ui-panel {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  backdrop-filter: var(--ui-backdrop);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.ui-panel-muted {
+  background: var(--ui-surface-muted);
+  border: 1px solid var(--ui-border-muted);
+  backdrop-filter: var(--ui-backdrop);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.animate-pulse-slow {
+  animation: pulse 8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.6;
+    transform: scale(1.1);
+  }
+}
+
+.el-menu {
+  --el-menu-bg-color: transparent;
+  --el-menu-hover-bg-color: rgba(59, 130, 246, 0.08);
+  --el-menu-active-color: #2563eb;
+  --el-menu-text-color: #334155;
+}
+
+.dark .el-menu {
+  --el-menu-hover-bg-color: rgba(99, 102, 241, 0.12);
+  --el-menu-active-color: #93c5fd;
+  --el-menu-text-color: rgba(255, 255, 255, 0.72);
+}
+
+.el-menu-item {
+  border-radius: 14px;
+  margin: 4px 10px;
+  height: 44px;
+  line-height: 44px;
+}
+
+.el-menu-item.is-active {
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.dark .el-menu-item.is-active {
+  background: rgba(99, 102, 241, 0.16);
+}
+
+.el-dialog.glass-modal {
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+html.dark .el-dialog.glass-modal {
+  background: rgba(30, 30, 40, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.el-dialog.glass-modal .el-dialog__header {
+  padding-bottom: 12px;
+}
+
+.el-dialog.glass-modal .el-dialog__body {
+  padding-top: 0;
+}
+
+.el-scrollbar__wrap {
+  scroll-behavior: smooth;
+}
