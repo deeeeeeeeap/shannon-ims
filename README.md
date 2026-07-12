@@ -1,237 +1,199 @@
-# Shannon IMS
+<div align="center">
 
-[English](#english) · [中文](#中文)
+<h1>Shannon IMS</h1>
 
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](go.mod)
-[![Vue](https://img.shields.io/badge/Vue-3-42b883?logo=vue.js)](web/package.json)
+<p>
+  <strong>Cellular module management with a deeply optimized Wi‑Fi Calling / IMS stack</strong><br>
+  <strong>面向蜂窝模组的管理平台，内置深度优化的 Wi‑Fi Calling / IMS 能力</strong>
+</p>
 
-Shannon IMS is a research-oriented cellular module management stack with special focus on reliable Wi-Fi Calling, IMS registration, IMS-AKA recovery, 3GPP IPsec, and SMS over IMS.
+<p>
+  <a href="#中文介绍">中文介绍</a> ·
+  <a href="#english">English</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#quick-start">Quick Start</a>
+</p>
 
-Shannon IMS 是一个面向蜂窝模组的研究型管理栈，重点优化 Wi-Fi Calling、IMS 注册、IMS-AKA 重同步、3GPP IPsec 与 IMS 短信链路。
+<p>
+  <a href="LICENSE"><img alt="License: PolyForm Noncommercial" src="https://img.shields.io/badge/License-PolyForm--Noncommercial-blue.svg"></a>
+  <a href="go.mod"><img alt="Go 1.26+" src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go"></a>
+  <a href="web/package.json"><img alt="Vue 3" src="https://img.shields.io/badge/Vue-3-42b883?logo=vue.js"></a>
+  <a href="#运行环境"><img alt="Linux and WSL2" src="https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2-555555?logo=linux"></a>
+</p>
 
-> Privacy first: this repository contains no runtime database, device identity, subscriber identity, phone number, credential, token, packet capture, or real deployment configuration.
->
-> 隐私优先：本仓库不包含运行数据库、设备身份、用户身份、电话号码、凭据、Token、抓包或真实部署配置。
+</div>
 
-<a id="english"></a>
+---
 
-## English
+<a id="中文介绍"></a>
 
-### Why this project exists
+## 中文介绍
 
-Cellular modules often expose enough QMI, MBIM, AT, UICC, and raw IP functionality to build a complete Wi-Fi Calling client, but real IMS networks are strict about registration state, AKA synchronization, IPsec direction, transport reuse, and SMS routing.
+Shannon IMS 不只是一个“能管理 4G/5G 模组”的后台，也不只是一个独立的 SIP 库。
 
-Shannon IMS packages the device manager and the Wi-Fi Calling core into one reproducible repository. The implementation is optimized around observable state transitions, bounded retries, privacy-safe diagnostics, and safe radio fallback after failures.
+它把 **模组控制、UICC 鉴权、SWu 隧道、IMS-AKA、3GPP IPsec、IMS 注册、IMS 短信和 Web 管理界面** 放进同一套运行时，目标是在 Linux 或 WSL2 上完成一条可以观察、诊断和恢复的 Wi‑Fi Calling 链路。
 
-### Highlights
+项目尤其适合以下场景：
 
-- Multi-modem discovery and lifecycle management for QMI, MBIM, AT, SMS, USSD, and eSIM workflows.
-- SWu tunnel orchestration with raw IP and ESP data-plane support.
-- IMS-AKA authentication with AUTS/SQN synchronization recovery.
-- Bounded challenge rounds and repeated challenge protection.
-- 3GPP IPsec security agreement, directional FlowC/FlowS handling, UDP protected transport, replay protection, and IPv4 fragmentation.
-- Protected REGISTER flow with security-agreement verification.
-- SMS over IMS with secure MESSAGE requests, service-centre PSI routing, Service-Route preservation, and delivery tracking.
-- Privacy-safe IMS diagnostics: challenge fingerprints, lengths, booleans, and state transitions instead of secret material.
-- Vue-based management UI and HTTP API.
-- Linux amd64, arm64, and armv7 release workflow.
+- 使用 QMI、MBIM 或 AT 接口接入蜂窝模组；
+- 研究或验证 Wi‑Fi Calling、IMS 和 SMS over IMS；
+- 在弱蜂窝覆盖环境中通过宽带网络建立 IMS 服务；
+- 调试真实网络中的 AKA 重同步、IPsec 协商和 SIP 路由问题；
+- 需要 Web UI、API、短信、USSD、eSIM 与多模组管理的一体化平台。
 
-### Architecture
+### 为什么 Shannon IMS 不一样
+
+| 能力 | 常见实现 | Shannon IMS |
+| --- | --- | --- |
+| IMS 鉴权 | 只处理一次 AKA challenge | 支持 AUTS/SQN 重同步、fresh challenge 和有界 challenge 状态机 |
+| IMS 安全 | 只生成 SIP Authorization | 完整处理 Security-Client、Security-Server、Security-Verify 与 3GPP IPsec |
+| 数据面 | 依赖普通 TCP/UDP socket | 支持 SWu raw IP、ESP、UDP protected flow 和 IPv4 分片 |
+| IMS 注册 | 发送一次 REGISTER 后等待结果 | 区分未保护重同步、密钥生成、IPsec 安装与受保护 REGISTER |
+| IMS 短信 | 直接向目标号码发 SIP MESSAGE | 使用短信中心 PSI、Service-Route、P-Preferred-Identity 和安全 MESSAGE |
+| 故障诊断 | 打印完整 SIP 或认证字段 | 记录状态、长度、布尔值和不可逆指纹，避免泄露 AKA 材料 |
+| 设备管理 | 单一模组脚本 | 集成 QMI、MBIM、AT、短信、USSD、eSIM、代理和 Web 控制台 |
+
+### 已覆盖的端到端链路
+
+~~~text
+蜂窝模组
+  └─ QMI / MBIM / AT
+      └─ USIM / ISIM
+          └─ SWu tunnel
+              └─ IMS-AKA
+                  ├─ 正常 AKA
+                  └─ AUTS / SQN 重同步
+                      └─ 3GPP IPsec
+                          └─ protected REGISTER
+                              ├─ IMS Ready
+                              ├─ SMS over IMS
+                              └─ Voice service
+~~~
+
+真实设备验证过的核心状态链：
+
+~~~text
+Access ready
+→ SWu tunnel ready
+→ initial REGISTER
+→ AKA challenge
+→ optional AUTS resync
+→ fresh AKA challenge
+→ RES / CK / IK available
+→ IPsec installed
+→ protected REGISTER
+→ 200 OK
+→ IMSReady
+→ SMSReady
+~~~
+
+> 运营商、账户、SIM 资料和区域策略会影响最终结果。项目能够实现完整协议链路，但不能替运营商开启未授权的 IMS 服务。
+
+### 核心特性
+
+#### Wi‑Fi Calling / IMS
+
+- SWu 隧道生命周期管理；
+- IMS-AKA 与 AUTS/SQN 重同步；
+- 重复 nonce、重复同步状态与 challenge 轮次保护；
+- 3GPP IPsec SA、FlowC/FlowS 和重放保护；
+- UDP protected signaling 与 IPv4 MTU 分片；
+- 初始、重同步、鉴权和受保护 REGISTER 的独立状态；
+- carrier profile、P-CSCF 解析与 IMS 路由；
+- 可观察的 IMSReady、SMSReady 和 tunnel 状态。
+
+#### SMS over IMS
+
+- 3GPP SMS over IP 封装；
+- 短信中心 PSI Request-URI；
+- REGISTER 返回的 Service-Route 复用；
+- Security-Verify 与 sec-agree；
+- 多分片提交与 delivery 状态记录；
+- 接收 RP-ACK / RP-ERROR 报告；
+- SQLite 幂等写入和安全迁移。
+
+#### 模组与平台能力
+
+- QMI、MBIM、AT 多后端；
+- 多模组发现、热插拔和状态监控；
+- 短信、USSD、运营商选择和信号信息；
+- eSIM Profile 管理；
+- SOCKS5 / HTTP 移动网络代理；
+- Vue 3 Web 管理界面；
+- HTTP API 与 OpenAPI 文档；
+- SQLite 本地状态存储。
+
+### 架构
 
 ~~~mermaid
 flowchart LR
-    UI["Web UI / API"] --> Core["Shannon IMS service"]
-    Core --> Device["QMI / MBIM / AT modem control"]
-    Core --> UICC["USIM / ISIM authentication"]
-    Core --> SWu["SWu tunnel and raw IP stack"]
-    SWu --> IMS["IMS P-CSCF"]
-    UICC --> AKA["IMS-AKA and AUTS recovery"]
-    AKA --> IMS
-    IMS --> IPsec["3GPP IPsec protected signaling"]
-    IPsec --> Services["REGISTER / SMS / Voice services"]
+    UI["Web UI / HTTP API"] --> Service["Shannon IMS Service"]
+
+    Service --> Manager["Modem Manager"]
+    Manager --> QMI["QMI"]
+    Manager --> MBIM["MBIM"]
+    Manager --> AT["AT"]
+
+    Service --> UICC["USIM / ISIM"]
+    UICC --> AKA["IMS-AKA + AUTS Recovery"]
+
+    Service --> SWu["SWu Tunnel"]
+    SWu --> Raw["Raw IP / ESP"]
+    Raw --> PCSCF["IMS P-CSCF"]
+
+    AKA --> PCSCF
+    PCSCF --> IPsec["3GPP IPsec"]
+    IPsec --> Register["Protected REGISTER"]
+    Register --> IMS["IMSReady / SMSReady"]
+    IMS --> SMS["SMS over IMS"]
 ~~~
 
-### Repository layout
+### 面向使用者的隐私设计
 
-| Path | Purpose |
+Shannon IMS 的隐私边界体现在运行方式中，而不是要求使用者理解仓库维护流程：
+
+- 示例配置不包含真实凭据，首次部署时由使用者在本机生成配置；
+- 运行数据库、日志和设备状态保存在部署机器上，不随源码仓库分发；
+- IMS-AKA 的 RAND、AUTN、AUTS、RES、CK 和 IK 不进入常规日志；
+- SIP trace 默认只记录报文长度和连接信息，不保存完整认证报文；
+- challenge 诊断使用轮次、布尔状态、字段长度和不可逆 nonce 指纹；
+- Web 密码、通知 Token 和第三方凭据由本地配置管理。
+
+### 运行环境
+
+| 项目 | 建议 |
 | --- | --- |
-| cmd/vohive | Main service entry point |
-| internal/device | Modem lifecycle and Wi-Fi Calling orchestration |
-| internal/sim | UICC APDU and AKA adapter |
-| internal/db | SQLite models and safe migrations |
-| internal/web | Embedded web assets |
-| web | Vue 3 management interface |
-| vowifi-go | Embedded Wi-Fi Calling and IMS core |
-| third_party/sipgo | Local SIP transport changes used by both modules |
-| scripts | Build, install, and repository privacy checks |
+| 操作系统 | Linux 或 WSL2 |
+| Go | 1.26.3 或更高版本 |
+| Node.js | 20 或更高版本 |
+| 模组 | 支持 QMI、MBIM 或 AT 的 LTE / 5G 模组 |
+| 网络权限 | raw socket、TUN、ESP、路由和设备访问权限 |
+| SWu 组件 | StrongSwan / VICI 及对应插件 |
+| SIM | 有效 SIM，且账户允许使用相应 IMS 服务 |
 
-### Requirements
+<a id="快速开始"></a>
 
-- Linux or WSL2 with direct access to the cellular module.
-- Go 1.26.3 or newer.
-- Node.js 20 or newer and npm.
-- A compatible QMI or MBIM modem and the required USB serial/control interfaces.
-- StrongSwan/VICI components required by the SWu environment.
-- Root or equivalent capabilities for raw networking, TUN, ESP, device access, and route management.
-- A valid SIM and carrier support for Wi-Fi Calling.
+## 快速开始
 
-Carrier behavior differs. A successful build does not guarantee that a specific subscription or network enables IMS services.
-
-### Quick start
+### 1. 获取源码
 
 ~~~bash
 git clone git@github.com:deeeeeeeeap/shannon-ims.git
 cd shannon-ims
+~~~
 
+### 2. 准备配置
+
+~~~bash
 cp config/config.example.yaml config/config.yaml
 chmod 600 config/config.yaml
-
-# Edit config/config.yaml and replace every placeholder.
-bash scripts/build-linux-amd64.sh
 ~~~
 
-The generated binary is:
+编辑 <code>config/config.yaml</code>，至少修改 Web 登录密码，并按实际模组填写设备配置。
 
-~~~text
-dist/shannon-ims_linux_amd64
-~~~
-
-Install it into a local prefix:
+### 3. 构建 Linux amd64
 
 ~~~bash
-sudo bash scripts/install-local.sh dist/shannon-ims_linux_amd64 /opt/shannon-ims
-sudo /opt/shannon-ims/bin/shannon-ims -c /opt/shannon-ims/config/config.yaml
-~~~
-
-Check service health:
-
-~~~bash
-curl http://127.0.0.1:7575/api/health
-~~~
-
-### Manual build
-
-~~~bash
-npm ci --prefix web
-npm run build --prefix web
-
-rm -rf internal/web/dist
-cp -R web/dist internal/web/dist
-
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -buildvcs=false \
-  -tags "with_utls nomsgpack" \
-  -o dist/shannon-ims_linux_amd64 ./cmd/vohive
-~~~
-
-### Validation
-
-Run the repository privacy check before committing or releasing:
-
-~~~bash
-python3 scripts/check-repository-privacy.py
-~~~
-
-Run the focused Wi-Fi Calling regression suites:
-
-~~~bash
-go test ./internal/sim ./internal/vowifihost
-go test ./internal/db -run '^TestEnsureSMSDeliveryPartUniqueIndex'
-
-cd vowifi-go
-go test ./internal/vowifi/imscore ./runtimehost/simauth \
-  ./internal/vowifi/ipsec3gpp ./runtimehost/voiceclient \
-  -run Test -skip '^TestFormatGSMAIMEIURN$'
-~~~
-
-### Configuration and privacy
-
-- Never commit config/config.yaml. Only config/config.example.yaml belongs in Git.
-- Keep database, logs, packet captures, crash dumps, modem identities, subscriber identities, phone numbers, passwords, and tokens outside the repository.
-- Use a unique web password before the first run.
-- IMS authentication material must never be printed, copied into issues, or stored in diagnostic artifacts.
-- Review staged files with git status and run the privacy checker before every push.
-
-### Wi-Fi Calling state model
-
-A healthy registration normally progresses through these classes of state:
-
-~~~text
-access ready
-SWu tunnel ready
-initial REGISTER
-AKA challenge
-optional AUTS synchronization recovery
-fresh AKA challenge
-IPsec installed
-protected REGISTER
-IMS ready
-SMS ready
-~~~
-
-An HTTP or SIP challenge is not automatically a failure. Diagnose the current state transition and preserve already-proven transport and identity settings.
-
-### Releases
-
-Pushing a version tag such as v0.1.0 runs the GitHub Actions release workflow and builds Linux binaries for amd64, arm64, and armv7.
-
-~~~bash
-git tag v0.1.0
-git push origin v0.1.0
-~~~
-
-### Safety and legal notice
-
-This is an independent research project. It is not affiliated with any modem vendor, network operator, or standards organization. Use it only with hardware, subscriptions, networks, and destination numbers you are authorized to test. Follow local law and carrier terms.
-
-The software is provided as-is without warranty. Radio, SIM, eSIM, routing, and IMS operations can interrupt connectivity. Keep backups and maintain a known-safe fallback procedure.
-
-<a id="中文"></a>
-
-## 中文
-
-### 项目定位
-
-蜂窝模组通常已经提供 QMI、MBIM、AT、UICC 和原始 IP 能力，但真实 IMS 网络会严格校验注册状态、AKA 同步、IPsec 方向、连接复用以及短信路由。Shannon IMS 将模组管理服务与 Wi-Fi Calling 核心整合为一个可复现仓库，便于在其他 Linux 或 WSL2 机器上构建和部署。
-
-项目重点不是“堆叠重试”，而是清晰记录状态迁移、限制 challenge 轮次、保护认证材料，并在失败后恢复到安全的短信与射频状态。
-
-### 核心能力
-
-- 支持 QMI、MBIM、AT、短信、USSD 和 eSIM 的多模组发现与生命周期管理。
-- 支持 SWu 隧道、原始 IP 与 ESP 数据面。
-- 支持 IMS-AKA 鉴权和 AUTS/SQN 重同步。
-- 限制 challenge 轮次，并阻止重复 challenge 在本地形成死循环。
-- 支持 3GPP IPsec security agreement、FlowC/FlowS 方向、UDP 保护传输、重放保护与 IPv4 分片。
-- 支持受保护 REGISTER 和 security-agreement 验证。
-- 支持 IMS 短信安全 MESSAGE、短信中心 PSI 路由、Service-Route 保留和投递状态记录。
-- 日志只记录状态、长度、布尔值与不可逆指纹，不记录 AKA 密钥材料。
-- 提供 Vue 3 管理后台与 HTTP API。
-- 提供 Linux amd64、arm64、armv7 的 GitHub Release 构建流程。
-
-### 环境要求
-
-- Linux 或可直通蜂窝模组的 WSL2。
-- Go 1.26.3 或更高版本。
-- Node.js 20 或更高版本及 npm。
-- 兼容的 QMI 或 MBIM 模组，以及对应 USB 串口和控制接口。
-- SWu 环境所需的 StrongSwan/VICI 组件。
-- 原始网络、TUN、ESP、设备访问和路由管理所需的 root 权限或等效 capabilities。
-- 有效 SIM，并且运营商侧允许 Wi-Fi Calling。
-
-不同网络的 IMS 策略存在差异。编译成功并不代表任意账户都一定开放 IMS 服务。
-
-### 快速开始
-
-~~~bash
-git clone git@github.com:deeeeeeeeap/shannon-ims.git
-cd shannon-ims
-
-cp config/config.example.yaml config/config.yaml
-chmod 600 config/config.yaml
-
-# 编辑 config/config.yaml，并替换所有占位值。
 bash scripts/build-linux-amd64.sh
 ~~~
 
@@ -241,149 +203,168 @@ bash scripts/build-linux-amd64.sh
 dist/shannon-ims_linux_amd64
 ~~~
 
-安装到本机目录：
+### 4. 安装
 
 ~~~bash
-sudo bash scripts/install-local.sh dist/shannon-ims_linux_amd64 /opt/shannon-ims
-sudo /opt/shannon-ims/bin/shannon-ims -c /opt/shannon-ims/config/config.yaml
+sudo bash scripts/install-local.sh \
+  dist/shannon-ims_linux_amd64 \
+  /opt/shannon-ims
 ~~~
 
-检查服务健康状态：
+启动：
+
+~~~bash
+sudo /opt/shannon-ims/bin/shannon-ims \
+  -c /opt/shannon-ims/config/config.yaml
+~~~
+
+健康检查：
 
 ~~~bash
 curl http://127.0.0.1:7575/api/health
 ~~~
 
-### 手动构建
+### 从 Release 部署
 
-~~~bash
-npm ci --prefix web
-npm run build --prefix web
+版本标签会触发 GitHub Actions，生成 Linux amd64、arm64 和 armv7 二进制。希望快速部署时，可直接从 Releases 下载对应架构的产物，而无需在目标机器安装前端工具链。
 
-rm -rf internal/web/dist
-cp -R web/dist internal/web/dist
+### 项目结构
 
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -buildvcs=false \
-  -tags "with_utls nomsgpack" \
-  -o dist/shannon-ims_linux_amd64 ./cmd/vohive
+| 路径 | 内容 |
+| --- | --- |
+| <code>cmd/vohive</code> | 主服务入口 |
+| <code>internal/device</code> | 模组管理与 Wi‑Fi Calling 编排 |
+| <code>internal/sim</code> | UICC APDU 与 AKA 适配 |
+| <code>internal/db</code> | SQLite 模型、投递状态与迁移 |
+| <code>vowifi-go</code> | SWu、IMS、IPsec、SIP 与 SMS 核心 |
+| <code>third_party/sipgo</code> | 项目使用的 SIP transport 扩展 |
+| <code>web</code> | Vue 3 管理界面 |
+| <code>scripts</code> | 构建、安装与仓库检查工具 |
+
+### 当前边界
+
+Shannon IMS 是面向研究、实验室和个人部署的工程项目，不是运营商认证终端固件。
+
+目前不承诺：
+
+- 所有运营商和所有账户都能开通 Wi‑Fi Calling；
+- 所有模组固件都暴露相同的 UICC、QMI 或 MBIM 能力；
+- 紧急呼叫、商业语音质量或生产级高可用；
+- 在没有合法授权的情况下绕过运营商策略。
+
+---
+
+<a id="english"></a>
+
+## English
+
+Shannon IMS is an integrated cellular-module platform with a deeply optimized Wi‑Fi Calling and IMS stack.
+
+Instead of treating IMS as a single SIP request, it models the complete path from modem control and UICC authentication to SWu transport, AKA synchronization recovery, 3GPP IPsec, protected registration, and SMS over IMS.
+
+### What makes it useful
+
+- QMI, MBIM, and AT modem backends;
+- multi-modem discovery and lifecycle management;
+- SWu tunnel orchestration with raw IP and ESP support;
+- IMS-AKA authentication with AUTS/SQN resynchronization;
+- bounded challenge handling and repeated-state protection;
+- 3GPP IPsec security agreement and protected UDP signaling;
+- protected REGISTER with explicit state transitions;
+- SMS over IMS using service-centre PSI and Service-Route;
+- local SQLite delivery tracking;
+- privacy-safe diagnostics that do not expose AKA key material;
+- Vue 3 management UI, HTTP API, and OpenAPI documentation.
+
+### End-to-end model
+
+~~~text
+Modem access
+→ USIM / ISIM
+→ SWu tunnel
+→ IMS-AKA
+→ optional AUTS resynchronization
+→ fresh AKA challenge
+→ 3GPP IPsec
+→ protected REGISTER
+→ IMS ready
+→ SMS ready
 ~~~
 
-### 测试与隐私检查
+### Privacy by design
 
-提交或发布前先运行：
+- Runtime configuration and state remain on the deployment machine.
+- Sample configuration ships without real credentials.
+- AKA authentication material is excluded from normal logs.
+- SIP diagnostics record metadata and lengths rather than full authenticated messages.
+- Challenge troubleshooting uses state, round counters, booleans, lengths, and irreversible fingerprints.
+
+<a id="quick-start"></a>
+
+## Quick Start
 
 ~~~bash
-python3 scripts/check-repository-privacy.py
+git clone git@github.com:deeeeeeeeap/shannon-ims.git
+cd shannon-ims
+
+cp config/config.example.yaml config/config.yaml
+chmod 600 config/config.yaml
+
+bash scripts/build-linux-amd64.sh
 ~~~
 
-运行关键 Wi-Fi Calling 回归测试：
+Install the generated binary:
+
+~~~bash
+sudo bash scripts/install-local.sh \
+  dist/shannon-ims_linux_amd64 \
+  /opt/shannon-ims
+
+sudo /opt/shannon-ims/bin/shannon-ims \
+  -c /opt/shannon-ims/config/config.yaml
+~~~
+
+Health check:
+
+~~~bash
+curl http://127.0.0.1:7575/api/health
+~~~
+
+### Compatibility notes
+
+A valid IMS protocol implementation does not guarantee service activation for every subscription. Carrier policy, account provisioning, regional access, SIM capabilities, modem firmware, and network topology all affect the result.
+
+Use Shannon IMS only with hardware, subscriptions, networks, and destination numbers you are authorized to test.
+
+## Build verification
+
+Focused regression suites:
 
 ~~~bash
 go test ./internal/sim ./internal/vowifihost
 go test ./internal/db -run '^TestEnsureSMSDeliveryPartUniqueIndex'
 
 cd vowifi-go
-go test ./internal/vowifi/imscore ./runtimehost/simauth \
-  ./internal/vowifi/ipsec3gpp ./runtimehost/voiceclient \
+go test ./internal/vowifi/imscore \
+  ./runtimehost/simauth \
+  ./internal/vowifi/ipsec3gpp \
+  ./runtimehost/voiceclient \
   -run Test -skip '^TestFormatGSMAIMEIURN$'
 ~~~
 
-### 配置与隐私边界
+## Releases
 
-- 禁止提交 config/config.yaml，Git 中只能保留 config/config.example.yaml。
-- 数据库、日志、抓包、崩溃转储、设备身份、用户身份、电话号码、密码和 Token 必须放在仓库外。
-- 第一次启动前必须更换 Web 密码。
-- IMS 鉴权材料不得打印、粘贴到 Issue 或写入诊断文件。
-- 每次推送前检查 git status，并运行仓库隐私检查器。
-
-### Wi-Fi Calling 状态链
-
-健康的注册链路通常依次经过：
-
-~~~text
-接入就绪
-SWu 隧道就绪
-初始 REGISTER
-AKA challenge
-必要时发送 AUTS 重同步
-新的 AKA challenge
-安装 IPsec
-受保护 REGISTER
-IMSReady
-SMSReady
-~~~
-
-收到 HTTP 或 SIP challenge 不等于最终失败。应沿当前状态迁移诊断，并保留已经证明有效的传输和身份画像。
-
-### 发布版本
-
-推送 v0.1.0 之类的版本标签后，GitHub Actions 会构建 amd64、arm64 和 armv7 Linux 二进制并创建 Release。
+Push a semantic version tag to build Linux artifacts for amd64, arm64, and armv7:
 
 ~~~bash
 git tag v0.1.0
 git push origin v0.1.0
 ~~~
 
-### 安全与合规
+## Credits and license
 
-本项目为独立研究项目，与任何模组厂商、网络运营商或标准组织均无官方关联。只能对自己有权使用的硬件、账户、网络和目的号码进行测试，并遵守当地法律和运营商条款。
+Shannon IMS combines and extends the VoHive service, an embedded Wi‑Fi Calling core, and a locally maintained SIP transport layer. Attribution and required notices are available in [NOTICE.md](NOTICE.md).
 
-软件按现状提供，不附带任何担保。射频、SIM、eSIM、路由和 IMS 操作可能中断连接，请保留备份和已验证的安全回落流程。
+The repository is distributed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use requires separate authorization.
 
-## License / 许可证
-
-This repository is distributed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use is not permitted without separate authorization.
-
-本仓库采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，仅限非商业用途；商业使用需要另行授权。
-
-<details>
-<summary>Upstream project background / 上游项目背景</summary>
-
-# VoHive
-
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0)
-[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](go.mod)
-[![Vue 3](https://img.shields.io/badge/Vue-3-42b883?logo=vue.js)](web/package.json)
-
-> 面向高通 4G/LTE/5G 模组（Quectel EC20/EC25/EC21/EG25/EM20 等）的综合管理与代理服务平台。
-
-VoHive 把模组热插拔管理、SOCKS5/HTTP 代理编排、短信收发、VoWiFi/IMS 通话、eSIM 全生命周期管理整合到一个服务里,并提供一套现代化的响应式 Web 管理后台。
-
-## 核心特性
-
-| 模块 | 说明 |
-| --- | --- |
-| 多模组并发管理 | USB 热插拔自动发现(ttyUSB 等)、多设备实时状态监控 |
-| 轻量级代理引擎 | 内建 SOCKS5 / HTTP 代理内核,支持多实例并发;基于 `SO_BINDTODEVICE` 按设备网卡严格绑定出站流量 |
-| 通信与短信中心 | 统一界面/API 处理 AT 短信收发、会话与联系人管理、USSD 交互,短信落库可查 |
-| eSIM 管理 | 通过 AT 指令通道直接管理 eSIM 芯片,支持 Profile 下载、启用/停用、重命名、删除 |
-| 全渠道通知 | 重要短信及系统告警可推送至 Telegram、Email、PushPlus、Bark、飞书(Lark/Feishu)、QQ 等 |
-| 多架构构建 | 原生支持 amd64 / arm64 / arm7 跨平台编译,路由器到边缘节点均可部署 |
-
-## 典型应用场景
-
-- **私有 IP 代理池**:单主机挂载多张物理 SIM 卡或多张 eSIM,每张网卡对应独立的 SOCKS5/HTTP 实例,组建自己的移动网络代理。
-- **统一接码/验证码中心**:Web 界面或 API 并行收发多卡短信,并通过 Webhook/Bot 实时推送到个人终端。
-- **VoWiFi 零信号通信**:地下室、弱覆盖场景下,借助宽带网络隧道建立 IMS 连接,保证业务不掉线。
-
-## 架构与技术栈
-
-- **Backend**:Go 1.26+(Gin、GORM、Viper、sipgo、euicc-go)
-- **Frontend**:Vue 3 + Vite + TailwindCSS + Element Plus
-- **Database**:SQLite(`vohive.db`)
-- **CI/CD**:GitHub Actions 自动化多架构 Docker 镜像构建与发布
-
-
-## 免责声明
-
-- **用途定位**:本项目主要面向个人学习、技术研究与功能测试场景,不建议直接用于生产环境或关键业务系统;由此产生的部署及使用风险由使用者自行承担。
-- **非官方项目**:VoHive 为第三方独立开发的开源软件,与 Quectel(高通模组厂商)、高通公司及其他任何模组/芯片厂商均无官方关联、授权或合作关系,亦不对模组硬件本身的功能、质量或安全性负责。
-- **合规使用**:使用本项目搭建的服务时,请自行确保符合所在地区的法律法规及电信运营商的服务条款,不得用于任何违法违规用途。因违规使用造成的一切法律责任由使用者自行承担,与本项目作者及贡献者无关。
-- **无担保**:本软件按"现状"提供,不附带任何明示或暗示的担保,包括但不限于适销性、特定用途适用性及不侵权担保。因使用或无法使用本软件(含数据丢失、设备异常、业务中断等)造成的任何直接或间接损失,作者及贡献者不承担任何责任。
-
-## License
-
-本项目基于 [PolyForm Noncommercial License 1.0.0](LICENSE) 开源,**仅限非商业用途**:可自由查看、使用、修改、分发源码用于个人学习、研究、测试等非商业场景;**禁止任何形式的商业使用**(包括但不限于销售、提供付费服务、用于盈利性产品或业务)。如需商业授权,请联系作者另行协商。
-
-</details>
+This is an independent research project and is not affiliated with any modem vendor, mobile network operator, or standards organization.
