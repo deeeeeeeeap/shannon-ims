@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	swulogger "github.com/1239t/swu-go/pkg/logger"
 	swusim "github.com/1239t/vowifi-go/engine/sim"
 	"github.com/1239t/vowifi-go/internal/vowifi/imscore"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
@@ -19,6 +20,7 @@ import (
 	"github.com/1239t/vowifi-go/runtimehost/messaging"
 	"github.com/1239t/vowifi-go/runtimehost/transport"
 	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
+	"go.uber.org/zap"
 )
 
 var ErrAPDUBusy = errors.New("apdu busy")
@@ -965,4 +967,10 @@ func WithTraceID(ctx context.Context, traceID string) context.Context {
 	return context.WithValue(ctx, traceIDContextKey{}, traceID)
 }
 
-func SetLogger(l interface{}) {}
+func SetLogger(l interface{}) {
+	log, ok := l.(*zap.Logger)
+	if !ok || log == nil {
+		return
+	}
+	swulogger.SetLogger(log)
+}

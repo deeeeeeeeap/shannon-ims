@@ -1030,7 +1030,7 @@ func (r *Registrar) handleBye(req *sip.Request, tx sip.ServerTransaction) {
 		username = from.Address.User
 	}
 
-	// 打印完整 BYE 消息用于诊断秒断问题
+	// 仅记录 BYE 元数据；完整 SIP 报文可能包含身份与鉴权字段。
 	reasonHeader := req.GetHeader("Reason")
 	reason := ""
 	if reasonHeader != nil {
@@ -1042,22 +1042,12 @@ func (r *Registrar) handleBye(req *sip.Request, tx sip.ServerTransaction) {
 		warning = warningHeader.Value()
 	}
 
-	if shouldLogSIPRaw() {
-		logger.RunDebug("收到 Linphone BYE",
-			"from", username,
-			"call_id", req.CallID().Value(),
-			"reason", reason,
-			"warning", warning,
-			"source", req.Source(),
-			"full_msg", redactSIPRaw(req.String()))
-	} else {
-		logger.RunDebug("收到 Linphone BYE",
-			"from", username,
-			"call_id", req.CallID().Value(),
-			"reason", reason,
-			"warning", warning,
-			"source", req.Source())
-	}
+	logger.RunDebug("收到 Linphone BYE",
+		"from", username,
+		"call_id", req.CallID().Value(),
+		"reason", reason,
+		"warning", warning,
+		"source", req.Source())
 
 	// 回复 200 OK 给 Linphone
 	r.respond(tx, req, 200, "OK")

@@ -23,6 +23,7 @@ import (
 	"github.com/1239t/vohive/internal/proxy/traffic"
 	"github.com/1239t/vohive/internal/sipgw"
 	"github.com/1239t/vohive/internal/upstreamproxy"
+	"github.com/1239t/vowifi-go/runtimehost"
 	"github.com/1239t/vowifi-go/runtimehost/carrier"
 	"github.com/1239t/vowifi-go/runtimehost/voicehost"
 
@@ -70,10 +71,6 @@ func main() {
 	// 开启 SIP_DEBUG 以排查问题（针对旧系统或备用系统）
 	os.Setenv("SIP_DEBUG", "false")
 
-	sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	sip.SetDefaultLogger(sipLogger)
 	sip.SIPDebug = false
 	// 绕过 sipgo 底层硬编码的 UDP MTU 限制（默认 1500），
 	// 防止由于包含 APNs/FCM 推送 Token 的超长 Contact URI 导致 UDP 发送直接报错。
@@ -87,7 +84,7 @@ func main() {
 	flag.Parse()
 
 	// 1. 加载配置
-	if err := config.InitGlobalManager(configPath); err != nil {
+	if err := config.InitGlobalManagerForStartup(configPath); err != nil {
 		log.Fatalf("初始化配置管理器失败: %v", err)
 	}
 	cfg := config.GetConfig()
@@ -97,8 +94,11 @@ func main() {
 		Debug:    cfg.Server.Debug,
 		Filename: "logs/app.log",
 	})
-	// 将内置 slog 重定向到已就绪的系统日志框架
-	slog.SetDefault(slog.New(logger.NewSlogHandler(logger.ZapLogger())))
+	// 将标准 slog、sipgo 和 vowifi-go 子模块统一接入脱敏日志核心。
+	appSlog := slog.New(logger.NewSlogHandler(logger.ZapLogger()))
+	slog.SetDefault(appSlog)
+	sip.SetDefaultLogger(appSlog)
+	runtimehost.SetLogger(logger.ZapLogger())
 	logger.Info("VoHive 模组管理器启动中...")
 
 	go func() {
@@ -348,7 +348,10 @@ func main() {
 		}
 	}
 
-	apiServer := api.New(cfg, pool, staticFS, proxyMgr, voiceGW, notifyMgr, configPath)
+	apiServer, err := api.New(cfg, pool, staticFS, proxyMgr, voiceGW, notifyMgr, configPath)
+	if err != nil {
+		log.Fatalf("初始化 API 服务失败: %v", err)
+	}
 	apiServer.SetRealtimeTraffic(realtimeTraffic)
 
 	syncProxyConfigs := func(reason, deviceID string) {

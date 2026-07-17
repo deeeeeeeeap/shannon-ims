@@ -171,7 +171,7 @@ func (s *registerSession) logFSM(event, reason string, variantIndex, variantTota
 		logger.Int("variant_index", variantIndex),
 		logger.Int("variant_total", variantTotal),
 		logger.String("variant_name", strings.TrimSpace(variant.name)),
-		logger.String("initial_auth", variant.initialAuth),
+		logger.String("initial_auth_mode", variant.initialAuth),
 		logger.Bool("require_sec_agree", variant.requireSecAgree || s.cfg.Template.RequireSecAgree),
 		logger.Bool("proxy_require_sec_agree", variant.proxyRequireSecAgree || s.cfg.Template.ProxyRequireSecAgree),
 		logger.String("alg", alg),
@@ -216,7 +216,7 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
 			logger.String("pcscf", s.cfg.PCSCFAddr),
 			logger.String("variant_name", strings.TrimSpace(variant.name)),
-			logger.String("initial_auth", variant.initialAuth),
+			logger.String("initial_auth_mode", variant.initialAuth),
 			logger.Bool("require_sec_agree", variant.requireSecAgree || s.cfg.Template.RequireSecAgree),
 			logger.Bool("proxy_require_sec_agree", variant.proxyRequireSecAgree || s.cfg.Template.ProxyRequireSecAgree),
 			logger.Bool("include_pani", variant.includePANI),
@@ -279,7 +279,7 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 					logger.Int("variant_total", len(variants)),
 					logger.String("variant_name", strings.TrimSpace(variant.name)),
 					logger.String("next_variant_name", strings.TrimSpace(variants[i+1].name)),
-					logger.String("next_initial_auth", variants[i+1].initialAuth),
+					logger.String("next_initial_auth_mode", variants[i+1].initialAuth),
 					logger.Bool("next_include_pani", variants[i+1].includePANI),
 					logger.Bool("next_include_cellular", variants[i+1].includeCellular))
 				i++
@@ -467,7 +467,11 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 }
 
 func akaChallengeNonceFingerprint(nonce string) string {
-	trimmed := strings.TrimSpace(nonce)
+	return diagnosticFingerprint(nonce)
+}
+
+func diagnosticFingerprint(value string) string {
+	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return "missing"
 	}

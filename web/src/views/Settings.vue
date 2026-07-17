@@ -257,7 +257,9 @@ async function doCheckUpdate() {
     const res = await systemService.checkUpdate()
     if (!res.ok) throw new Error(res.error.message || '检查更新失败')
     updateInfo.value = res.data
-    if (!res.data.has_update) {
+    if (!res.data.enabled) {
+      ElMessage.warning(res.data.reason || '自动更新暂未启用，请使用经过校验的 Release 部署')
+    } else if (!res.data.has_update) {
       ElMessage.success('当前已是最新版本')
     }
   } catch (e: any) {
@@ -270,9 +272,14 @@ async function doCheckUpdate() {
 async function doApplyUpdate() {
   if (!updateInfo.value) return
 
+  if (!updateInfo.value.enabled) {
+    ElMessage.warning(updateInfo.value.reason || '自动更新暂未启用')
+    return
+  }
+
   if (updateInfo.value.is_docker) {
     ElMessageBox.alert(
-      '检测到当前系统运行在 Docker 环境下。<br><br>不建议在 Docker 容器内直接执行文件热替换。请直接通过拉取最新镜像（如 <code>docker pull iniwex5/vohive:latest</code>）并重启容器来完成升级！',
+      '检测到当前系统运行在容器环境下。<br><br>不应在容器内直接执行文件热替换，请使用经过校验的 Shannon IMS Release 或部署包重建并重启实例。',
       '环境警告',
       { dangerouslyUseHTMLString: true, type: 'warning' }
     )
@@ -386,6 +393,14 @@ onBeforeUnmount(() => {
                  立即更新并重启
                </el-button>
             </div>
+            <div v-else-if="updateInfo && !updateInfo.enabled" class="p-4 bg-blue-50 dark:bg-blue-500/10 rounded-lg border border-blue-200 dark:border-blue-500/20">
+               <div class="flex items-center gap-2 text-blue-800 dark:text-blue-200 mb-1 font-bold text-[13px]">
+                 自动更新已安全停用
+               </div>
+               <div class="text-xs text-blue-700 dark:text-blue-300/80">
+                 {{ updateInfo.reason || '请使用经过校验的 Shannon IMS Release 或部署包更新。' }}
+               </div>
+            </div>
             <div class="p-3 bg-gray-50 dark:bg-white/5 rounded-lg">
               <FieldRow label="构建时间" :value="systemInfo.build_time" monospace />
             </div>
@@ -393,7 +408,7 @@ onBeforeUnmount(() => {
               <FieldRow label="配置路径" :value="systemInfo.config" monospace copyable />
             </div>
             <div class="p-3 bg-gray-50 dark:bg-white/5 rounded-lg">
-              <FieldRow label="交流群" value="https://t.me/vohive" monospace copyable />
+              <FieldRow label="项目主页" value="https://github.com/deeeeeeeeap/shannon-ims" monospace copyable />
             </div>
             <div class="ui-panel-muted px-4 py-4">
               <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">

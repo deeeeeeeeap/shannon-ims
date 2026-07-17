@@ -8,9 +8,11 @@
 # Usage:
 #   make STRONGSWAN_SRC=/path/to/configured/strongswan-5.9.1
 #   sudo make install STRONGSWAN_SRC=/path/to/configured/strongswan-5.9.1
+# Set IPSEC_LIB_DIR and PLUGIN_DIR when the target uses a non-Debian layout.
 
 STRONGSWAN_SRC ?=
-PLUGIN_DIR      = /usr/lib/ipsec/plugins
+IPSEC_LIB_DIR  ?= /usr/lib/ipsec
+PLUGIN_DIR     ?= $(IPSEC_LIB_DIR)/plugins
 SONAME          = libstrongswan-p-cscf-vohive.so
 
 CC       = gcc
@@ -21,8 +23,8 @@ CPPFLAGS = -DHAVE_CONFIG_H \
            -I$(STRONGSWAN_SRC)/src/libcharon \
            -include $(STRONGSWAN_SRC)/config.h
 CFLAGS   = -rdynamic -g -O2 -Wall -Wno-format -Wno-format-security -Wno-pointer-sign -fPIC -DPIC
-LDFLAGS  = -shared -fPIC -DPIC -L/usr/lib/ipsec -lstrongswan \
-           -Wl,-rpath,/usr/lib/ipsec -Wl,-soname,$(SONAME)
+LDFLAGS  = -shared -fPIC -DPIC -L$(IPSEC_LIB_DIR) -lstrongswan \
+           -Wl,-rpath,$(IPSEC_LIB_DIR) -Wl,-soname,$(SONAME)
 
 SOURCES = p_cscf_vohive_handler.c p_cscf_vohive_plugin.c
 OBJECTS = $(SOURCES:.c=.o)

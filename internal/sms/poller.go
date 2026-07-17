@@ -158,7 +158,11 @@ func (s *Poller) processPDU(raw string) {
 
 	sender, content, msgTime, concat, err := smscodec.DecodeDeliverTPDU(b)
 	if err != nil {
-		logger.Error("TPDU 解析失败", "device", s.deviceID, "err", err, "raw", raw)
+		logger.Error("TPDU 解析失败",
+			"device", s.deviceID,
+			"err", err,
+			"raw_len", len(raw),
+			"raw_fingerprint", logger.Fingerprint(raw))
 		return
 	}
 
@@ -218,7 +222,11 @@ func (s *Poller) processPDU(raw string) {
 			delete(s.fragmentCache, key)
 			s.cacheMu.Unlock()
 
-			logger.Info("长短信重组完成", "device", s.deviceID, "sender", sender, "total", concat.Total)
+			logger.Info("长短信重组完成",
+				"device", s.deviceID,
+				"sender_len", len(sender),
+				"sender_fingerprint", logger.Fingerprint(sender),
+				"total", concat.Total)
 			// 继续处理发送逻辑...
 		} else {
 			s.cacheMu.Unlock()
@@ -231,12 +239,21 @@ func (s *Poller) processPDU(raw string) {
 		content = fmt.Sprintf("[PDU 解析失败] %s", raw)
 	}
 
-	logger.Info("收到短信 (PDU)", "device", s.deviceID, "sender", sender, "content", content, "time", timestamp)
+	logger.Info("收到短信 (PDU)",
+		"device", s.deviceID,
+		"sender_len", len(sender),
+		"sender_fingerprint", logger.Fingerprint(sender),
+		"content_len", len(content),
+		"content_fingerprint", logger.Fingerprint(content),
+		"time", timestamp)
 
 	// 通过统一通知接口转发
 	if s.notifier != nil {
 		if smsnotify.ShouldSuppressReceivedSMS(content) {
-			logger.Info("短信已过滤（运营商 OTA/不可解码二进制包）", "device", s.deviceID, "sender", sender)
+			logger.Info("短信已过滤（运营商 OTA/不可解码二进制包）",
+				"device", s.deviceID,
+				"sender_len", len(sender),
+				"sender_fingerprint", logger.Fingerprint(sender))
 			return
 		}
 		s.notifier.NotifySMS(s.deviceID, sender, content, timestamp)

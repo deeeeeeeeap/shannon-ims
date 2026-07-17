@@ -2,18 +2,22 @@ package api
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/internal/updater"
 	"github.com/1239t/vohive/pkg/logger"
+	"github.com/gin-gonic/gin"
 )
 
 var errNotFound = errors.New("not found")
+
+const uninstallConfirmation = "UNINSTALL"
 
 // resolveUninstallTargets 计算自毁流程需要清理的数据目录和配置文件路径。
 // 配置文件路径必须来自运行时实际加载的路径（config.GetConfigPath()），
@@ -56,55 +60,110 @@ func (s *Server) handleCheckUpdate(c *gin.Context) {
 
 // handleApplyUpdate 应用系统更新
 func (s *Server) handleApplyUpdate(c *gin.Context) {
-	go func() {
-		if err := updater.ApplyUpdate(); err != nil {
-			logger.Error("应用更新失败", "err", err)
+	if err := updater.ApplyUpdate(); err != nil {
+		if errors.Is(err, updater.ErrAutomaticUpdateDisabled) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status":  "error",
+				"code":    "automatic_update_disabled",
+				"message": err.Error(),
+			})
+			return
 		}
-	}()
-	c.JSON(http.StatusOK, gin.H{"message": "正在后台下载更新，系统稍后将自动重启..."})
+		logger.Error("应用更新失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"code":    "update_failed",
+			"message": "应用更新失败",
+		})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"message": "正在后台下载更新，系统稍后将自动重启..."})
 }
 
-// handleUninstall 自毁/卸载接口，用于用户拒绝免责声明时
+// handleUninstall is a local-only, authenticated uninstall boundary.
 func (s *Server) handleUninstall(c *gin.Context) {
-	logger.Warn("用户拒绝了免责声明，正在触发自毁/卸载逻辑")
-	c.JSON(http.StatusOK, gin.H{"message": "正在卸载软件..."})
+	if !isLoopbackRequest(c.Request) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"status":     "error",
+			"code":       "uninstall_local_only",
+			"message":    "卸载操作仅允许从本机发起",
+			"request_id": requestID(c),
+		})
+		return
+	}
 
-	// 在后台异步执行自毁，以免请求无法返回
-	go func() {
-		time.Sleep(1 * time.Second)
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Confirm) != uninstallConfirmation {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status":  "error",
+			"code":    "uninstall_confirmation_required",
+			"message": "卸载操作需要明确确认",
+		})
+		return
+	}
 
-		// 先主动通知服务管理器停止 + 禁用自启，确保即使后面的文件删除
-		// 失败（只读文件系统等），systemd Restart=always / procd respawn
-		// 也不会把进程重新拉起来。命令异步触发(Start 不 Wait)，
-		// 避免对"停止自己"这条命令的等待造成死锁。
-		for _, args := range detectServiceStopCommands(exec.LookPath, fileExists) {
-			cmd := exec.Command(args[0], args[1:]...)
-			if err := cmd.Start(); err != nil {
-				logger.Warn("通知服务管理器停止失败", "cmd", args, "err", err)
-				continue
-			}
-			go cmd.Wait()
+	logger.Warn("本机管理员已确认卸载，正在执行卸载逻辑")
+	c.JSON(http.StatusAccepted, gin.H{"message": "正在卸载软件..."})
+	s.startUninstall()
+}
+
+func isLoopbackRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	host := strings.TrimSpace(req.RemoteAddr)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) startUninstall() {
+	runner := runDefaultUninstall
+	if s != nil && s.uninstallRunner != nil {
+		runner = s.uninstallRunner
+	}
+	go runner()
+}
+
+func runDefaultUninstall() {
+	time.Sleep(1 * time.Second)
+
+	// 先主动通知服务管理器停止 + 禁用自启，确保即使后面的文件删除
+	// 失败（只读文件系统等），systemd Restart=always / procd respawn
+	// 也不会把进程重新拉起来。命令异步触发(Start 不 Wait)，
+	// 避免对"停止自己"这条命令的等待造成死锁。
+	for _, args := range detectServiceStopCommands(exec.LookPath, fileExists) {
+		cmd := exec.Command(args[0], args[1:]...)
+		if err := cmd.Start(); err != nil {
+			logger.Warn("通知服务管理器停止失败", "cmd", args, "err", err)
+			continue
 		}
+		go cmd.Wait()
+	}
 
-		dataDir, configFile := resolveUninstallTargets(config.GetConfigPath())
+	dataDir, configFile := resolveUninstallTargets(config.GetConfigPath())
 
-		if err := os.RemoveAll(dataDir); err != nil {
-			logger.Warn("清理数据目录失败", "dir", dataDir, "err", err)
+	if err := os.RemoveAll(dataDir); err != nil {
+		logger.Warn("清理数据目录失败", "dir", dataDir, "err", err)
+	}
+	if configFile != "" {
+		if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
+			logger.Warn("清理配置文件失败", "file", configFile, "err", err)
 		}
-		if configFile != "" {
-			if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
-				logger.Warn("清理配置文件失败", "file", configFile, "err", err)
-			}
+	}
+	if executable, err := os.Executable(); err == nil {
+		if err := os.Remove(executable); err != nil {
+			logger.Warn("删除可执行文件失败", "file", executable, "err", err)
 		}
-		if executable, err := os.Executable(); err == nil {
-			if err := os.Remove(executable); err != nil {
-				logger.Warn("删除可执行文件失败", "file", executable, "err", err)
-			}
-		}
+	}
 
-		logger.Warn("自毁流程结束，退出进程")
-		os.Exit(0)
-	}()
+	logger.Warn("自毁流程结束，退出进程")
+	os.Exit(0)
 }
 
 func fileExists(path string) bool {

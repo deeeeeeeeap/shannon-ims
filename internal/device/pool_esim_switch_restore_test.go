@@ -13,8 +13,6 @@ import (
 	"time"
 	"unsafe"
 
-	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 	"github.com/1239t/vohive/internal/backend"
 	"github.com/1239t/vohive/internal/cardpolicy"
 	"github.com/1239t/vohive/internal/config"
@@ -23,6 +21,8 @@ import (
 	"github.com/1239t/vohive/internal/vowifihost"
 	"github.com/1239t/vohive/pkg/logger"
 	"github.com/1239t/vowifi-go/runtimehost"
+	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
+	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 )
 
 type esimSwitchRestoreBackendStub struct {
@@ -53,6 +53,23 @@ type esimSwitchRestoreBackendStub struct {
 	openChannelStarted  chan<- struct{}
 	openChannelRelease  <-chan struct{}
 	setModeHook         func(backend.OperatingMode)
+}
+
+type blockingPostSwitchIdentityBackendStub struct {
+	esimSwitchRestoreBackendStub
+	iccidStarted chan struct{}
+	releaseICCID <-chan struct{}
+	startOnce    sync.Once
+}
+
+func (s *blockingPostSwitchIdentityBackendStub) GetICCIDLive(ctx context.Context) (string, error) {
+	s.startOnce.Do(func() { close(s.iccidStarted) })
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-s.releaseICCID:
+		return "stale-test-iccid", nil
+	}
 }
 
 func setPrivateFieldSwitchRestore(t *testing.T, target any, fieldName string, value any) {
@@ -1320,6 +1337,95 @@ func TestRefreshPostSwitchIdentityClearsOldSIMMetadataWithoutReadingNewMetadata(
 	}
 }
 
+func TestRefreshPostSwitchIdentityStopsInFlightReadWhenPoolCanceled(t *testing.T) {
+	withFastPostSwitchIdentityPolling(t)
+	p := NewPool(&config.Config{})
+	releaseICCID := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseICCID) }) }
+	t.Cleanup(release)
+
+	be := &blockingPostSwitchIdentityBackendStub{
+		esimSwitchRestoreBackendStub: esimSwitchRestoreBackendStub{mode: backend.BackendQMI},
+		iccidStarted:                 make(chan struct{}),
+		releaseICCID:                 releaseICCID,
+	}
+	worker := &Worker{
+		ID:      "dev-cancel",
+		Config:  config.DeviceConfig{ID: "dev-cancel"},
+		Backend: be,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.refreshPostSwitchIdentity("dev-cancel", worker, esimSwitchContext{TargetICCID: "target-test-iccid"})
+		done <- err
+	}()
+
+	select {
+	case <-be.iccidStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live ICCID read did not start")
+	}
+	p.cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("identity refresh error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("identity refresh did not stop promptly after pool cancellation")
+	}
+}
+
+func TestWaitPostSwitchIdentityPollStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- waitPostSwitchIdentityPoll(ctx, time.Second)
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("poll wait error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("poll wait did not stop promptly after cancellation")
+	}
+}
+
+func TestPostSwitchIdentityPollBackoffReachesConfiguredCap(t *testing.T) {
+	capDelay := 500 * time.Millisecond
+	delay := initialPostSwitchIdentityPollDelay(capDelay)
+	got := []time.Duration{delay}
+	for range 4 {
+		delay = nextPostSwitchIdentityPollDelay(delay, capDelay)
+		got = append(got, delay)
+	}
+	want := []time.Duration{
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		500 * time.Millisecond,
+		500 * time.Millisecond,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("poll backoff = %v, want %v", got, want)
+	}
+
+	if got := initialPostSwitchIdentityPollDelay(25 * time.Millisecond); got != 25*time.Millisecond {
+		t.Fatalf("initial delay with small cap = %s, want 25ms", got)
+	}
+	if got := nextPostSwitchIdentityPollDelay(400*time.Millisecond, 0); got != 500*time.Millisecond {
+		t.Fatalf("non-positive cap next delay = %s, want 500ms", got)
+	}
+}
+
 func TestRefreshPostSwitchIdentityDoesNotRequireSPNForVoWiFiRestore(t *testing.T) {
 	p := NewPool(&config.Config{})
 	be := &esimSwitchRestoreBackendStub{
@@ -1638,6 +1744,9 @@ func TestHandleESIMSwitchFailedWithErrorClearsSwitchingWithoutQMIRecovery(t *tes
 func TestRefreshPostSwitchIdentityWaitsForIMSIAfterICCIDMatch(t *testing.T) {
 	// 验证修复：切卡后 ICCID 快速生效，但 IMSI 仍在 USIM 重初始化窗口（0x0030/0x0025）。
 	// 轮询不应该在 ICCID 命中后立即退出，应该等 IMSI 也成功读出。
+	originalInterval := postSwitchIdentityPollInterval
+	postSwitchIdentityPollInterval = 2 * time.Second
+	t.Cleanup(func() { postSwitchIdentityPollInterval = originalInterval })
 	p := NewPool(&config.Config{})
 	defer p.cancel()
 
@@ -1664,8 +1773,10 @@ func TestRefreshPostSwitchIdentityWaitsForIMSIAfterICCIDMatch(t *testing.T) {
 	worker.state.Identity.IMSI = "old-imsi"
 	worker.cacheMu.Unlock()
 
-	// 调用身份刷新
+	// 调用身份刷新；2s 是最大间隔而非首个固定等待，快路径应在 1s 内完成。
+	startedAt := time.Now()
 	ok, err := p.refreshPostSwitchIdentity("dev-1", worker, esimSwitchContext{TargetICCID: "target-iccid-123"})
+	elapsed := time.Since(startedAt)
 
 	if !ok {
 		t.Fatalf("refreshPostSwitchIdentity failed: %v", err)
@@ -1689,6 +1800,9 @@ func TestRefreshPostSwitchIdentityWaitsForIMSIAfterICCIDMatch(t *testing.T) {
 	imsiCallsMu.Unlock()
 	if calls < 3 {
 		t.Fatalf("IMSI read calls=%d want >= 3 (should wait for IMSI to be ready)", calls)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("identity convergence elapsed=%s, want exponential fast path under 1s", elapsed)
 	}
 }
 

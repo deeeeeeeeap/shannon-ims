@@ -40,11 +40,61 @@ type esimSwitchContext struct {
 	PhaseUpdatedAt       time.Time
 }
 
+const (
+	postSwitchIdentityDefaultPollTimeout  = 10 * time.Second
+	postSwitchIdentityDefaultPollInterval = 500 * time.Millisecond
+	postSwitchIdentityInitialPollDelay    = 100 * time.Millisecond
+	postSwitchIdentityLiveReadTimeout     = 5 * time.Second
+)
+
 var (
-	postSwitchIdentityPollTimeout  = 10 * time.Second
-	postSwitchIdentityPollInterval = 500 * time.Millisecond
+	postSwitchIdentityPollTimeout  = postSwitchIdentityDefaultPollTimeout
+	postSwitchIdentityPollInterval = postSwitchIdentityDefaultPollInterval
 	postSwitchIdentityRetryDelays  = []time.Duration{time.Second, 3 * time.Second, 6 * time.Second}
 )
+
+func initialPostSwitchIdentityPollDelay(capDelay time.Duration) time.Duration {
+	if capDelay <= 0 {
+		capDelay = postSwitchIdentityDefaultPollInterval
+	}
+	if capDelay < postSwitchIdentityInitialPollDelay {
+		return capDelay
+	}
+	return postSwitchIdentityInitialPollDelay
+}
+
+func nextPostSwitchIdentityPollDelay(current, capDelay time.Duration) time.Duration {
+	if capDelay <= 0 {
+		capDelay = postSwitchIdentityDefaultPollInterval
+	}
+	if current <= 0 {
+		return initialPostSwitchIdentityPollDelay(capDelay)
+	}
+	if current >= capDelay || current > capDelay/2 {
+		return capDelay
+	}
+	return current * 2
+}
+
+func waitPostSwitchIdentityPoll(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		return fmt.Errorf("post_switch_identity_context_missing")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 func (w *Worker) setSwitchEventSource(src *switchEventSource) {
 	if w == nil {
@@ -135,7 +185,7 @@ func (p *Pool) beginESIMSwitch(deviceID string, targetICCID string) esimSwitchCo
 		"qmi_connected_before", snapshot.QMIConnectedBefore,
 		"network_enabled_before", snapshot.NetworkEnabledBefore,
 		"target_iccid", snapshot.TargetICCID,
-		"switch_phase", snapshot.Phase)
+		"switch_phase", string(snapshot.Phase))
 	return snapshot
 }
 
@@ -157,7 +207,7 @@ func (p *Pool) markESIMSwitchPhaseIfToken(deviceID string, token uint64, phase e
 		p.switchMu.Unlock()
 		logger.Debug("忽略过期 eSIM 切卡阶段更新",
 			"device", deviceID,
-			"switch_phase", phase,
+			"switch_phase", string(phase),
 			"switch_token", token,
 			"current_switch_token", currentToken)
 		return false
@@ -177,7 +227,7 @@ func (p *Pool) markESIMSwitchPhaseIfToken(deviceID string, token uint64, phase e
 	p.switchMu.Unlock()
 	logger.Info("eSIM 切卡阶段更新",
 		"device", deviceID,
-		"switch_phase", phase,
+		"switch_phase", string(phase),
 		"switch_token", logToken,
 		"phase_ms", phaseMS,
 		"phase_known", ok)
@@ -367,16 +417,26 @@ func (p *Pool) handleESIMSwitchBefore(deviceID string, targetICCID string) uint6
 func (p *Pool) refreshPostSwitchIdentity(deviceID string, worker *Worker, snapshot esimSwitchContext) (bool, error) {
 	pollTimeout := postSwitchIdentityPollTimeout
 	if pollTimeout <= 0 {
-		pollTimeout = 10 * time.Second
+		pollTimeout = postSwitchIdentityDefaultPollTimeout
 	}
 	pollInterval := postSwitchIdentityPollInterval
 	if pollInterval <= 0 {
-		pollInterval = 500 * time.Millisecond
+		pollInterval = postSwitchIdentityDefaultPollInterval
 	}
-	return p.refreshPostSwitchIdentityWithPolling(deviceID, worker, snapshot, pollTimeout, pollInterval)
+	// Switch completion is callback-driven and has no request-scoped context;
+	// the Pool lifecycle is the narrowest owner that covers both immediate and
+	// deferred identity convergence work.
+	return p.refreshPostSwitchIdentityWithPolling(p.ctx, deviceID, worker, snapshot, pollTimeout, pollInterval)
 }
 
-func (p *Pool) refreshPostSwitchIdentityWithPolling(deviceID string, worker *Worker, snapshot esimSwitchContext, pollTimeout time.Duration, pollInterval time.Duration) (bool, error) {
+func (p *Pool) refreshPostSwitchIdentityWithPolling(ctx context.Context, deviceID string, worker *Worker, snapshot esimSwitchContext, pollTimeout time.Duration, pollInterval time.Duration) (bool, error) {
+	if ctx == nil {
+		return false, fmt.Errorf("post_switch_identity_context_missing")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	oldICCID := normalizeSIMIdentity(snapshot.ICCIDBefore)
 	oldIMSI := normalizeSIMIdentity(snapshot.IMSIBefore)
 	targetICCID := normalizeSIMIdentity(snapshot.TargetICCID)
@@ -404,21 +464,42 @@ func (p *Pool) refreshPostSwitchIdentityWithPolling(deviceID string, worker *Wor
 	// 切卡后 DMS/UIM 服务内部更新新卡身份需要时间。
 	// 单次 GetICCIDLive 可能返回旧卡的值，目标 ICCID 已知时必须等到目标卡生效。
 	if pollTimeout <= 0 {
-		pollTimeout = 10 * time.Second
+		pollTimeout = postSwitchIdentityDefaultPollTimeout
 	}
 	if pollInterval <= 0 {
-		pollInterval = 500 * time.Millisecond
+		pollInterval = postSwitchIdentityDefaultPollInterval
 	}
 
 	var newICCID, newIMSI string
 	var iccidErr, imsiErr error
 
 	pollDeadline := time.Now().Add(pollTimeout)
+	pollDelay := initialPostSwitchIdentityPollDelay(pollInterval)
 	for {
-		liveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		remaining := time.Until(pollDeadline)
+		if remaining <= 0 {
+			logger.Warn("切卡后等待新卡身份生效超时",
+				"device", deviceID,
+				"target_iccid", targetICCID,
+				"old_iccid", oldICCID,
+				"current_iccid", newICCID,
+				"poll_timeout", pollTimeout.String())
+			break
+		}
+		attemptTimeout := postSwitchIdentityLiveReadTimeout
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+		liveCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		liveICCID, liveICCIDErr := reader.GetICCIDLive(liveCtx)
 		liveIMSI, liveIMSIErr := reader.GetIMSILive(liveCtx)
 		cancel()
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		newICCID = normalizeSIMIdentity(liveICCID)
 		newIMSI = normalizeSIMIdentity(liveIMSI)
 		iccidErr = liveICCIDErr
@@ -446,7 +527,14 @@ func (p *Pool) refreshPostSwitchIdentityWithPolling(deviceID string, worker *Wor
 				"poll_timeout", pollTimeout.String())
 			break
 		}
-		time.Sleep(pollInterval)
+		waitDelay := pollDelay
+		if remaining := time.Until(pollDeadline); remaining < waitDelay {
+			waitDelay = remaining
+		}
+		if err := waitPostSwitchIdentityPoll(ctx, waitDelay); err != nil {
+			return false, err
+		}
+		pollDelay = nextPostSwitchIdentityPollDelay(pollDelay, pollInterval)
 	}
 
 	newICCIDKey := normalizeSIMIdentityForCompare(newICCID)
@@ -656,11 +744,11 @@ func (p *Pool) schedulePostSwitchIdentityRefreshes(deviceID string, snapshot esi
 	delays := append([]time.Duration(nil), postSwitchIdentityRetryDelays...)
 	pollTimeout := postSwitchIdentityPollTimeout
 	if pollTimeout <= 0 {
-		pollTimeout = 10 * time.Second
+		pollTimeout = postSwitchIdentityDefaultPollTimeout
 	}
 	pollInterval := postSwitchIdentityPollInterval
 	if pollInterval <= 0 {
-		pollInterval = 500 * time.Millisecond
+		pollInterval = postSwitchIdentityDefaultPollInterval
 	}
 	for _, delay := range delays {
 		delay := delay
@@ -678,7 +766,7 @@ func (p *Pool) schedulePostSwitchIdentityRefreshes(deviceID string, snapshot esi
 			if worker == nil || worker.Backend == nil || !worker.SIMIdentityConvergenceMatches(snapshot.TargetICCID, snapshot.IdentityGeneration) {
 				return
 			}
-			_, err := p.refreshPostSwitchIdentityWithPolling(deviceID, worker, snapshot, pollTimeout, pollInterval)
+			_, err := p.refreshPostSwitchIdentityWithPolling(p.ctx, deviceID, worker, snapshot, pollTimeout, pollInterval)
 			if err != nil {
 				logger.Debug("切卡后补刷新 SIM 身份失败", "device", deviceID, "delay", delay.String(), "err", err)
 				return
@@ -933,7 +1021,7 @@ func (p *Pool) handleESIMSwitchFailed(deviceID string, token uint64) {
 	logger.Warn("eSIM 切卡失败，按切卡前快照恢复 radio/data",
 		"device", deviceID,
 		"switch_token", snapshot.SwitchToken,
-		"switch_phase", snapshot.Phase,
+		"switch_phase", string(snapshot.Phase),
 		"flight_before", snapshot.FlightModeBefore,
 		"qmi_connected_before", snapshot.QMIConnectedBefore,
 		"network_enabled_before", snapshot.NetworkEnabledBefore)

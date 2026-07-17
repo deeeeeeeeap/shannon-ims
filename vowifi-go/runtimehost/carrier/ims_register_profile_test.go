@@ -20,7 +20,7 @@ func TestResolveIMSRegisterProfileXiaomiMi11(t *testing.T) {
 	if got.Profile.ContactFeatures != "phone_xiaomi" {
 		t.Fatalf("profile = %q", got.Profile.ContactFeatures)
 	}
-	if got.SIPInstanceURN != "urn:gsma:imei:8699887-766554-4" {
+	if got.SIPInstanceURN != "urn:gsma:imei:86998877-665544-0" {
 		t.Fatalf("sip instance = %q", got.SIPInstanceURN)
 	}
 	if got.RegisterExpiry != 600000*time.Second {
@@ -58,7 +58,7 @@ func TestResolveIMSRegisterProfileRMX3366SIPInstance(t *testing.T) {
 		t.Fatalf("LoadCarrierOverrides() error = %v", err)
 	}
 	got := ResolveIMSRegisterProfile("234", "10")
-	if got.SIPInstanceURN != "urn:gsma:imei:8612345-678901-2" {
+	if got.SIPInstanceURN != "urn:gsma:imei:86123456-789012-0" {
 		t.Fatalf("sip instance = %q", got.SIPInstanceURN)
 	}
 }

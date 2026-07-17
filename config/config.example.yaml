@@ -4,6 +4,8 @@ server:
 
 web:
     username: admin
+    # Startup fails closed until this placeholder is replaced locally.
+    # The independent session signing secret is generated under data/ at runtime.
     password: CHANGE_ME_BEFORE_FIRST_RUN
 
 devices:

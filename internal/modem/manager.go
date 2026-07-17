@@ -379,10 +379,15 @@ func (m *Manager) DialCall(number string) error {
 	cmd := fmt.Sprintf("ATD%s;", number)
 	_, err := m.ExecuteAT(cmd, 60*time.Second)
 	if err != nil {
-		logger.Error(fmt.Sprintf("[%s] 拨号失败", m.cfg.ID), "err", err, "number", number)
+		logger.Error(fmt.Sprintf("[%s] 拨号失败", m.cfg.ID),
+			"err", err,
+			"number_len", len(number),
+			"number_fingerprint", logger.Fingerprint(number))
 		return err
 	}
-	logger.Info(fmt.Sprintf("[%s] 拨号指令已发出", m.cfg.ID), "number", number)
+	logger.Info(fmt.Sprintf("[%s] 拨号指令已发出", m.cfg.ID),
+		"number_len", len(number),
+		"number_fingerprint", logger.Fingerprint(number))
 	return nil
 }
 
@@ -891,7 +896,13 @@ func (m *Manager) initModem() {
 
 	// 3. 采集设备信息
 	m.collectDeviceInfo()
-	logger.Info(fmt.Sprintf("[%s] 模组初始化完成", m.cfg.ID), "imei", m.imei, "iccid", m.iccid)
+	logger.Info(fmt.Sprintf("[%s] 模组初始化完成", m.cfg.ID),
+		"imei_present", m.imei != "",
+		"imei_len", len(m.imei),
+		"imei_fingerprint", logger.Fingerprint(m.imei),
+		"iccid_present", m.iccid != "",
+		"iccid_len", len(m.iccid),
+		"iccid_fingerprint", logger.Fingerprint(m.iccid))
 }
 
 // RefreshDeviceInfo 重新采集设备信息（切卡后需要更新缓存）
@@ -1526,7 +1537,11 @@ func (m *Manager) readAndProcessSMSFromStorage(storage, index string) {
 		return
 	}
 
-	logger.Debug(fmt.Sprintf("[%s] 短信内容", m.cfg.ID), "sender", sender, "content", content)
+	logger.Debug(fmt.Sprintf("[%s] 短信已解码", m.cfg.ID),
+		"sender_len", len(sender),
+		"sender_fingerprint", logger.Fingerprint(sender),
+		"content_len", len(content),
+		"content_fingerprint", logger.Fingerprint(content))
 
 	// 回调通知
 	if m.smsCallback != nil {
@@ -1979,7 +1994,9 @@ func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.Submit
 	m.SetBusy(true)
 	defer m.SetBusy(false)
 
-	logger.Info(fmt.Sprintf("[%s] 准备发送短信 (PDU)", m.cfg.ID), "to", phone)
+	logger.Info(fmt.Sprintf("[%s] 准备发送短信 (PDU)", m.cfg.ID),
+		"to_len", len(phone),
+		"to_fingerprint", logger.Fingerprint(phone))
 
 	// 确保处于 PDU 模式
 	if _, err := m.ExecuteATHigh("AT+CMGF=0", 3*time.Second); err != nil {
@@ -1994,7 +2011,10 @@ func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.Submit
 
 	for i, pduHex := range pduHexList {
 		tpduLen := tpduLenList[i]
-		logger.Debug(fmt.Sprintf("[%s] PDU 编码完成 (分片 %d/%d)", m.cfg.ID, i+1, len(pduHexList)), "pdu", pduHex, "tpdu_len", tpduLen)
+		logger.Debug(fmt.Sprintf("[%s] PDU 编码完成 (分片 %d/%d)", m.cfg.ID, i+1, len(pduHexList)),
+			"pdu_len", len(pduHex),
+			"pdu_fingerprint", logger.Fingerprint(pduHex),
+			"tpdu_len", tpduLen)
 
 		req := commandRequest{
 			cmd:          fmt.Sprintf("AT+CMGS=%d", tpduLen), // PDU 长度 (不含 SMSC)

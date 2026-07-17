@@ -1,4 +1,4 @@
-name: Shannon IMS Release Binaries
+name: Shannon IMS Runtime Bundles
 
 on:
   push:
@@ -19,12 +19,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: binary-release-${{ github.ref }}
+  group: runtime-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   validate:
-    name: Privacy and focused tests
+    name: Full validation and release contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,19 +39,53 @@ jobs:
       - name: Repository privacy check
         run: python3 scripts/check-repository-privacy.py
 
-      - name: Root module tests
-        run: |
-          go test ./internal/sim ./internal/vowifihost -count=1
-          go test ./internal/db -run '^TestEnsureSMSDeliveryPartUniqueIndex' -count=1
-          go test ./internal/device -run '^TestBuildVoWiFiStartProfile' -count=1
+      - name: Python contract tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
-      - name: Wi-Fi Calling core tests
+      - name: Root module tests
+        run: go test ./... -count=1
+
+      - name: Root static analysis
+        run: go vet ./...
+
+      - name: Wi-Fi Calling module tests
         working-directory: vowifi-go
+        run: go test ./... -count=1
+
+      - name: Wi-Fi Calling static analysis
+        working-directory: vowifi-go
+        run: go vet ./...
+
+      - name: Critical race tests
+        run: >-
+          go test -race
+          ./internal/apduarbiter
+          ./internal/device
+          ./internal/vowifihost
+          ./pkg/logger
+          -count=1
+
+      - name: Wi-Fi Calling race tests
+        working-directory: vowifi-go
+        run: >-
+          go test -race
+          ./internal/vowifi/ipsec3gpp
+          ./internal/vowifi/imscore
+          ./runtimehost/simauth
+          ./runtimehost/voiceclient
+          -count=1
+
+      - name: Runtime deployment script tests
+        shell: bash
         run: |
-          go test ./internal/vowifi/imscore ./runtimehost/simauth ./internal/vowifi/ipsec3gpp ./runtimehost/voiceclient -run Test -skip '^TestFormatGSMAIMEIURN$' -count=1
+          bash scripts/tests/check-runtime-deps_test.sh
+          bash scripts/tests/build-strongswan-plugins_test.sh
+          bash scripts/tests/install-local_test.sh
+          bash scripts/tests/package-release-bundle_test.sh
+          bash scripts/tests/verify-release-bundle_test.sh
 
   frontend:
-    name: Build frontend assets
+    name: Frontend lint, typecheck, and build
     runs-on: ubuntu-latest
     needs: validate
     steps:
@@ -69,6 +103,8 @@ jobs:
         shell: bash
         run: |
           npm ci --prefix web
+          npm run lint --prefix web
+          npm run typecheck --prefix web
           npm run build --prefix web
 
       - name: Upload frontend dist
@@ -190,18 +226,31 @@ jobs:
         run: |
           upx --best --lzma dist/shannon-ims || upx -9 dist/shannon-ims
 
-      - name: Package artifacts
+      - name: Package runtime-aware release bundle
         shell: bash
         run: |
-          OUT="shannon-ims_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}"
-          mkdir -p out
-          cp dist/shannon-ims "out/${OUT}"
+          bash scripts/package-release-bundle.sh \
+            --binary dist/shannon-ims \
+            --version "${{ steps.vars.outputs.version }}" \
+            --arch "${{ matrix.artifact_arch }}" \
+            --output out
+
+      - name: Verify release bundle
+        shell: bash
+        run: |
+          bash scripts/verify-release-bundle.sh \
+            --archive "out/shannon-ims_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}.tar.gz" \
+            --arch "${{ matrix.artifact_arch }}" \
+            | tee "out/shannon-ims_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}.bundle-smoke.txt"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.artifact_arch }}
-          path: out/*
+          name: runtime-bundle-${{ matrix.artifact_arch }}
+          path: |
+            out/*.tar.gz
+            out/*.tar.gz.sha256
+            out/*.bundle-smoke.txt
           retention-days: 3
 
   release:
@@ -220,7 +269,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: binaries-*
+          pattern: runtime-bundle-*
           merge-multiple: true
           path: dist
 
@@ -233,4 +282,18 @@ jobs:
         with:
           tag_name: ${{ steps.release_vars.outputs.release_version }}
           generate_release_notes: true
+          body: |
+            The release archives include the Shannon IMS binary, release/runtime manifests,
+            detached and in-bundle SHA-256 checksums, deployment scripts, and custom strongSwan
+            plugin sources.
+
+            Wi-Fi Calling is not a single-binary deployment. Build the two custom plugins against
+            the target machine's matching configured strongSwan source, install them into that
+            runtime's plugin directory, and require `scripts/check-runtime-deps.sh` to pass before
+            starting the application.
+
+            发布包包含主程序、发布/运行时 manifest、归档内外 SHA-256 校验、部署脚本和
+            自定义 strongSwan 插件源码。
+            Wi-Fi Calling 不是单二进制部署：必须针对目标机匹配的 strongSwan configured source
+            构建并安装两个插件，并在启动前确认 `scripts/check-runtime-deps.sh` 通过。
           files: dist/*

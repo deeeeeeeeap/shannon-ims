@@ -1,70 +1,91 @@
 package logger
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"unicode/utf8"
 )
 
-var reLongDigits = regexp.MustCompile(`\d{8,}`)
+var (
+	reLongDigits   = regexp.MustCompile(`\d{8,}`)
+	reLongHex      = regexp.MustCompile(`(?i)\b[0-9a-f]{24,}\b`)
+	reSecretKV     = regexp.MustCompile(`(?i)\b(authorization|proxy-authorization|bearer|token|password|secret|rand|autn|auts|res|xres|ck|ik|nonce|pdu|payload|content)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)`)
+	fingerprintKey = newFingerprintKey()
+)
 
-func envEnabled(name string) bool {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+func newFingerprintKey() []byte {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil
+	}
+	return key
 }
 
-// ShouldLogSIPRaw 返回是否允许输出 SIP 原文。
+// ShouldLogSIPRaw is retained for compatibility; raw SIP logging is disabled.
 func ShouldLogSIPRaw() bool {
-	return envEnabled("VOHIVE_SIP_LOG_RAW")
+	return false
 }
 
-// ShouldLogSMSContent 返回是否允许输出短信明文。
+// ShouldLogSMSContent is retained for compatibility; SMS plaintext logging is disabled.
 func ShouldLogSMSContent() bool {
-	return envEnabled("VOHIVE_SMS_LOG_CONTENT")
+	return false
 }
 
 // RedactSIPRaw 对 SIP 原文做脱敏。
 func RedactSIPRaw(raw string) string {
-	if raw == "" {
-		return raw
+	return RedactText(raw)
+}
+
+// RedactSMSContent always emits metadata; runtime flags cannot enable plaintext.
+func RedactSMSContent(content string) string {
+	return redactionSummary("sms_content", content)
+}
+
+// RedactText removes credential assignments, raw auth headers, long identities,
+// and opaque blobs from free-form messages and errors.
+func RedactText(text string) string {
+	if text == "" {
+		return ""
 	}
-	lines := strings.Split(raw, "\n")
+	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		trim := strings.TrimSpace(line)
-		lower := strings.ToLower(trim)
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
 		if strings.HasPrefix(lower, "authorization:") || strings.HasPrefix(lower, "proxy-authorization:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				lines[i] = parts[0] + ": [REDACTED]\r"
-				continue
-			}
-			lines[i] = "Authorization: [REDACTED]\r"
+			name := strings.SplitN(trimmed, ":", 2)[0]
+			lines[i] = name + ": [REDACTED]"
 			continue
 		}
-		lines[i] = reLongDigits.ReplaceAllStringFunc(line, maskLongDigits)
+		line = reSecretKV.ReplaceAllString(line, "${1}${2}[REDACTED]")
+		line = reLongDigits.ReplaceAllStringFunc(line, func(value string) string {
+			return redactionSummary("digits", value)
+		})
+		line = reLongHex.ReplaceAllStringFunc(line, func(value string) string {
+			return redactionSummary("hex", value)
+		})
+		lines[i] = line
 	}
 	return strings.Join(lines, "\n")
 }
 
-// RedactSMSContent 统一短信内容脱敏；开启 VOHIVE_SMS_LOG_CONTENT 时返回明文。
-func RedactSMSContent(content string) string {
-	if ShouldLogSMSContent() {
-		return content
+// Fingerprint returns a short one-way diagnostic identifier, never raw input.
+func Fingerprint(value string) string {
+	if value == "" {
+		return "missing"
 	}
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return "[REDACTED len=0]"
+	if len(fingerprintKey) == 0 {
+		return "unavailable"
 	}
-	return fmt.Sprintf("[REDACTED len=%d]", utf8.RuneCountInString(content))
+	mac := hmac.New(sha256.New, fingerprintKey)
+	_, _ = mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil)[:8])
 }
 
-func maskLongDigits(s string) string {
-	if len(s) <= 6 {
-		return strings.Repeat("*", len(s))
-	}
-	prefix := s[:3]
-	suffix := s[len(s)-2:]
-	return prefix + strings.Repeat("*", len(s)-5) + suffix
+func redactionSummary(kind, value string) string {
+	return fmt.Sprintf("[REDACTED kind=%s len=%d fp=%s]", normalizeLogKey(kind), utf8.RuneCountInString(value), Fingerprint(value))
 }

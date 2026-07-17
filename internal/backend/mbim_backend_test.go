@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
 	"github.com/1239t/vohive/pkg/mbim"
 	"github.com/1239t/vohive/pkg/smscodec"
+	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
 	"github.com/warthog618/sms/encoding/tpdu"
 )
 
@@ -103,11 +103,11 @@ func (f *fakeMBIMSource) UIMPowerOnSIM(context.Context, uint8) error {
 	return nil
 }
 
-// 原运营商应取 HomeProvider 的 PLMN(MNC 长度正确,3 位 → 6 位),而不是 IMSI 截 2 位。
+// 原运营商应优先取 HomeProvider 的 PLMN，而不是 IMSI 中的不同 HPLMN。
 func TestMBIMBackendGetNativeMCCMNCUsesHomeProviderLength(t *testing.T) {
 	src := &fakeMBIMSource{
-		sub:          mbim.SubscriberReady{IMSI: "310990000000003"}, // IMSI[3:5]="84"(错)
-		homeProvider: mbim.Provider{PLMN: "310840"},                 // 正确 3 位 MNC
+		sub:          mbim.SubscriberReady{IMSI: "310260000000003"},
+		homeProvider: mbim.Provider{PLMN: "310840"},
 	}
 	b := NewMBIMBackend("", src)
 
@@ -124,7 +124,7 @@ func TestMBIMBackendGetNativeMCCMNCUsesHomeProviderLength(t *testing.T) {
 // 仍应靠 IMSI+MCC 表得到正确的 3 位 MNC(310→280),而不是截成 2 位。
 func TestMBIMBackendGetNativeMCCMNCUsesMCCTableWhenNoHomeProviderNoEFAD(t *testing.T) {
 	src := &fakeMBIMSource{
-		sub:             mbim.SubscriberReady{IMSI: "310990000000002"},
+		sub:             mbim.SubscriberReady{IMSI: "310280000000002"},
 		homeProviderErr: fmt.Errorf("home provider unavailable"),
 		efFn:            func(uint16) ([]byte, error) { return nil, fmt.Errorf("UICC_OPEN_CHANNEL status=0x87430002") },
 	}

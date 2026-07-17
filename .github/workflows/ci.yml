@@ -1,0 +1,204 @@
+name: Shannon IMS CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go test and vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            vowifi-go/go.sum
+
+      - name: Root module tests
+        run: go test ./... -count=1
+
+      - name: Root module vet
+        run: go vet ./...
+
+      - name: Wi-Fi Calling module tests
+        working-directory: vowifi-go
+        run: go test ./... -count=1
+
+      - name: Wi-Fi Calling module vet
+        working-directory: vowifi-go
+        run: go vet ./...
+
+  race:
+    name: Critical concurrency race tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            vowifi-go/go.sum
+
+      - name: Root concurrency modules
+        run: >-
+          go test -race
+          ./internal/apduarbiter
+          ./internal/device
+          ./internal/vowifihost
+          ./pkg/logger
+          -count=1
+
+      - name: Wi-Fi Calling concurrency modules
+        working-directory: vowifi-go
+        run: >-
+          go test -race
+          ./internal/vowifi/ipsec3gpp
+          ./internal/vowifi/imscore
+          ./runtimehost/simauth
+          ./runtimehost/voiceclient
+          -count=1
+
+  frontend:
+    name: Frontend lint, typecheck, and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install locked frontend dependencies
+        run: npm ci --prefix web
+
+      - name: Lint frontend
+        run: npm run lint --prefix web
+
+      - name: Typecheck frontend
+        run: npm run typecheck --prefix web
+
+      - name: Build frontend
+        run: npm run build --prefix web
+
+      - name: Upload frontend assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  privacy-runtime:
+    name: Privacy and runtime contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Repository privacy scan
+        run: python3 scripts/check-repository-privacy.py
+
+      - name: Python contract tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Runtime and packaging script tests
+        shell: bash
+        run: |
+          bash scripts/tests/check-runtime-deps_test.sh
+          bash scripts/tests/build-strongswan-plugins_test.sh
+          bash scripts/tests/install-local_test.sh
+          bash scripts/tests/package-release-bundle_test.sh
+          bash scripts/tests/verify-release-bundle_test.sh
+
+  bundle-smoke:
+    name: Linux amd64 release bundle smoke
+    runs-on: ubuntu-latest
+    needs: [go, race, frontend, privacy-runtime]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download frontend assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+
+      - name: Sync embedded frontend assets
+        shell: bash
+        run: |
+          rm -rf internal/web/dist
+          mkdir -p internal/web
+          cp -R web/dist internal/web/dist
+
+      - name: Prepare RC metadata
+        id: metadata
+        shell: bash
+        run: |
+          echo "version=ci-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux amd64 binary
+        shell: bash
+        run: |
+          mkdir -p dist/ci
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -trimpath -buildvcs=false \
+            -tags "with_utls nomsgpack" \
+            -ldflags "-s -w -X 'github.com/1239t/vohive/internal/global.Version=${{ steps.metadata.outputs.version }}' -X 'github.com/1239t/vohive/internal/global.BuildTime=${{ steps.metadata.outputs.build_time }}'" \
+            -o dist/ci/shannon-ims ./cmd/vohive
+
+      - name: Package and verify release bundle
+        shell: bash
+        run: |
+          bash scripts/package-release-bundle.sh \
+            --binary dist/ci/shannon-ims \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --arch amd64 \
+            --output dist/ci
+          bash scripts/verify-release-bundle.sh \
+            --archive "dist/ci/shannon-ims_${{ steps.metadata.outputs.version }}_linux_amd64.tar.gz" \
+            --arch amd64 | tee dist/ci/bundle-smoke.txt
+
+      - name: Upload verified bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-amd64-bundle
+          path: |
+            dist/ci/*.tar.gz
+            dist/ci/*.tar.gz.sha256
+            dist/ci/bundle-smoke.txt
+          if-no-files-found: error
+          retention-days: 3

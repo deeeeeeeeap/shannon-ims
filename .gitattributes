@@ -7,6 +7,7 @@
 *.yaml text eol=lf
 *.yml text eol=lf
 *.json text eol=lf
+**/Makefile text eol=lf
 
 # Preserve vendored SIP torture fixtures byte-for-byte and ignore upstream
 # whitespace conventions in the vendored module.

@@ -23,7 +23,7 @@ func TestXiaomiMi11RegisterProfile(t *testing.T) {
 
 func TestFormatGSMAIMEIURN(t *testing.T) {
 	got := FormatGSMAIMEIURN("869988776655443")
-	want := "urn:gsma:imei:8699887-766554-4"
+	want := "urn:gsma:imei:86998877-665544-0"
 	if got != want {
 		t.Fatalf("FormatGSMAIMEIURN() = %q, want %q", got, want)
 	}
@@ -37,11 +37,11 @@ func TestBuildPhoneContactHeader(t *testing.T) {
 		Transport: "tcp",
 	}
 	profile := XiaomiMi11RegisterProfile()
-	header := cfg.buildContactHeader(profile, "urn:gsma:imei:8699887-766554-4", "49400748-008d-44e9-a258-2fae9bb4b2be")
+	header := cfg.buildContactHeader(profile, "urn:gsma:imei:86998877-665544-0", "49400748-008d-44e9-a258-2fae9bb4b2be")
 	for _, want := range []string{
 		`+g.3gpp.accesstype="wlan1"`,
 		"audio",
-		`urn:gsma:imei:8699887-766554-4`,
+		`urn:gsma:imei:86998877-665544-0`,
 		"expires=600000",
 	} {
 		if !strings.Contains(header, want) {

@@ -11,9 +11,13 @@ import (
 )
 
 type transportFlow struct {
-	flow   Flow
-	sa     *ipsec.SecurityAssociation
-	replay *ReplayWindow
+	flow Flow
+	// Each direction owns a distinct SA. outboundSA is the only mutable SA:
+	// NextSequenceNumber updates its atomic sequence counter. inboundSA is
+	// immutable after construction; replay state is owned separately below.
+	outboundSA *ipsec.SecurityAssociation
+	inboundSA  *ipsec.SecurityAssociation
+	replay     *ReplayWindow
 }
 
 // Transport performs userspace ESP transport-mode transforms for SIP TCP packets.
@@ -51,18 +55,23 @@ func NewTransport(policy Policy) (*Transport, error) {
 }
 
 func newTransportFlow(flow Flow) (transportFlow, error) {
-	sa, err := newSAForFlow(flow)
+	outboundSA, err := newSAForFlow(flow, flow.OutboundSPI)
+	if err != nil {
+		return transportFlow{}, err
+	}
+	inboundSA, err := newSAForFlow(flow, flow.InboundSPI)
 	if err != nil {
 		return transportFlow{}, err
 	}
 	return transportFlow{
-		flow:   flow,
-		sa:     sa,
-		replay: NewReplayWindow(defaultReplayWindowSize),
+		flow:       flow,
+		outboundSA: outboundSA,
+		inboundSA:  inboundSA,
+		replay:     NewReplayWindow(defaultReplayWindowSize),
 	}, nil
 }
 
-func newSAForFlow(flow Flow) (*ipsec.SecurityAssociation, error) {
+func newSAForFlow(flow Flow, spi uint32) (*ipsec.SecurityAssociation, error) {
 	keys, err := DeriveSecureChannelKeys(flow)
 	if err != nil {
 		return nil, err
@@ -75,7 +84,7 @@ func newSAForFlow(flow Flow) (*ipsec.SecurityAssociation, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ipsec.NewSecurityAssociationCBC(flow.OutboundSPI, enc, keys.EncKey, integ, keys.AuthKey), nil
+	return ipsec.NewSecurityAssociationCBC(spi, enc, keys.EncKey, integ, keys.AuthKey), nil
 }
 
 func encrypterForFlow(encAlg string) (crypto.Encrypter, error) {
@@ -128,7 +137,7 @@ func (t *Transport) TransformOutbound(packet []byte) ([]byte, error) {
 		t.transformErrors.Add(1)
 		return nil, fmt.Errorf("ipsec3gpp: unsupported outbound transport protocol %d", parsed.nextHeader)
 	}
-	esp, err := encapsulateTransport(parsed.transportPayload, flow.sa, parsed.nextHeader)
+	esp, err := encapsulateTransport(parsed.transportPayload, flow.outboundSA, parsed.nextHeader)
 	if err != nil {
 		t.transformErrors.Add(1)
 		return nil, err
@@ -173,8 +182,7 @@ func (t *Transport) TransformInbound(packet []byte) ([]byte, error) {
 		t.transformErrors.Add(1)
 		return nil, errors.New("ipsec3gpp: replay packet rejected")
 	}
-	recvSA := cloneSAForInbound(flow.sa, spi)
-	plain, nextHeader, err := decapsulateTransport(parsed.transportPayload, recvSA)
+	plain, nextHeader, err := decapsulateTransport(parsed.transportPayload, flow.inboundSA)
 	if err != nil {
 		t.transformErrors.Add(1)
 		return nil, err
@@ -397,15 +405,6 @@ func parseESPSPISeq(esp []byte) (uint32, uint32, error) {
 		return 0, 0, errors.New("ipsec3gpp: ESP payload too short")
 	}
 	return binary.BigEndian.Uint32(esp[0:4]), binary.BigEndian.Uint32(esp[4:8]), nil
-}
-
-func cloneSAForInbound(template *ipsec.SecurityAssociation, spi uint32) *ipsec.SecurityAssociation {
-	if template == nil {
-		return nil
-	}
-	sa := *template
-	sa.SPI = spi
-	return &sa
 }
 
 func encapsulateTransport(plaintext []byte, sa *ipsec.SecurityAssociation, nextHeader uint8) ([]byte, error) {

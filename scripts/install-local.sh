@@ -4,10 +4,18 @@ set -euo pipefail
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary=${1:?usage: install-local.sh <binary> [prefix]}
 prefix=${2:-/opt/shannon-ims}
+preflight="$root_dir/scripts/check-runtime-deps.sh"
 
 test -f "$binary"
 
-install -d -m 0755 "$prefix/bin" "$prefix/config" "$prefix/data" "$prefix/logs"
+if ! bash "$preflight"; then
+  printf 'install_status=blocked\n'
+  printf 'reason=runtime_preflight_failed\n'
+  exit 1
+fi
+
+install -d -m 0755 "$prefix/bin" "$prefix/config" "$prefix/logs"
+install -d -m 0700 "$prefix/data"
 install -m 0755 "$binary" "$prefix/bin/shannon-ims"
 
 if [[ ! -e "$prefix/config/config.yaml" ]]; then
@@ -20,3 +28,4 @@ fi
 
 printf 'installed_binary=%s\n' "$prefix/bin/shannon-ims"
 printf 'run_command=%s\n' "$prefix/bin/shannon-ims -c $prefix/config/config.yaml"
+printf 'install_status=pass\n'

@@ -10,27 +10,56 @@ var (
 	globalConfig *Config
 	configMu     sync.RWMutex
 	configPath   string
+	secureWeb    bool
 )
 
 // InitGlobalManager 初始化全局配置管理器，将首次从文件加载到内存
 func InitGlobalManager(path string) error {
+	configMu.Lock()
 	configPath = path
+	secureWeb = false
+	configMu.Unlock()
 	return ReloadFromFile()
 }
 
-// ReloadFromFile 从磁盘重新加载最新配置到内存，通常在任何更新配置的动作后主动调用
-func ReloadFromFile() error {
-	if configPath == "" {
-		return nil
-	}
-	cfg, err := Load(configPath)
+// InitGlobalManagerForStartup is the production entry point. It validates the
+// Web authentication boundary before publishing the configuration globally.
+func InitGlobalManagerForStartup(path string) error {
+	cfg, err := LoadForStartup(path)
 	if err != nil {
 		return err
 	}
 	configMu.Lock()
+	configPath = path
+	globalConfig = cfg
+	secureWeb = true
+	configMu.Unlock()
+	logger.Info("配置文件已从磁盘加载到内存", "path", path)
+	return nil
+}
+
+// ReloadFromFile 从磁盘重新加载最新配置到内存，通常在任何更新配置的动作后主动调用
+func ReloadFromFile() error {
+	configMu.RLock()
+	path := configPath
+	requireSecureWeb := secureWeb
+	configMu.RUnlock()
+	if path == "" {
+		return nil
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if requireSecureWeb {
+		if err := ValidateWebCredentials(cfg.Web); err != nil {
+			return err
+		}
+	}
+	configMu.Lock()
 	globalConfig = cfg
 	configMu.Unlock()
-	logger.Info("配置文件已从磁盘热加载到内存", "path", configPath)
+	logger.Info("配置文件已从磁盘热加载到内存", "path", path)
 	return nil
 }
 

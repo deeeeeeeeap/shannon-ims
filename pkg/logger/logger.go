@@ -294,7 +294,7 @@ func Setup(cfg LogConfig) {
 	// SSE 日志推送核心（用于前端实时日志）
 	sseCore := NewSSECore(GlobalBroadcaster, level)
 
-	core := &devicePrefixCore{Core: zapcore.NewTee(consoleCore, fileCore, sseCore)}
+	core := &devicePrefixCore{Core: newRedactingCore(zapcore.NewTee(consoleCore, fileCore, sseCore))}
 
 	log := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
 	sugar := log.Sugar()

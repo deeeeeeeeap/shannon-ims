@@ -84,8 +84,14 @@ type Server struct {
 
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
+	sessionSecret []byte
 
 	shutdownCh chan struct{}
+
+	// uninstallRunner is the destructive uninstall boundary. Production uses
+	// runDefaultUninstall; tests inject a harmless observer so routing and
+	// authorization can be verified without touching the filesystem/process.
+	uninstallRunner func()
 }
 
 type realtimeTrafficSubscriber interface {
@@ -94,12 +100,22 @@ type realtimeTrafficSubscriber interface {
 
 // New 创建一个新的 API 服务器实例
 // proxyMgr 参数可为 nil，此时代理管理功能不可用
-func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *server.Manager, voiceGW *voicehost.Gateway, notifyMgr *notify.Manager, configPath string) *Server {
+func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *server.Manager, voiceGW *voicehost.Gateway, notifyMgr *notify.Manager, configPath string) (*Server, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("initialize API server: config is required")
+	}
+	if err := config.ValidateWebCredentials(cfg.Web); err != nil {
+		return nil, err
+	}
 	if !cfg.Server.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	if strings.TrimSpace(configPath) == "" {
 		configPath = "config/config.yaml"
+	}
+	sessionSecret, err := loadOrCreateSessionSecret(sessionSecretPath(configPath))
+	if err != nil {
+		return nil, fmt.Errorf("initialize API session signing: %w", err)
 	}
 	s := &Server{
 		cfg:           cfg.Server,
@@ -114,10 +130,11 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		proxyRepo:     repo.NewDBRepo(),
 		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
 		loginAttempts: make(map[string]loginAttempt),
+		sessionSecret: sessionSecret,
 		shutdownCh:    make(chan struct{}),
 	}
 
-	return s
+	return s, nil
 }
 
 func (s *Server) SetRealtimeTraffic(m *proxytraffic.RealtimeManager) {
@@ -137,12 +154,13 @@ func checkPassword(stored, input string) bool {
 }
 
 func (s *Server) issueSessionToken() (string, time.Time, error) {
+	if len(s.sessionSecret) != sessionSecretSize {
+		return "", time.Time{}, fmt.Errorf("session signing is unavailable")
+	}
 	exp := time.Now().Add(30 * 24 * time.Hour) // 有效期 30 天
 	expStr := strconv.FormatInt(exp.Unix(), 10)
 
-	h := hmac.New(sha256.New, []byte(s.auth.Password))
-	h.Write([]byte(expStr))
-	sig := hex.EncodeToString(h.Sum(nil))
+	sig := hex.EncodeToString(s.sessionTokenMAC(expStr))
 
 	tokenRaw := expStr + "." + sig
 	token := base64.StdEncoding.EncodeToString([]byte(tokenRaw))
@@ -225,7 +243,6 @@ func (s *Server) newRouter() *gin.Engine {
 	api.POST("/auth/login", s.handleLogin)
 	api.POST("/rotateip", s.handleRotate)
 	api.OPTIONS("/logs/stream", s.handleLogStreamOptions)
-	api.POST("/system/uninstall", s.handleUninstall)
 	s.registerWebsheetRoutes(api)
 
 	// 以下接口需要鉴权
@@ -258,6 +275,7 @@ func (s *Server) newRouter() *gin.Engine {
 		api.GET("/system/info", s.handleSystemInfo)            // 获取系统运行与版本信息
 		api.GET("/system/update/check", s.handleCheckUpdate)   // 检查系统更新
 		api.POST("/system/update/apply", s.handleApplyUpdate)  // 应用系统更新
+		api.POST("/system/uninstall", s.handleUninstall)       // 卸载当前实例
 
 		api.GET("/devices", s.handleDeviceMgmtList)                                            // 获取设备列表（管理页用）
 		api.POST("/devices", s.handleDeviceMgmtAddDevice)                                      // 添加新设备
@@ -1960,6 +1978,17 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 		})
 		return
 	}
+	if err := config.ValidateWebCredentials(config.WebConfig{
+		Username: s.auth.Username,
+		Password: req.NewPassword,
+	}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status":  "error",
+			"code":    "unsafe_password",
+			"message": "新密码不能使用默认值或占位值",
+		})
+		return
+	}
 
 	// 生成 bcrypt 哈希
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
@@ -2049,6 +2078,9 @@ func (s *Server) authorizeRotate(c *gin.Context, username string, password strin
 }
 
 func (s *Server) isSessionTokenValid(token string, now time.Time) bool {
+	if len(s.sessionSecret) != sessionSecretSize {
+		return false
+	}
 	decodedBytes, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
 		return false
@@ -2067,11 +2099,20 @@ func (s *Server) isSessionTokenValid(token string, now time.Time) bool {
 		return false
 	}
 
-	h := hmac.New(sha256.New, []byte(s.auth.Password))
-	h.Write([]byte(expStr))
-	expectedSig := hex.EncodeToString(h.Sum(nil))
+	expectedSig := hex.EncodeToString(s.sessionTokenMAC(expStr))
 
 	return hmac.Equal([]byte(sig), []byte(expectedSig))
+}
+
+func (s *Server) sessionTokenMAC(expStr string) []byte {
+	h := hmac.New(sha256.New, s.sessionSecret)
+	_, _ = io.WriteString(h, "shannon-ims-session-v1\n")
+	_, _ = io.WriteString(h, expStr)
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, s.auth.Username)
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, s.auth.Password)
+	return h.Sum(nil)
 }
 
 func (s *Server) requestSessionToken(c *gin.Context) string {

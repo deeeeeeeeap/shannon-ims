@@ -57,7 +57,7 @@ func (c *Client) registerWithResync(ctx context.Context) error {
 			logger.Int("variant_total", len(variants)),
 			logger.String("register_profile", c.registerProfile.ContactFeatures),
 			logger.Bool("cellular_network_info", c.registerProfile.IncludeCellularNetwork),
-			logger.String("initial_authorization", c.registerProfile.InitialAuthorization))
+			logger.String("initial_auth_mode", c.registerProfile.InitialAuthorization))
 		err := c.registerOnce(ctx)
 		if err == nil {
 			return nil

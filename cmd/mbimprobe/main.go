@@ -4,14 +4,30 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"time"
-	"encoding/hex"
 
 	dev "github.com/1239t/vohive/internal/device"
 	mbimcore "github.com/1239t/vohive/internal/mbim"
+	"github.com/1239t/vohive/pkg/logger"
 )
+
+func safeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return logger.RedactText(err.Error())
+}
+
+func byteMetadata(value []byte) string {
+	return fmt.Sprintf("len=%d fingerprint=%s", len(value), logger.Fingerprint(string(value)))
+}
+
+func textMetadata(value string) string {
+	return fmt.Sprintf("present=%t len=%d fingerprint=%s", value != "", len(value), logger.Fingerprint(value))
+}
 
 func main() {
 	mode := "probe"
@@ -51,7 +67,7 @@ func runSimAuth() {
 	defer ocancel()
 	m := mbimcore.New(node, "auto")
 	if err := m.Open(octx); err != nil {
-		fmt.Println("Open 失败:", err)
+		fmt.Println("Open 失败:", safeError(err))
 		os.Exit(1)
 	}
 	defer m.Close()
@@ -59,10 +75,10 @@ func runSimAuth() {
 
 	aidStr, source, err := m.ResolveLogicalChannelAID("usim", "")
 	if err != nil {
-		fmt.Println("智能选卡提取 USIM 失败:", err)
+		fmt.Println("智能选卡提取 USIM 失败:", safeError(err))
 		return
 	}
-	fmt.Printf("成功提取 USIM 长 AID: %s (Source: %s)\n", aidStr, source)
+	fmt.Printf("成功提取 USIM 长 AID: %s source=%s\n", textMetadata(aidStr), source)
 
 	aid, _ := hex.DecodeString(aidStr)
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
@@ -70,7 +86,7 @@ func runSimAuth() {
 
 	ch, err := m.OpenChannel(ctx, aid)
 	if err != nil {
-		fmt.Printf("OpenChannel(USIM) 失败: %v\n", err)
+		fmt.Printf("OpenChannel(USIM) 失败: %s\n", safeError(err))
 		return
 	}
 	fmt.Printf("OpenChannel(USIM) OK channel=%d\n", ch)
@@ -86,13 +102,13 @@ func runSimAuth() {
 	apdu = append(apdu, 0x10)
 	apdu = append(apdu, autnBytes...)
 
-	fmt.Printf("发送 3G AKA 鉴权 APDU: %X\n", apdu)
+	fmt.Printf("发送 3G AKA 鉴权 APDU: %s\n", byteMetadata(apdu))
 	resp, err := m.TransmitAPDU(ctx, ch, apdu)
 	if err != nil {
-		fmt.Println("TransmitAPDU(AKA) 失败:", err)
+		fmt.Println("TransmitAPDU(AKA) 失败:", safeError(err))
 		return
 	}
-	fmt.Printf("TransmitAPDU(AKA) 响应: %X\n", resp)
+	fmt.Printf("TransmitAPDU(AKA) 响应: %s\n", byteMetadata(resp))
 	if len(resp) >= 2 && resp[len(resp)-2] == 0x98 && resp[len(resp)-1] == 0x62 {
 		fmt.Println("验证成功：收到 9862(MAC Failure)！底层逻辑通道鉴权完全打通。")
 	} else if len(resp) >= 2 && resp[len(resp)-2] == 0x61 {
@@ -115,7 +131,7 @@ func runAuth() {
 	defer ocancel()
 	m := mbimcore.New(node, "auto")
 	if err := m.Open(octx); err != nil {
-		fmt.Println("Open 失败:", err)
+		fmt.Println("Open 失败:", safeError(err))
 		os.Exit(1)
 	}
 	defer m.Close()
@@ -131,10 +147,11 @@ func runAuth() {
 	sres, kc, err := m.AuthSIM(ctx1, r16())
 	c1()
 	if err != nil {
-		fmt.Printf("AUTH_SIM(2G): 报错 -> %v\n", err)
+		fmt.Printf("AUTH_SIM(2G): 报错 -> %s\n", safeError(err))
 		fmt.Println("  判定: AUTH 服务大概率是 stub(连无 MAC 校验的 GSM 鉴权都失败)")
 	} else {
-		fmt.Printf("AUTH_SIM(2G): OK  SRES=0x%08x Kc=0x%016x\n", sres, kc)
+		authFingerprint := logger.Fingerprint(fmt.Sprintf("%08x%016x", sres, kc))
+		fmt.Printf("AUTH_SIM(2G): OK sres_present=true kc_present=true fingerprint=%s\n", authFingerprint)
 		fmt.Println("  判定: AUTH 子系统是工作的 → AKA 的 status=35 不是 stub,需查应用上下文(USIM/ISIM)")
 	}
 
@@ -142,7 +159,7 @@ func runAuth() {
 	_, _, _, _, akaErr := m.CalculateAKA(ctx2, r16(), r16())
 	c2()
 	if akaErr != nil {
-		fmt.Printf("AUTH_AKA(随机): %v  (基线:随机 AUTN 必然 MAC 失败,预期 0x23/35)\n", akaErr)
+		fmt.Printf("AUTH_AKA(随机): %s  (基线:随机 AUTN 必然 MAC 失败,预期 0x23/35)\n", safeError(akaErr))
 	} else {
 		fmt.Println("AUTH_AKA(随机): 竟然成功? 异常,随机 AUTN 不应通过 MAC")
 	}
@@ -163,14 +180,14 @@ func runScan() {
 	for i, m := range list {
 		fmt.Printf("[%d] mode=%s transport=%s vid:pid=%04x:%04x driver=%s\n",
 			i, m.Mode, m.TransportType, m.VendorID, m.ProductID, m.DriverName)
-		fmt.Printf("    control=%s net=%s usb=%s netcap=%v IMEI=%s AT=%v\n",
-			m.ControlPath, m.NetInterface, m.USBPath, m.NetworkCapable, m.IMEI, m.ATPorts)
+		fmt.Printf("    control=%s net=%s usb=%s netcap=%v imei_%s AT=%v\n",
+			m.ControlPath, m.NetInterface, m.USBPath, m.NetworkCapable, textMetadata(m.IMEI), m.ATPorts)
 		if m.Mode == "mbim" {
 			enriched, imei := dev.EnrichDiscoveredCompatibleModem(m, dev.CompatibleModemEnrichOptions{
 				EnableATProbe:  true,
 				ATProbeTimeout: 900 * time.Millisecond,
 			})
-			fmt.Printf("    [enrich] AT口=%s IMEI=%q (enrichment 未崩溃)\n", enriched.ATPort, imei)
+			fmt.Printf("    [enrich] AT口=%s imei_%s (enrichment 未崩溃)\n", enriched.ATPort, textMetadata(imei))
 		}
 	}
 }
@@ -184,7 +201,7 @@ func runUICC() {
 	defer ocancel()
 	m := mbimcore.New(node, "auto")
 	if err := m.Open(octx); err != nil {
-		fmt.Println("Open 失败:", err)
+		fmt.Println("Open 失败:", safeError(err))
 		os.Exit(1)
 	}
 	defer m.Close()
@@ -196,7 +213,7 @@ func runUICC() {
 	apps, qmiErr := m.QMIUIMApplicationList(qmiCtx)
 	qmiCancel()
 	if qmiErr != nil {
-		fmt.Printf("QMIUIMApplicationList 失败: %v\n", qmiErr)
+		fmt.Printf("QMIUIMApplicationList 失败: %s\n", safeError(qmiErr))
 	} else {
 		appTypeNames := map[uint8]string{1: "SIM(2G)", 2: "USIM(3G/4G/5G)", 3: "RUIM", 4: "CSIM", 5: "ISIM"}
 		for i, app := range apps {
@@ -204,7 +221,7 @@ func runUICC() {
 			if name == "" {
 				name = fmt.Sprintf("Unknown(%d)", app.Type)
 			}
-			fmt.Printf("  发现应用[%d]: 类型=%-14s AID=%X\n", i, name, app.AID)
+			fmt.Printf("  发现应用[%d]: 类型=%-14s AID_%s\n", i, name, byteMetadata(app.AID))
 		}
 	}
 	fmt.Println("==================================================")
@@ -223,7 +240,7 @@ func runUICC() {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 		ch, err := m.OpenChannel(ctx, c.aid)
 		if err != nil {
-			fmt.Printf("%-16s OpenChannel 失败: %v\n", c.name, err)
+			fmt.Printf("%-16s OpenChannel 失败: %s\n", c.name, safeError(err))
 			cancel()
 			continue
 		}
@@ -242,7 +259,7 @@ func runProbe() {
 	defer ocancel()
 	m := mbimcore.New(node, "direct")
 	if err := m.Open(octx); err != nil {
-		fmt.Println("Open 失败:", err)
+		fmt.Println("Open 失败:", safeError(err))
 		os.Exit(1)
 	}
 	defer m.Close()
@@ -264,42 +281,42 @@ func runProbe() {
 	step("DeviceCaps", func(ctx context.Context) string {
 		c, err := m.DeviceCaps(ctx)
 		if err != nil {
-			return "ERR " + err.Error()
+			return "ERR " + safeError(err)
 		}
-		return fmt.Sprintf("IMEI=%s FW=%s", c.DeviceID, c.FirmwareInfo)
+		return fmt.Sprintf("imei_%s FW=%s", textMetadata(c.DeviceID), c.FirmwareInfo)
 	})
 	step("Subscriber", func(ctx context.Context) string {
 		s, err := m.SubscriberReady(ctx)
 		if err != nil {
-			return "ERR " + err.Error()
+			return "ERR " + safeError(err)
 		}
-		return fmt.Sprintf("ready=%d IMSI=%s ICCID=%s", s.ReadyState, s.IMSI, s.ICCID)
+		return fmt.Sprintf("ready=%d imsi_%s iccid_%s", s.ReadyState, textMetadata(s.IMSI), textMetadata(s.ICCID))
 	})
 	step("Register", func(ctx context.Context) string {
 		r, err := m.RegisterState(ctx)
 		if err != nil {
-			return "ERR " + err.Error()
+			return "ERR " + safeError(err)
 		}
 		return fmt.Sprintf("state=%d provider=%q MCC=%s MNC=%s", r.RegisterState, r.ProviderName, r.MCC, r.MNC)
 	})
 	step("Signal", func(ctx context.Context) string {
 		s, err := m.SignalState(ctx)
 		if err != nil {
-			return "ERR " + err.Error()
+			return "ERR " + safeError(err)
 		}
 		return fmt.Sprintf("unknown=%v rssi=%d dBm=%d", s.Unknown, s.RSSI, s.DBM)
 	})
 	step("Packet", func(ctx context.Context) string {
 		p, err := m.PacketService(ctx)
 		if err != nil {
-			return "ERR " + err.Error()
+			return "ERR " + safeError(err)
 		}
 		return fmt.Sprintf("state=%d", p.State)
 	})
 	step("Radio", func(ctx context.Context) string {
 		r, err := m.RadioState(ctx)
 		if err != nil {
-			return "ERR " + err.Error()
+			return "ERR " + safeError(err)
 		}
 		return fmt.Sprintf("hw=%d sw=%d", r.Hardware, r.Software)
 	})

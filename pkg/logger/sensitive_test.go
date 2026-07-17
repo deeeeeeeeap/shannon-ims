@@ -24,11 +24,40 @@ func TestRedactSMSContentDefaultHidden(t *testing.T) {
 	}
 }
 
-func TestRedactSMSContentEnabled(t *testing.T) {
+func TestRedactSMSContentEnvironmentCannotBypass(t *testing.T) {
 	t.Setenv("VOHIVE_SMS_LOG_CONTENT", "true")
 	in := "hello world"
 	out := RedactSMSContent(in)
-	if out != in {
-		t.Fatalf("sms content should stay plaintext when enabled: got=%s", out)
+	if out == in || !strings.Contains(out, "[REDACTED") {
+		t.Fatalf("runtime environment must not bypass SMS redaction: got=%s", out)
+	}
+}
+
+func TestRawSIPLoggingCannotBeEnabledByEnvironment(t *testing.T) {
+	t.Setenv("VOHIVE_SIP_LOG_RAW", "true")
+	if ShouldLogSIPRaw() {
+		t.Fatal("runtime environment must not enable raw SIP logging")
+	}
+}
+
+func TestRedactTextPreservesLongDiagnosticIdentifiers(t *testing.T) {
+	in := "post_switch_sim_auth_not_ready"
+	if out := RedactText(in); out != in {
+		t.Fatalf("diagnostic identifier changed: got=%q want=%q", out, in)
+	}
+}
+
+func TestFingerprintIsStableWithinProcessAndDoesNotEchoInput(t *testing.T) {
+	in := strings.Repeat("synthetic", 4)
+	first := Fingerprint(in)
+	second := Fingerprint(in)
+	if first != second {
+		t.Fatalf("Fingerprint() changed within one process: %q != %q", first, second)
+	}
+	if first == in || strings.Contains(first, in) {
+		t.Fatalf("Fingerprint() echoed input: %q", first)
+	}
+	if other := Fingerprint(in + "-other"); other == first {
+		t.Fatalf("Fingerprint() collision for distinct synthetic inputs: %q", first)
 	}
 }

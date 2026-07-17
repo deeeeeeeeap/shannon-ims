@@ -58,8 +58,12 @@ func logRegisterRouting(cfg Config, req *sip.Request) {
 		logger.String("registrar", strings.TrimSpace(cfg.PCSCFAddr)),
 		logger.String("transport_target", effectiveTransportAddr(cfg)),
 		logger.String("ipsec_gateway", effectiveIPSecGatewayAddr(cfg)),
-		logger.String("route", route),
-		logger.String("request_uri", req.Recipient.String()),
-		logger.String("destination", strings.TrimSpace(req.Destination())),
+		logger.Bool("route_present", route != ""),
+		logger.Int("route_len", len(route)),
+		logger.String("route_fingerprint", diagnosticFingerprint(route)),
+		logger.Int("request_uri_len", len(req.Recipient.String())),
+		logger.String("request_uri_fingerprint", diagnosticFingerprint(req.Recipient.String())),
+		logger.Int("destination_len", len(strings.TrimSpace(req.Destination()))),
+		logger.String("destination_fingerprint", diagnosticFingerprint(req.Destination())),
 		logger.Bool("contact_present", req.GetHeader("Contact") != nil))
 }

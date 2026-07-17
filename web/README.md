@@ -1,35 +1,43 @@
-# Web 管理界面（Vue 3 + Vite）
+# Shannon IMS Web Console
 
-该目录是 EC20 4G Proxy Manager 的前端工程，提供设备状态、短信、代理实例（sing-box）等管理功能。
+Shannon IMS 的 Web 管理界面，基于 Vue 3、TypeScript、Vite、Pinia、Element Plus 和 ECharts。它负责展示模组、网络、Wi‑Fi Calling/IMS、短信、代理、日志和系统设置等运行状态，并通过后端 `/api` 接口执行经过鉴权的管理操作。
 
-## 依赖与约定
+The Shannon IMS management console is built with Vue 3, TypeScript, Vite, Pinia, Element Plus, and ECharts. It presents modem, network, Wi‑Fi Calling/IMS, SMS, proxy, log, and system state, and uses authenticated backend routes under `/api` for management actions.
 
-- 后端默认监听 `:7575`，API 前缀为 `/api`。
-- 前端开发服务器默认监听 `:5173`，并通过 Vite 代理把 `/api` 转发到 `http://127.0.0.1:7575`（见 [vite.config.ts](file:///root/ec20/go-4gproxy/web/vite.config.ts)）。
+## 本地开发 / Local development
 
-## 开发运行
+后端默认监听 `http://127.0.0.1:7575`，Vite 开发服务器默认监听 `http://127.0.0.1:5173`。开发代理只转发 `/api`；可通过 `VITE_API_PROXY_TARGET` 指向其他本地后端。
 
 ```bash
-npm i
+npm ci
 npm run dev
 ```
 
-默认访问 `http://127.0.0.1:5173/`。
+PowerShell 示例：
 
-如需在远程/容器里对外暴露，可使用：
-
-```bash
-npm run dev -- --host 0.0.0.0 --port 5174
+```powershell
+$env:VITE_API_PROXY_TARGET='http://127.0.0.1:7575'
+npm run dev
 ```
 
-## 构建
+后端公开的进程存活检查是：
 
 ```bash
+curl -fsS http://127.0.0.1:7575/ping
+```
+
+`/api/*` 路由需要先登录并携带 Bearer token。
+
+## 质量检查 / Quality checks
+
+```bash
+npm run lint
+npm run typecheck
 npm run build
 ```
 
-构建产物输出到 `web/dist`。后端会读取该目录并把它作为 SPA 静态资源托管（未命中路由时回落到 `index.html`）。
+`npm run build` 会先执行 TypeScript/Vue 类型检查，再把静态资源输出到 `web/dist`。仓库的主构建脚本随后将该目录同步到 `internal/web/dist`，由 Go 服务嵌入并托管。
 
-## 相关文档
+## 项目文档 / Project documentation
 
-- 后端与整体项目说明见 [../README.md](file:///root/ec20/go-4gproxy/README.md)
+完整的架构、构建、strongSwan 运行时和部署说明见 [../README.md](../README.md)。Release 运行时包说明见 [../packaging/runtime/README.md](../packaging/runtime/README.md)。

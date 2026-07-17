@@ -8,11 +8,13 @@ export type DocsLinks = {
 }
 
 export type UpdateInfo = {
+  enabled: boolean
   has_update: boolean
   current_version: string
   latest_version: string
   release_note: string
   is_docker: boolean
+  reason?: string
 }
 
 export type SystemInfo = {

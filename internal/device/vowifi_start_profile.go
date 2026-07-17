@@ -39,7 +39,7 @@ func (p *Pool) buildVoWiFiStartProfile(worker *Worker, traceID string) (identity
 	status := worker.ProjectDeviceStatus()
 	mcc, mnc, plmnSource := resolveVoWiFiProfileMCCMNC(liveCtx, worker, status, imsi, traceID)
 	if mcc == "" || mnc == "" {
-		return identity.Profile{}, fmt.Errorf("缺少 SIM 归属 MCC/MNC，无法构建 VoWiFi 启动画像: %s", imsi)
+		return identity.Profile{}, fmt.Errorf("缺少 SIM 归属 MCC/MNC，无法构建 VoWiFi 启动画像: imsi_present=true imsi_len=%d", len(imsi))
 	}
 
 	imei := strings.TrimSpace(status.IMEI)
@@ -66,11 +66,17 @@ func (p *Pool) buildVoWiFiStartProfile(worker *Worker, traceID string) (identity
 		"plmn_source", plmnSource,
 		"native_mcc", strings.TrimSpace(status.NativeMCC),
 		"native_mnc", strings.TrimSpace(status.NativeMNC),
-		"iccid", iccid,
-		"imsi", imsi,
+		"iccid_present", iccid != "",
+		"iccid_len", len(iccid),
+		"iccid_fingerprint", logger.Fingerprint(iccid),
+		"imsi_present", imsi != "",
+		"imsi_len", len(imsi),
+		"imsi_fingerprint", logger.Fingerprint(imsi),
 		"mcc", mcc,
 		"mnc", mnc,
-		"imei", imei)
+		"imei_present", imei != "",
+		"imei_len", len(imei),
+		"imei_fingerprint", logger.Fingerprint(imei))
 
 	return buildVoWiFiRawProfile(imsi, mcc, mnc, imei, smsc), nil
 }

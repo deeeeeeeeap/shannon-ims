@@ -232,6 +232,40 @@ type WebConfig struct {
 	Password string `mapstructure:"password"`
 }
 
+var reservedWebPasswords = map[string]struct{}{
+	"admin":                      {},
+	"change_me":                  {},
+	"change_me_before_first_run": {},
+	"change-me":                  {},
+	"change-me-before-first-run": {},
+	"changeme":                   {},
+	"default":                    {},
+	"password":                   {},
+	"placeholder":                {},
+	"replace_me":                 {},
+	"replace-me":                 {},
+	"set_me":                     {},
+	"set-me":                     {},
+	"your_password":              {},
+	"your-password":              {},
+}
+
+// ValidateWebCredentials enforces the production startup boundary without
+// echoing the rejected credential into errors or logs.
+func ValidateWebCredentials(web WebConfig) error {
+	if strings.TrimSpace(web.Username) == "" {
+		return fmt.Errorf("web authentication is not initialized: username is required")
+	}
+	password := strings.TrimSpace(web.Password)
+	if password == "" {
+		return fmt.Errorf("web authentication is not initialized: password is required")
+	}
+	if _, reserved := reservedWebPasswords[strings.ToLower(password)]; reserved {
+		return fmt.Errorf("web authentication is not initialized: replace the configured Web password before startup")
+	}
+	return nil
+}
+
 type ServerConfig struct {
 	Port  string `mapstructure:"port"`
 	Debug bool   `mapstructure:"debug"`
@@ -260,10 +294,10 @@ type DeviceConfig struct {
 	USBPath       string `mapstructure:"-"` // Deprecated: 运行时按 IMEI 现解析,绝不从文件读取
 	ATPort        string `mapstructure:"-"` // Deprecated: 运行时解析;AT 终端用 Worker.ResolvedATPort()
 	ProxyPort     int    `mapstructure:"proxy_port"`
-	ManagePort    string `mapstructure:"-"` // Deprecated: 运行时解析,绝不从文件读取
-	Interface     string `mapstructure:"-"` // Deprecated: 运行时解析,绝不从文件读取
-	QMIDevice     string `mapstructure:"-"` // Deprecated: 运行时解析,绝不从文件读取
-	ControlDevice string `mapstructure:"-"` // Deprecated: 运行时按 IMEI 现解析,绝不从文件读取
+	ManagePort    string `mapstructure:"-"`              // Deprecated: 运行时解析,绝不从文件读取
+	Interface     string `mapstructure:"-"`              // Deprecated: 运行时解析,绝不从文件读取
+	QMIDevice     string `mapstructure:"-"`              // Deprecated: 运行时解析,绝不从文件读取
+	ControlDevice string `mapstructure:"-"`              // Deprecated: 运行时按 IMEI 现解析,绝不从文件读取
 	MBIMTransport string `mapstructure:"mbim_transport"` // MBIM 传输: auto|proxy|direct，默认 auto
 	QMIUseProxy   bool   `mapstructure:"qmi_use_proxy"`  // 是否通过 libqmi qmi-proxy 打开 QMI 控制口
 	// 可选：qmi-proxy abstract socket 名称和可执行文件路径。留空使用 quectel-qmi-go 默认值。
@@ -383,7 +417,6 @@ func Load(path string) (*Config, error) {
 	viper.SetDefault("email.use_ssl", false)
 	viper.SetDefault("pushplus.enabled", false)
 	viper.SetDefault("web.username", "admin")
-	viper.SetDefault("web.password", "admin")
 	viper.SetDefault("vowifi.enabled", false)
 	viper.SetDefault("vowifi.mode", "vowifi")
 	viper.SetDefault("imscore.use_sipgo_udp", false)
@@ -417,4 +450,17 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// LoadForStartup loads configuration and rejects unsafe Web credentials before
+// any network-facing service is allowed to start.
+func LoadForStartup(path string) (*Config, error) {
+	cfg, err := Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateWebCredentials(cfg.Web); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }

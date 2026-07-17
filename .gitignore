@@ -65,6 +65,8 @@ coverage.out
 *.tmp
 *.temp
 .cache/
+__pycache__/
+*.pyc
 /server
 /reader
 vohive.code-workspace
@@ -103,6 +105,8 @@ Quectel_EC2xEG2xEG9xEM05_Series_QCFG_AT_Commands_Manual_V1.6.pdf
 *.kdbx
 /secrets/
 /credentials/
+session-secret
+.shannon-ims-session-secret
 /scripts/sync-vowifi-go.sh
 
 # 旧版容器构建文件依赖外部私有目录，不纳入本发行仓库

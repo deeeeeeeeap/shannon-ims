@@ -16,7 +16,6 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/lestrrat-go/file-rotatelogs v2.4.0+incompatible
 	github.com/miekg/dns v1.1.67
-	github.com/minio/selfupdate v0.6.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
 	github.com/things-go/go-socks5 v0.1.1
