@@ -35,17 +35,17 @@ func (w *ReplayWindow) Accept(seq uint32) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if seq == 0 {
+		w.stats.TooOld++
+		return false
+	}
+
 	if !w.initialized {
 		w.initialized = true
 		w.highest = seq
 		w.bitmap = 1
 		w.stats.Accepted++
 		return true
-	}
-
-	if seq == 0 {
-		w.stats.TooOld++
-		return false
 	}
 
 	if seq > w.highest {

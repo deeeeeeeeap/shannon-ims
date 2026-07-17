@@ -1,7 +1,10 @@
 package runtimepath
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -68,6 +71,70 @@ func TestValidateRemovalRequiresStrictChildOfRuntimeRoot(t *testing.T) {
 				t.Fatalf("ValidateRemoval(%q) error = nil, want rejection", target)
 			}
 		})
+	}
+}
+
+func TestValidateRemovalRejectsSymlinkedParentOutsideRuntimeRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	linkedParent := filepath.Join(root, "config")
+	if err := os.Symlink(outside, linkedParent); err != nil {
+		t.Skipf("directory symlink unavailable on this platform: %v", err)
+	}
+
+	target := filepath.Join(linkedParent, "config.yaml")
+	if _, err := ValidateRemoval(root, target); err == nil {
+		t.Fatalf("ValidateRemoval(%q) error = nil, want physical escape rejection", target)
+	}
+}
+
+func TestValidateRemovalRejectsWindowsJunctionOutsideRuntimeRoot(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows junction regression")
+	}
+
+	root := t.TempDir()
+	outside := t.TempDir()
+	junction := filepath.Join(root, "config")
+	output, err := exec.Command("cmd", "/c", "mklink", "/J", junction, outside).CombinedOutput()
+	if err != nil {
+		t.Skipf("directory junction unavailable: %v (%s)", err, output)
+	}
+
+	target := filepath.Join(junction, "config.yaml")
+	if _, err := ValidateRemoval(root, target); err == nil {
+		t.Fatalf("ValidateRemoval(%q) error = nil, want junction escape rejection", target)
+	}
+}
+
+func TestValidateRemovalAllowsMissingTargetUnderExistingRuntimeRoot(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "data", "not-created-yet")
+
+	got, err := ValidateRemoval(root, target)
+	if err != nil {
+		t.Fatalf("ValidateRemoval(missing target) error = %v", err)
+	}
+	if got != target {
+		t.Fatalf("ValidateRemoval(missing target) = %q, want %q", got, target)
+	}
+}
+
+func TestValidateRemovalAllowsRuntimeRootSymlinkWithoutNestedRedirect(t *testing.T) {
+	physicalRoot := t.TempDir()
+	aliasParent := t.TempDir()
+	rootAlias := filepath.Join(aliasParent, "runtime")
+	if err := os.Symlink(physicalRoot, rootAlias); err != nil {
+		t.Skipf("directory symlink unavailable on this platform: %v", err)
+	}
+
+	got, err := ValidateRemoval(rootAlias, filepath.Join(rootAlias, "data"))
+	if err != nil {
+		t.Fatalf("ValidateRemoval(root alias) error = %v", err)
+	}
+	want := filepath.Join(physicalRoot, "data")
+	if got != want {
+		t.Fatalf("ValidateRemoval(root alias) = %q, want physical target %q", got, want)
 	}
 }
 

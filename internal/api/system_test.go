@@ -1,14 +1,13 @@
 package api
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-// resolveUninstallTargets 必须使用运行时实际加载的配置文件路径，
-// 而不是硬编码相对路径 "config"——后者在 OpenWrt 部署下（通过 -c 传入
-// /etc/vohive/config.yaml，与进程工作目录无关）永远指向一个不存在的目录，
-// 导致真实配置文件从未被清理。
+// resolveUninstallTargets 必须使用运行时实际加载的绝对配置文件路径，
+// 而不是依赖调用者工作目录的硬编码相对路径 "config"，否则会漏掉真实配置。
 func TestResolveUninstallTargetsUsesStrictRuntimeChildren(t *testing.T) {
 	root := t.TempDir()
 	configFile := filepath.Join(root, "config", "config.yaml")
@@ -57,6 +56,24 @@ func TestResolveUninstallTargetsRejectsPathsOutsideRuntimeRoot(t *testing.T) {
 				t.Fatal("resolveUninstallTargets() error = nil, want unsafe path rejection")
 			}
 		})
+	}
+}
+
+func TestResolveUninstallTargetsRejectsPhysicalConfigEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	linkedConfigDir := filepath.Join(root, "config")
+	if err := os.Symlink(outside, linkedConfigDir); err != nil {
+		t.Skipf("directory symlink unavailable on this platform: %v", err)
+	}
+
+	_, err := resolveUninstallTargets(
+		root,
+		filepath.Join(linkedConfigDir, "config.yaml"),
+		filepath.Join(root, "bin", "shannon-ims"),
+	)
+	if err == nil {
+		t.Fatal("resolveUninstallTargets() error = nil, want physical config escape rejection")
 	}
 }
 

@@ -11,9 +11,10 @@
 - 修复 QMI lazy-bootstrap 旧断言、匿名化后失配的 MCC/MNC、IMEI、GSMA URN 夹具，以及依赖本机绝对路径的数据库测试。
 - push/PR CI 覆盖双 Go 模块全量 test/vet、关键 race、前端 lint/typecheck/build、隐私扫描、运行时脚本和 Linux amd64 bundle smoke。
 - 发布包新增 `release-manifest.env`，并同时提供二进制 SHA-256、归档内 `SHA256SUMS` 和独立归档 `.sha256`。
-- 数据库、日志、运营商覆盖和 session secret 统一使用绝对 runtime root；卸载会在停止服务前验证数据目录、配置和可执行文件均为安装根的严格子路径。
-- ESP replay window 只在 ICV 校验与解密成功后提交序号，错误完整性的高序号包不能再推进窗口。
+- 数据库、日志、运营商覆盖和 session secret 统一使用绝对 runtime root；卸载会在停止服务前验证数据目录、配置和可执行文件均为安装根的严格子路径，并拒绝 symlink/junction 造成的物理路径逃逸。
+- ESP replay window 只在 ICV 校验与解密成功后提交序号，错误完整性的高序号包不能再推进窗口；ESP 序号 `0` 在首次初始化前也始终拒绝。
 - 登录限流默认只使用 TCP peer 地址，显式禁用未配置代理头信任，并通过 TTL 清理和硬容量上限约束状态表。
+- 移除缺少完整包配方、迁移和 CI 的陈旧 OpenWrt init/config 片段，并明确当前不提供受支持的 OpenWrt 包装。
 
 兼容性承诺：本轮不修改 IMS-AKA、AUTS/SQN 重同步、3GPP IPsec 协商、短信发送/接收或 eSIM 操作语义。
 
@@ -21,6 +22,7 @@
 
 - Release 归档不是完整 strongSwan 发行版；两个自定义插件仍必须针对目标机匹配的 configured source 构建。
 - 当前运行方式需要 Linux/WSL2、设备访问权限以及 raw socket/TUN/路由所需权限。
+- 当前不提供受支持的 OpenWrt 安装包；恢复支持前必须补齐单一 runtime root、数据迁移、包管理器卸载语义和目标布局 CI。
 - 运营商开户、区域策略、SIM 权限和模组固件能力仍决定真实网络是否可用。
 - RC 稳定性验证不替代每种模组、SIM 和运营商组合的实机验收。
 
@@ -35,9 +37,10 @@ Highlights:
 - Stale QMI lazy-bootstrap assertions, anonymized MCC/MNC, IMEI and GSMA URN fixtures, and a machine-specific database test were corrected.
 - Push/PR CI covers full test/vet for both Go modules, critical race tests, frontend lint/typecheck/build, privacy scanning, runtime script contracts, and Linux amd64 bundle smoke verification.
 - Release archives now include `release-manifest.env`, a binary SHA-256, in-bundle `SHA256SUMS`, and a detached archive `.sha256`.
-- Databases, logs, carrier overrides, and the session secret now share one absolute runtime root. Uninstall validates that data, configuration, and executable targets are strict children of that root before stopping the service.
-- ESP sequence numbers are committed to the replay window only after successful integrity verification and decryption, preventing invalid high-sequence packets from advancing the window.
+- Databases, logs, carrier overrides, and the session secret now share one absolute runtime root. Uninstall validates lexical and physical boundaries before stopping the service and rejects symlink/junction escapes.
+- ESP sequence numbers are committed to the replay window only after successful integrity verification and decryption, preventing invalid high-sequence packets from advancing the window. ESP sequence `0` is rejected even before first-window initialization.
 - Login throttling uses the direct TCP peer by default, disables unconfigured proxy-header trust, and bounds its state with TTL cleanup and a hard capacity.
+- The stale OpenWrt init/config fragments were removed because they had no complete package recipe, migration contract, or CI; this release does not claim a supported OpenWrt package.
 
 Compatibility statement: this round does not change IMS-AKA, AUTS/SQN resynchronization, 3GPP IPsec negotiation, SMS send/receive, or eSIM operation semantics.
 
@@ -45,5 +48,6 @@ Known limitations:
 
 - A release archive is not a complete strongSwan distribution; both custom plugins must still be built against the target's matching configured source.
 - The supported runtime requires Linux/WSL2, device access, and privileges for raw sockets, TUN, and routing.
+- No supported OpenWrt package is currently provided; restoring one requires a single-runtime-root layout, data migration, package-manager uninstall semantics, and target-layout CI.
 - Subscription provisioning, regional policy, SIM authorization, and modem firmware still determine live-network availability.
 - RC stability checks do not replace hardware acceptance for every modem, SIM, and network combination.

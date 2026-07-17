@@ -7,7 +7,8 @@
 - [ ] `.github/workflows/ci.yml` 中列出的关键模块 `-race` 零告警。 / Critical race suites in CI report no warnings.
 - [ ] 前端在 `package-lock.json` 下完成 `npm ci`、lint、typecheck 和 build。 / Frontend install, lint, typecheck, and build pass from the lockfile.
 - [ ] 隐私扫描、Python 合约测试和全部 `scripts/tests/*` 发布/运行时测试通过。 / Privacy, Python contracts, and release/runtime script tests pass.
-- [ ] runtime root/卸载越界、ESP 坏 ICV replay、登录代理头绕过与限流容量回归测试通过。 / Runtime-root deletion bounds, ESP bad-ICV replay, proxy-header bypass, and limiter-capacity regressions pass.
+- [ ] runtime root 词法/物理卸载边界、symlink/junction 逃逸、ESP 坏 ICV 与序号 0 replay、登录代理头绕过及限流容量回归测试通过。 / Runtime-root lexical/physical deletion bounds, symlink/junction escapes, ESP bad-ICV and sequence-zero replay, proxy-header bypass, and limiter-capacity regressions pass.
+- [ ] OpenWrt 目录只保留“不受支持”声明，不包含可部署的旧 init/config。 / The OpenWrt directory contains only the unsupported-status notice, not stale deployable init/config files.
 - [ ] Linux amd64 二进制以目标版本构建，归档由 `package-release-bundle.sh` 生成。 / The Linux amd64 binary is built with the target version and packaged by the release script.
 - [ ] `verify-release-bundle.sh` 输出 `bundle_smoke=pass`，并记录归档与二进制 SHA-256。 / Bundle verification passes and both hashes are recorded.
 

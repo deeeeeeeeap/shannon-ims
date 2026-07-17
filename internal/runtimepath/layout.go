@@ -75,8 +75,9 @@ func Resolve(rootOverride, configPath string) (Layout, error) {
 	}, nil
 }
 
-// ValidateRemoval returns a cleaned target only when it is a strict child of
-// the absolute runtime root. It never permits deleting the root itself.
+// ValidateRemoval returns the physical target only when both its lexical and
+// resolved paths are strict children of the absolute runtime root. Symlink or
+// junction redirection below the root is rejected rather than followed.
 func ValidateRemoval(root, target string) (string, error) {
 	root = filepath.Clean(strings.TrimSpace(root))
 	target = filepath.Clean(strings.TrimSpace(target))
@@ -86,6 +87,36 @@ func ValidateRemoval(root, target string) (string, error) {
 	if filepath.Dir(root) == root {
 		return "", fmt.Errorf("runtime root must not be a filesystem root: %q", root)
 	}
+	rel, err := strictChildRel(root, target)
+	if err != nil {
+		return "", err
+	}
+
+	physicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve physical runtime root %q: %w", root, err)
+	}
+	physicalRoot = filepath.Clean(physicalRoot)
+	if filepath.Dir(physicalRoot) == physicalRoot {
+		return "", fmt.Errorf("physical runtime root must not be a filesystem root: %q", physicalRoot)
+	}
+
+	physicalTarget, err := resolvePhysicalPath(target)
+	if err != nil {
+		return "", fmt.Errorf("resolve physical removal target %q: %w", target, err)
+	}
+	if _, err := strictChildRel(physicalRoot, physicalTarget); err != nil {
+		return "", fmt.Errorf("physical removal target escapes runtime root: %w", err)
+	}
+
+	expectedTarget := filepath.Join(physicalRoot, rel)
+	if !samePath(expectedTarget, physicalTarget) {
+		return "", fmt.Errorf("removal target %q is redirected below runtime root %q", target, root)
+	}
+	return physicalTarget, nil
+}
+
+func strictChildRel(root, target string) (string, error) {
 	rel, err := filepath.Rel(root, target)
 	if err != nil {
 		return "", fmt.Errorf("resolve runtime removal target: %w", err)
@@ -93,5 +124,40 @@ func ValidateRemoval(root, target string) (string, error) {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("removal target %q is outside runtime root %q", target, root)
 	}
-	return target, nil
+	return rel, nil
+}
+
+// resolvePhysicalPath resolves all existing path components. A missing final
+// target is represented beneath its nearest existing physical parent so that
+// uninstall remains safe and idempotent without requiring every target to
+// exist. Dangling links fail closed.
+func resolvePhysicalPath(path string) (string, error) {
+	current := filepath.Clean(path)
+	var missing []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing parent for %q", path)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func samePath(left, right string) bool {
+	rel, err := filepath.Rel(filepath.Clean(left), filepath.Clean(right))
+	return err == nil && rel == "."
 }
