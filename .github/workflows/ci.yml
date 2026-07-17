@@ -15,6 +15,7 @@ jobs:
   go:
     name: Go test and vet
     runs-on: ubuntu-latest
+    needs: frontend
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,6 +27,19 @@ jobs:
           cache-dependency-path: |
             go.sum
             vowifi-go/go.sum
+
+      - name: Download frontend assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+
+      - name: Sync embedded frontend assets
+        shell: bash
+        run: |
+          rm -rf internal/web/dist
+          mkdir -p internal/web
+          cp -R web/dist internal/web/dist
 
       - name: Root module tests
         run: go test ./... -count=1
