@@ -1,29 +1,62 @@
 package api
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // resolveUninstallTargets 必须使用运行时实际加载的配置文件路径，
 // 而不是硬编码相对路径 "config"——后者在 OpenWrt 部署下（通过 -c 传入
 // /etc/vohive/config.yaml，与进程工作目录无关）永远指向一个不存在的目录，
 // 导致真实配置文件从未被清理。
-func TestResolveUninstallTargetsUsesActualConfigPath(t *testing.T) {
-	dataDir, configFile := resolveUninstallTargets("/etc/vohive/config.yaml")
+func TestResolveUninstallTargetsUsesStrictRuntimeChildren(t *testing.T) {
+	root := t.TempDir()
+	configFile := filepath.Join(root, "config", "config.yaml")
+	executable := filepath.Join(root, "bin", "shannon-ims")
 
-	if dataDir != "data" {
-		t.Fatalf("dataDir = %q, want %q", dataDir, "data")
+	targets, err := resolveUninstallTargets(root, configFile, executable)
+	if err != nil {
+		t.Fatalf("resolveUninstallTargets() error = %v", err)
 	}
-	if configFile != "/etc/vohive/config.yaml" {
-		t.Fatalf("configFile = %q, want %q", configFile, "/etc/vohive/config.yaml")
+	if targets.DataDir != filepath.Join(root, "data") {
+		t.Fatalf("DataDir = %q, want runtime data directory", targets.DataDir)
+	}
+	if targets.ConfigFile != configFile {
+		t.Fatalf("ConfigFile = %q, want %q", targets.ConfigFile, configFile)
+	}
+	if targets.Executable != executable {
+		t.Fatalf("Executable = %q, want %q", targets.Executable, executable)
 	}
 }
 
 func TestResolveUninstallTargetsSkipsConfigWhenPathUnknown(t *testing.T) {
-	// 配置管理器尚未初始化时 config.GetConfigPath() 返回空字符串，
-	// 此时绝不能删除任何路径（避免误删进程当前工作目录）。
-	_, configFile := resolveUninstallTargets("")
+	root := t.TempDir()
+	executable := filepath.Join(root, "bin", "shannon-ims")
+	targets, err := resolveUninstallTargets(root, "", executable)
+	if err != nil {
+		t.Fatalf("resolveUninstallTargets() error = %v", err)
+	}
+	if targets.ConfigFile != "" {
+		t.Fatalf("ConfigFile = %q, want empty when config path unknown", targets.ConfigFile)
+	}
+}
 
-	if configFile != "" {
-		t.Fatalf("configFile = %q, want empty when config path unknown", configFile)
+func TestResolveUninstallTargetsRejectsPathsOutsideRuntimeRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(filepath.Dir(root), "unrelated")
+	insideConfig := filepath.Join(root, "config", "config.yaml")
+	insideExecutable := filepath.Join(root, "bin", "shannon-ims")
+
+	for name, paths := range map[string][2]string{
+		"config outside root":     {outside, insideExecutable},
+		"executable outside root": {insideConfig, outside},
+		"root as config target":   {root, insideExecutable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := resolveUninstallTargets(root, paths[0], paths[1]); err == nil {
+				t.Fatal("resolveUninstallTargets() error = nil, want unsafe path rejection")
+			}
+		})
 	}
 }
 

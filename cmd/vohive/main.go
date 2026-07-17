@@ -21,6 +21,7 @@ import (
 	"github.com/1239t/vohive/internal/notify"
 	proxyserver "github.com/1239t/vohive/internal/proxy/server"
 	"github.com/1239t/vohive/internal/proxy/traffic"
+	"github.com/1239t/vohive/internal/runtimepath"
 	"github.com/1239t/vohive/internal/sipgw"
 	"github.com/1239t/vohive/internal/upstreamproxy"
 	"github.com/1239t/vowifi-go/runtimehost"
@@ -82,6 +83,11 @@ func main() {
 	flag.StringVar(&configPath, "c", "config/config.yaml", "config file path")
 	flag.BoolVar(&backendOnly, "backend-only", false, "run as backend-only (disable embedded web UI)")
 	flag.Parse()
+	layout, err := runtimepath.Resolve("", configPath)
+	if err != nil {
+		log.Fatalf("解析运行目录失败: %v", err)
+	}
+	configPath = layout.ConfigFile
 
 	// 1. 加载配置
 	if err := config.InitGlobalManagerForStartup(configPath); err != nil {
@@ -92,7 +98,7 @@ func main() {
 	// 2. 初始化日志
 	logger.Setup(logger.LogConfig{
 		Debug:    cfg.Server.Debug,
-		Filename: "logs/app.log",
+		Filename: layout.LogFile,
 	})
 	// 将标准 slog、sipgo 和 vowifi-go 子模块统一接入脱敏日志核心。
 	appSlog := slog.New(logger.NewSlogHandler(logger.ZapLogger()))
@@ -118,7 +124,7 @@ func main() {
 		}
 	}()
 
-	loadResult, err := carrier.LoadCarrierOverrides("data/carrier_overrides.json")
+	loadResult, err := carrier.LoadCarrierOverrides(layout.CarrierOverrides)
 	if err != nil {
 		carrier.ClearCarrierOverrides()
 		logger.Warn("加载 carrier_overrides 失败，回退内置运营商配置",
@@ -131,8 +137,8 @@ func main() {
 	}
 
 	// 3. 初始化数据库
-	legacyDBPath := "data/ec20.db"
-	dbPath := "data/vohive.db"
+	legacyDBPath := layout.LegacyDatabase
+	dbPath := layout.Database
 	if err := migrateLegacyServerDB(legacyDBPath, dbPath); err != nil {
 		log.Fatalf("迁移旧数据库失败: %v", err)
 	}
@@ -145,7 +151,7 @@ func main() {
 	}
 	logger.Info("数据库已初始化", "path", dbPath, "resolved_path", dbResolvedPath)
 	countryResult := upstreamproxy.InitCountryTable(context.Background(), upstreamproxy.CountryTableOptions{
-		CachePath: upstreamproxy.DefaultCountryTableCachePath,
+		CachePath: layout.CountryTable,
 	})
 	if countryResult.Err != nil {
 		logger.Warn("MCC/MNC 国家表不可用，VoWiFi 国家代理规则将按未知国家直连",

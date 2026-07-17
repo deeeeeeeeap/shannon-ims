@@ -253,9 +253,12 @@ sudoedit /opt/shannon-ims/config/config.yaml
 启动：
 
 ~~~bash
-sudo /opt/shannon-ims/bin/shannon-ims \
+cd /opt/shannon-ims
+sudo ./bin/shannon-ims \
   -c /opt/shannon-ims/config/config.yaml
 ~~~
+
+程序会从绝对配置路径推导 `/opt/shannon-ims` 运行根，并将数据库、日志、运营商覆盖和 session secret 固定在该根目录下；因此不会随调用者的当前目录漂移。卸载同样只允许删除该运行根的严格子路径。
 
 健康检查：
 
@@ -406,9 +409,15 @@ sudo bash scripts/install-local.sh \
 
 sudoedit /opt/shannon-ims/config/config.yaml
 
-sudo /opt/shannon-ims/bin/shannon-ims \
+cd /opt/shannon-ims
+sudo ./bin/shannon-ims \
   -c /opt/shannon-ims/config/config.yaml
 ~~~
+
+The absolute configuration path establishes `/opt/shannon-ims` as the runtime
+root. Databases, logs, carrier overrides, and the session secret remain under
+that root regardless of the caller's working directory. Uninstall cleanup is
+restricted to strict children of the same root.
 
 Replace every placeholder and set a new Web password before the first start.
 The installer preserves an existing configuration and creates `data/` with

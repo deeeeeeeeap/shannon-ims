@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/1239t/vohive/internal/notify"
 	"github.com/1239t/vohive/internal/proxy/server"
 	proxytraffic "github.com/1239t/vohive/internal/proxy/traffic"
+	"github.com/1239t/vohive/internal/runtimepath"
 	vwebsheet "github.com/1239t/vohive/internal/websheet"
 	"github.com/1239t/vohive/pkg/smscodec"
 	"github.com/1239t/vowifi-go/runtimehost/voicehost"
@@ -58,11 +60,6 @@ func smsInboxIMSI(source smsInboxIMSIReader, liveRefresh bool) string {
 	return strings.TrimSpace(source.GetIMSI())
 }
 
-type loginAttempt struct {
-	Count   int
-	ResetAt time.Time
-}
-
 // Server 是 API 服务器的核心结构
 type Server struct {
 	cfg         config.ServerConfig // HTTP 服务器配置
@@ -71,6 +68,7 @@ type Server struct {
 	auth        config.WebConfig    // Web 认证配置
 	fs          http.FileSystem     // 静态文件系统
 	configPath  string              // 配置文件路径
+	runtimeRoot string              // 绝对运行目录
 	proxyMgr    *server.Manager     // 代理实例管理器
 	trafficRT   realtimeTrafficSubscriber
 	proxyRepo   repo.ProxyInstanceRepository
@@ -82,8 +80,7 @@ type Server struct {
 	httpSrvMu sync.Mutex
 	httpSrv   *http.Server
 
-	loginMu       sync.Mutex
-	loginAttempts map[string]loginAttempt
+	loginLimiter  *loginRateLimiter
 	sessionSecret []byte
 
 	shutdownCh chan struct{}
@@ -110,10 +107,12 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 	if !cfg.Server.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	if strings.TrimSpace(configPath) == "" {
-		configPath = "config/config.yaml"
+	layout, err := runtimepath.Resolve("", configPath)
+	if err != nil {
+		return nil, fmt.Errorf("initialize runtime layout: %w", err)
 	}
-	sessionSecret, err := loadOrCreateSessionSecret(sessionSecretPath(configPath))
+	configPath = layout.ConfigFile
+	sessionSecret, err := loadOrCreateSessionSecret(sessionSecretPath(layout.Root))
 	if err != nil {
 		return nil, fmt.Errorf("initialize API session signing: %w", err)
 	}
@@ -124,12 +123,13 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		pool:          pool,
 		fs:            fs,
 		configPath:    configPath,
+		runtimeRoot:   layout.Root,
 		proxyMgr:      proxyMgr,
 		voiceGW:       voiceGW,
 		notifyMgr:     notifyMgr,
 		proxyRepo:     repo.NewDBRepo(),
 		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
-		loginAttempts: make(map[string]loginAttempt),
+		loginLimiter:  newLoginRateLimiter(0, 0, 0),
 		sessionSecret: sessionSecret,
 		shutdownCh:    make(chan struct{}),
 	}
@@ -171,30 +171,17 @@ func (s *Server) issueSessionToken() (string, time.Time, error) {
 // pruneExpiredSessionsLocked is removed.
 
 func (s *Server) allowLoginAttempt(ip string, now time.Time) bool {
-	if ip == "" {
-		ip = "unknown"
-	}
-	window := 2 * time.Minute
-	limit := 10
-
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-
-	cur := s.loginAttempts[ip]
-	if cur.ResetAt.IsZero() || now.After(cur.ResetAt) {
-		cur = loginAttempt{Count: 0, ResetAt: now.Add(window)}
-	}
-	if cur.Count >= limit {
-		s.loginAttempts[ip] = cur
+	if s == nil {
 		return false
 	}
-	cur.Count++
-	s.loginAttempts[ip] = cur
-	return true
+	return s.loginLimiter.Allow(ip, now)
 }
 
 func (s *Server) newRouter() *gin.Engine {
 	r := gin.Default()
+	if err := r.SetTrustedProxies(nil); err != nil {
+		panic(fmt.Sprintf("disable trusted proxies: %v", err))
+	}
 	r.Use(s.requestIDMiddleware())
 
 	r.GET("/ping", func(c *gin.Context) {
@@ -623,7 +610,7 @@ func (s *Server) handleLogHistory(c *gin.Context) {
 	}
 
 	// 日志文件路径（使用 logger 的默认路径）
-	logFile := "logs/app.log"
+	logFile := filepath.Join(s.runtimeRoot, "logs", "app.log")
 
 	recentLines, err := readLastLines(logFile, lines, 1<<20)
 	if err != nil {
@@ -1896,7 +1883,10 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	clientIP := c.ClientIP()
+	clientIP := "unknown"
+	if peerIP := requestPeerIP(c.Request); peerIP != nil {
+		clientIP = peerIP.String()
+	}
 	if !s.allowLoginAttempt(clientIP, time.Now()) {
 		c.JSON(http.StatusTooManyRequests, gin.H{
 			"status":     "error",

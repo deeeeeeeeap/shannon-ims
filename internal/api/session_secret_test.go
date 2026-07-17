@@ -154,6 +154,12 @@ func TestNewPersistsSessionSecretBesideRuntimeData(t *testing.T) {
 	if len(first.sessionSecret) != sessionSecretSize {
 		t.Fatalf("first session secret length = %d, want %d", len(first.sessionSecret), sessionSecretSize)
 	}
+	if first.runtimeRoot != root {
+		t.Fatalf("runtimeRoot = %q, want %q", first.runtimeRoot, root)
+	}
+	if first.configPath != configPath {
+		t.Fatalf("configPath = %q, want absolute %q", first.configPath, configPath)
+	}
 	if bytes.Equal(first.sessionSecret, []byte(cfg.Web.Password)) {
 		t.Fatal("session secret must be independent from the Web password")
 	}
@@ -174,7 +180,7 @@ func TestNewPersistsSessionSecretBesideRuntimeData(t *testing.T) {
 	}
 
 	wantPath := filepath.Join(root, "data", "session-secret")
-	if got := sessionSecretPath(configPath); got != wantPath {
+	if got := sessionSecretPath(root); got != wantPath {
 		t.Fatalf("sessionSecretPath() = %q, want %q", got, wantPath)
 	}
 }

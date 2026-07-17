@@ -109,7 +109,7 @@ func newProtectedSystemRouteTestServer(called *atomic.Bool) *Server {
 	return &Server{
 		auth:          config.WebConfig{Username: "admin", Password: "test-password"},
 		sessionSecret: bytes.Repeat([]byte{0x5a}, sessionSecretSize),
-		loginAttempts: make(map[string]loginAttempt),
+		loginLimiter:  newLoginRateLimiter(0, 0, 0),
 		shutdownCh:    make(chan struct{}),
 		uninstallRunner: func() {
 			called.Store(true)

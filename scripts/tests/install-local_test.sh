@@ -83,6 +83,7 @@ test "$(stat -c '%a' "$prefix/data")" = 700
 test ! -e "$prefix/data/session-secret"
 grep -qx 'runtime_preflight=pass' "$pass_output"
 grep -qx 'install_status=pass' "$pass_output"
+grep -Fqx "run_command=cd $prefix && exec $prefix/bin/shannon-ims -c $prefix/config/config.yaml" "$pass_output"
 
 printf 'preserve-this-config\n' >"$prefix/config/config.yaml"
 run_installer >"$tmp_dir/reinstall.out"

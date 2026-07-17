@@ -103,6 +103,19 @@ SHA-256 和 Linux 二进制架构，全程不会启动网络或设备访问。
    若在服务停止后删除它，现有会话会全部失效，下次启动会生成新密钥。不要提交
    或在不同部署之间共享该文件。
 
+9. Start from the installation root so the command and operational layout are
+   explicit. The application also derives the same absolute runtime root from
+   the configuration path and confines mutable files and uninstall targets to
+   that root.
+
+   ```bash
+   cd /opt/shannon-ims
+   sudo ./bin/shannon-ims -c /opt/shannon-ims/config/config.yaml
+   ```
+
+   从安装根目录启动。程序会从绝对配置路径推导相同的 runtime root，将数据库、
+   日志、运营商覆盖和 session secret 固定在该目录下，并拒绝卸载任何越界目标。
+
 The application supervises charon itself. It writes
 `/etc/strongswan.d/91-vohive-swu.conf`, uses `/run/charon.vici`, and creates the
 AKA/P-CSCF bridge sockets under `/run`. Do not run another charon instance that

@@ -178,14 +178,14 @@ func (t *Transport) TransformInbound(packet []byte) ([]byte, error) {
 		t.transformErrors.Add(1)
 		return nil, fmt.Errorf("ipsec3gpp: unknown inbound ESP SPI 0x%08x", spi)
 	}
-	if !flow.replay.Accept(seq) {
-		t.transformErrors.Add(1)
-		return nil, errors.New("ipsec3gpp: replay packet rejected")
-	}
 	plain, nextHeader, err := decapsulateTransport(parsed.transportPayload, flow.inboundSA)
 	if err != nil {
 		t.transformErrors.Add(1)
 		return nil, err
+	}
+	if !flow.replay.Accept(seq) {
+		t.transformErrors.Add(1)
+		return nil, errors.New("ipsec3gpp: replay packet rejected")
 	}
 	if nextHeader != ipProtoTCP && nextHeader != ipProtoUDP {
 		t.transformErrors.Add(1)

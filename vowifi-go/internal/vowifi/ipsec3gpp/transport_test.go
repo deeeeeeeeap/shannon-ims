@@ -2,6 +2,7 @@ package ipsec3gpp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -104,6 +105,64 @@ func TestTransportOutboundInboundIPv4(t *testing.T) {
 	}
 	if !bytes.Contains(gotParsed.transportPayload, sip) {
 		t.Fatalf("missing SIP payload in %x", gotParsed.transportPayload)
+	}
+}
+
+func TestTransportInvalidHighSequenceDoesNotAdvanceReplayWindow(t *testing.T) {
+	policy, err := NewPolicy(PolicyInput{
+		LocalIP:  net.ParseIP("10.0.0.2"),
+		RemoteIP: net.ParseIP("10.0.0.1"),
+		CK:       bytes.Repeat([]byte{0x01}, 16),
+		IK:       bytes.Repeat([]byte{0x02}, 16),
+		AuthAlg:  "hmac-sha-1-96",
+		EncAlg:   "aes-cbc",
+		Mech: SecurityMechanism{
+			Alg: "hmac-sha-1-96", EAlg: "aes-cbc", Prot: "esp", Mode: "trans",
+			SPIc: 0x11111111, SPIs: 0x22222222, PortC: 6054, PortS: 6060,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	transport, err := NewTransport(policy)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	serverFlow := transport.outbound[1]
+	tcpPayload := buildMinimalTCPSegment(
+		policy.FlowS.RemotePort,
+		policy.FlowS.LocalPort,
+		[]byte("REGISTER sip:ims.example.org SIP/2.0\r\n\r\n"),
+	)
+	badESP, err := encapsulateTransport(tcpPayload, serverFlow.outboundSA, ipProtoTCP)
+	if err != nil {
+		t.Fatalf("encapsulateTransport(bad): %v", err)
+	}
+	badESP = append([]byte(nil), badESP...)
+	binary.BigEndian.PutUint32(badESP[4:8], 1000) // invalidate the existing ICV
+	badPacket := buildIPv4Packet(policy.RemoteIP, policy.LocalIP, ipProtoESP, badESP)
+	if _, err := transport.TransformInbound(badPacket); err == nil {
+		t.Fatal("TransformInbound(bad ICV) error = nil, want integrity rejection")
+	}
+	if got := transport.Stats().Replay.Accepted; got != 0 {
+		t.Fatalf("replay accepted after bad ICV = %d, want 0", got)
+	}
+
+	validESP, err := encapsulateTransport(tcpPayload, serverFlow.outboundSA, ipProtoTCP)
+	if err != nil {
+		t.Fatalf("encapsulateTransport(valid): %v", err)
+	}
+	validPacket := buildIPv4Packet(policy.RemoteIP, policy.LocalIP, ipProtoESP, validESP)
+	if _, err := transport.TransformInbound(validPacket); err != nil {
+		t.Fatalf("TransformInbound(valid after bad high sequence): %v", err)
+	}
+	if _, err := transport.TransformInbound(validPacket); err == nil {
+		t.Fatal("TransformInbound(authenticated duplicate) error = nil, want replay rejection")
+	}
+	stats := transport.Stats().Replay
+	if stats.Accepted != 1 || stats.Duplicate != 1 {
+		t.Fatalf("replay stats = %+v, want one accepted and one duplicate", stats)
 	}
 }
 

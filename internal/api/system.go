@@ -2,14 +2,17 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/1239t/vohive/internal/config"
+	"github.com/1239t/vohive/internal/runtimepath"
 	"github.com/1239t/vohive/internal/updater"
 	"github.com/1239t/vohive/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -19,14 +22,32 @@ var errNotFound = errors.New("not found")
 
 const uninstallConfirmation = "UNINSTALL"
 
-// resolveUninstallTargets 计算自毁流程需要清理的数据目录和配置文件路径。
-// 配置文件路径必须来自运行时实际加载的路径（config.GetConfigPath()），
-// 不能假定其固定位于进程工作目录下的 "config" 子目录——
-// OpenWrt 部署通过 -c 显式传入 /etc/vohive/config.yaml，与工作目录无关，
-// 用硬编码相对路径删除会删错地方（实际等于什么都没删）。
-// configPath 为空（配置管理器未初始化）时不返回任何配置文件路径，避免误删。
-func resolveUninstallTargets(configPath string) (dataDir string, configFile string) {
-	return "data", configPath
+// resolveUninstallTargets validates every destructive target before uninstall
+// begins. Data, configuration, and executable paths must all be strict children
+// of the same absolute runtime root; an unknown config path is simply skipped.
+type uninstallTargets struct {
+	DataDir    string
+	ConfigFile string
+	Executable string
+}
+
+func resolveUninstallTargets(runtimeRoot, configPath, executablePath string) (uninstallTargets, error) {
+	dataDir, err := runtimepath.ValidateRemoval(runtimeRoot, filepath.Join(runtimeRoot, "data"))
+	if err != nil {
+		return uninstallTargets{}, fmt.Errorf("validate data directory: %w", err)
+	}
+	targets := uninstallTargets{DataDir: dataDir}
+	if strings.TrimSpace(configPath) != "" {
+		targets.ConfigFile, err = runtimepath.ValidateRemoval(runtimeRoot, configPath)
+		if err != nil {
+			return uninstallTargets{}, fmt.Errorf("validate config file: %w", err)
+		}
+	}
+	targets.Executable, err = runtimepath.ValidateRemoval(runtimeRoot, executablePath)
+	if err != nil {
+		return uninstallTargets{}, fmt.Errorf("validate executable: %w", err)
+	}
+	return targets, nil
 }
 
 // detectServiceStopCommands 根据当前部署形态返回应执行的"停止 + 禁用自启"命令。
@@ -110,28 +131,44 @@ func (s *Server) handleUninstall(c *gin.Context) {
 }
 
 func isLoopbackRequest(req *http.Request) bool {
+	ip := requestPeerIP(req)
+	return ip != nil && ip.IsLoopback()
+}
+
+func requestPeerIP(req *http.Request) net.IP {
 	if req == nil {
-		return false
+		return nil
 	}
 	host := strings.TrimSpace(req.RemoteAddr)
 	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
 		host = parsedHost
 	}
 	host = strings.Trim(host, "[]")
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return net.ParseIP(host)
 }
 
 func (s *Server) startUninstall() {
-	runner := runDefaultUninstall
+	runner := func() {
+		runDefaultUninstall(s.runtimeRoot, config.GetConfigPath())
+	}
 	if s != nil && s.uninstallRunner != nil {
 		runner = s.uninstallRunner
 	}
 	go runner()
 }
 
-func runDefaultUninstall() {
+func runDefaultUninstall(runtimeRoot, configPath string) {
 	time.Sleep(1 * time.Second)
+	executable, err := os.Executable()
+	if err != nil {
+		logger.Error("无法解析卸载可执行文件", "err", err)
+		return
+	}
+	targets, err := resolveUninstallTargets(runtimeRoot, configPath, executable)
+	if err != nil {
+		logger.Error("卸载路径安全校验失败", "err", err)
+		return
+	}
 
 	// 先主动通知服务管理器停止 + 禁用自启，确保即使后面的文件删除
 	// 失败（只读文件系统等），systemd Restart=always / procd respawn
@@ -146,20 +183,16 @@ func runDefaultUninstall() {
 		go cmd.Wait()
 	}
 
-	dataDir, configFile := resolveUninstallTargets(config.GetConfigPath())
-
-	if err := os.RemoveAll(dataDir); err != nil {
-		logger.Warn("清理数据目录失败", "dir", dataDir, "err", err)
+	if err := os.RemoveAll(targets.DataDir); err != nil {
+		logger.Warn("清理数据目录失败", "dir", targets.DataDir, "err", err)
 	}
-	if configFile != "" {
-		if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
-			logger.Warn("清理配置文件失败", "file", configFile, "err", err)
+	if targets.ConfigFile != "" {
+		if err := os.Remove(targets.ConfigFile); err != nil && !os.IsNotExist(err) {
+			logger.Warn("清理配置文件失败", "file", targets.ConfigFile, "err", err)
 		}
 	}
-	if executable, err := os.Executable(); err == nil {
-		if err := os.Remove(executable); err != nil {
-			logger.Warn("删除可执行文件失败", "file", executable, "err", err)
-		}
+	if err := os.Remove(targets.Executable); err != nil {
+		logger.Warn("删除可执行文件失败", "file", targets.Executable, "err", err)
 	}
 
 	logger.Warn("自毁流程结束，退出进程")

@@ -147,9 +147,9 @@ func TestProxyOverviewReadsInstancesFromDatabaseAcrossServerInstances(t *testing
 	})
 
 	saveServer := &Server{
-		fullCfg:       &config.Config{},
-		proxyRepo:     repo.NewDBRepo(),
-		loginAttempts: make(map[string]loginAttempt),
+		fullCfg:      &config.Config{},
+		proxyRepo:    repo.NewDBRepo(),
+		loginLimiter: newLoginRateLimiter(0, 0, 0),
 	}
 
 	body := `{"instances":[{"id":"proxy-db-1","name":"DB Proxy","device_id":"dev-1","enabled":true,"mode":"socks5","listen_addr":"127.0.0.1","listen_port":10800,"auth_enabled":false}]}`
@@ -165,9 +165,9 @@ func TestProxyOverviewReadsInstancesFromDatabaseAcrossServerInstances(t *testing
 	}
 
 	overviewServer := &Server{
-		fullCfg:       &config.Config{},
-		proxyRepo:     repo.NewDBRepo(),
-		loginAttempts: make(map[string]loginAttempt),
+		fullCfg:      &config.Config{},
+		proxyRepo:    repo.NewDBRepo(),
+		loginLimiter: newLoginRateLimiter(0, 0, 0),
 	}
 
 	overviewRecorder := httptest.NewRecorder()

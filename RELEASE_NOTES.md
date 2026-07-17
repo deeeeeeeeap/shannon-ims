@@ -11,6 +11,9 @@
 - 修复 QMI lazy-bootstrap 旧断言、匿名化后失配的 MCC/MNC、IMEI、GSMA URN 夹具，以及依赖本机绝对路径的数据库测试。
 - push/PR CI 覆盖双 Go 模块全量 test/vet、关键 race、前端 lint/typecheck/build、隐私扫描、运行时脚本和 Linux amd64 bundle smoke。
 - 发布包新增 `release-manifest.env`，并同时提供二进制 SHA-256、归档内 `SHA256SUMS` 和独立归档 `.sha256`。
+- 数据库、日志、运营商覆盖和 session secret 统一使用绝对 runtime root；卸载会在停止服务前验证数据目录、配置和可执行文件均为安装根的严格子路径。
+- ESP replay window 只在 ICV 校验与解密成功后提交序号，错误完整性的高序号包不能再推进窗口。
+- 登录限流默认只使用 TCP peer 地址，显式禁用未配置代理头信任，并通过 TTL 清理和硬容量上限约束状态表。
 
 兼容性承诺：本轮不修改 IMS-AKA、AUTS/SQN 重同步、3GPP IPsec 协商、短信发送/接收或 eSIM 操作语义。
 
@@ -32,6 +35,9 @@ Highlights:
 - Stale QMI lazy-bootstrap assertions, anonymized MCC/MNC, IMEI and GSMA URN fixtures, and a machine-specific database test were corrected.
 - Push/PR CI covers full test/vet for both Go modules, critical race tests, frontend lint/typecheck/build, privacy scanning, runtime script contracts, and Linux amd64 bundle smoke verification.
 - Release archives now include `release-manifest.env`, a binary SHA-256, in-bundle `SHA256SUMS`, and a detached archive `.sha256`.
+- Databases, logs, carrier overrides, and the session secret now share one absolute runtime root. Uninstall validates that data, configuration, and executable targets are strict children of that root before stopping the service.
+- ESP sequence numbers are committed to the replay window only after successful integrity verification and decryption, preventing invalid high-sequence packets from advancing the window.
+- Login throttling uses the direct TCP peer by default, disables unconfigured proxy-header trust, and bounds its state with TTL cleanup and a hard capacity.
 
 Compatibility statement: this round does not change IMS-AKA, AUTS/SQN resynchronization, 3GPP IPsec negotiation, SMS send/receive, or eSIM operation semantics.
 

@@ -12,16 +12,9 @@ import (
 
 const sessionSecretSize = 32
 
-func sessionSecretPath(configPath string) string {
-	configPath = strings.TrimSpace(configPath)
-	if configPath == "" {
-		configPath = filepath.Join("config", "config.yaml")
-	}
-	configDir := filepath.Dir(filepath.Clean(configPath))
-	if filepath.Base(configDir) == "config" {
-		return filepath.Join(filepath.Dir(configDir), "data", "session-secret")
-	}
-	return filepath.Join(configDir, ".shannon-ims-session-secret")
+func sessionSecretPath(runtimeRoot string) string {
+	runtimeRoot = strings.TrimSpace(runtimeRoot)
+	return filepath.Join(runtimeRoot, "data", "session-secret")
 }
 
 func loadOrCreateSessionSecret(path string) ([]byte, error) {

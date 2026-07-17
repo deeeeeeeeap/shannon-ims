@@ -27,5 +27,9 @@ else
 fi
 
 printf 'installed_binary=%s\n' "$prefix/bin/shannon-ims"
-printf 'run_command=%s\n' "$prefix/bin/shannon-ims -c $prefix/config/config.yaml"
+printf -v run_command 'cd %q && exec %q -c %q' \
+  "$prefix" \
+  "$prefix/bin/shannon-ims" \
+  "$prefix/config/config.yaml"
+printf 'run_command=%s\n' "$run_command"
 printf 'install_status=pass\n'
