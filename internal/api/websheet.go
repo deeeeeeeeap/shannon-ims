@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/1239t/vohive/internal/websheet"
@@ -28,7 +27,7 @@ func (s *Server) registerWebsheetRoutes(api *gin.RouterGroup) {
 
 func (s *Server) websheetSession(c *gin.Context) (*websheet.Session, error) {
 	if s.websheets == nil {
-		return nil, websheet.ErrNotFound
+		return nil, websheet.ErrDisabled
 	}
 	return s.websheets.Get(c.Param("id"))
 }
@@ -39,16 +38,13 @@ func (s *Server) authorizedWebsheetSession(c *gin.Context) (*websheet.Session, e
 		return nil, err
 	}
 	if err := session.Authorize(c.Request); err != nil {
-		if errors.Is(err, websheet.ErrUnauthorized) && s.isAuthenticatedRequest(c, time.Now()) {
-			return session, nil
-		}
 		return nil, err
 	}
 	return session, nil
 }
 
 func (s *Server) handleWebsheetBootstrap(c *gin.Context) {
-	session, err := s.authorizedWebsheetSession(c)
+	session, err := s.websheetSession(c)
 	if err != nil {
 		respondWebsheetError(c, err)
 		return
@@ -59,7 +55,7 @@ func (s *Server) handleWebsheetBootstrap(c *gin.Context) {
 }
 
 func (s *Server) handleWebsheetProxy(c *gin.Context) {
-	session, err := s.authorizedWebsheetSession(c)
+	session, err := s.websheetSession(c)
 	if err != nil {
 		respondWebsheetError(c, err)
 		return
@@ -75,9 +71,9 @@ func (s *Server) handleWebsheetCallback(c *gin.Context) {
 		respondWebsheetError(c, err)
 		return
 	}
-	var callback websheet.Callback
-	if err := c.ShouldBindJSON(&callback); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "code": "websheet_callback_invalid", "message": err.Error()})
+	callback, err := websheet.DecodeCallback(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "code": "websheet_callback_invalid", "message": "Invalid Websheet callback"})
 		return
 	}
 	session.Callback(callback)
@@ -119,6 +115,8 @@ func (s *Server) handleWebsheetDone(c *gin.Context) {
 
 func respondWebsheetError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, websheet.ErrDisabled):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "code": "websheet_disabled", "message": "Websheet is disabled"})
 	case errors.Is(err, websheet.ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "code": "websheet_not_found", "message": err.Error()})
 	case errors.Is(err, websheet.ErrExpired):

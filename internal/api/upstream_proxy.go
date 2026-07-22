@@ -5,9 +5,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/1239t/vohive/internal/db"
 	"github.com/1239t/vohive/internal/upstreamproxy"
+	"github.com/gin-gonic/gin"
 )
 
 // ── 前置代理管理 API（主服务） ──
@@ -38,6 +38,30 @@ func probeUpstreamProxyConfig(c *gin.Context, proxy db.UpstreamProxy) (upstreamp
 	})
 }
 
+type upstreamProxyDTO struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Addr        string    `json:"addr"`
+	Username    string    `json:"username"`
+	PasswordSet bool      `json:"password_set"`
+	Enabled     bool      `json:"enabled"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+func upstreamProxyToDTO(proxy db.UpstreamProxy) upstreamProxyDTO {
+	return upstreamProxyDTO{
+		ID:          proxy.ID,
+		Name:        proxy.Name,
+		Addr:        proxy.Addr,
+		Username:    proxy.Username,
+		PasswordSet: strings.TrimSpace(proxy.Password) != "",
+		Enabled:     proxy.Enabled,
+		CreatedAt:   proxy.CreatedAt,
+		UpdatedAt:   proxy.UpdatedAt,
+	}
+}
+
 // handleListUpstreamProxies 获取所有前置代理实例
 func (s *Server) handleListUpstreamProxies(c *gin.Context) {
 	proxies, err := db.ListUpstreamProxies()
@@ -45,11 +69,11 @@ func (s *Server) handleListUpstreamProxies(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
-	// 密码脱敏
-	for i := range proxies {
-		proxies[i].Password = maskSecret(proxies[i].Password)
+	out := make([]upstreamProxyDTO, 0, len(proxies))
+	for _, proxy := range proxies {
+		out = append(out, upstreamProxyToDTO(proxy))
 	}
-	c.JSON(http.StatusOK, proxies)
+	c.JSON(http.StatusOK, out)
 }
 
 // handleCreateUpstreamProxy 创建前置代理实例
@@ -266,12 +290,4 @@ func (s *Server) handleDeleteUpstreamProxyCountryRule(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
-// maskSecret 将密码脱敏为 **** 格式
-func maskSecret(s string) string {
-	if s == "" {
-		return ""
-	}
-	return "****"
 }

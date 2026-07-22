@@ -42,6 +42,43 @@ func (r staticProxyInstanceRepo) ReplaceAll(_ context.Context, instances []confi
 	return nil
 }
 
+func TestProxyInstanceGetReportsPasswordStateWithoutPassword(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	server := &Server{
+		proxyRepo: staticProxyInstanceRepo{instances: []config.ProxyInstance{{
+			ID:          "proxy-synthetic",
+			DeviceID:    "device-synthetic",
+			ListenPort:  1080,
+			AuthEnabled: true,
+			Username:    "synthetic-user",
+			Password:    "synthetic-existing-password",
+		}}},
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Params = gin.Params{{Key: "instance_id", Value: "proxy-synthetic"}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/proxy-instances/proxy-synthetic", nil)
+	server.handleProxyInstanceGet(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET proxy instance status=%d want %d", rec.Code, http.StatusOK)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode proxy instance response: %v", err)
+	}
+	if _, exists := payload["password"]; exists {
+		t.Fatal("GET proxy instance returned a password field")
+	}
+	if payload["password_set"] != true {
+		t.Fatal("GET proxy instance did not report password_set=true")
+	}
+	if strings.Contains(rec.Body.String(), "synthetic-existing-password") {
+		t.Fatal("GET proxy instance exposed the stored password")
+	}
+}
+
 func initProxyTestConfig(t *testing.T, body string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -104,8 +141,8 @@ func TestNormalizeProxyInstanceForSaveAuthOffClearsCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if out.ListenAddr != "0.0.0.0" {
-		t.Fatalf("listen_addr default mismatch: got=%q", out.ListenAddr)
+	if out.ListenAddr != "127.0.0.1" {
+		t.Fatalf("listen_addr default mismatch: got=%q want=127.0.0.1", out.ListenAddr)
 	}
 	if out.Mode != "socks5" {
 		t.Fatalf("mode default mismatch: got=%q want=socks5", out.Mode)
@@ -115,23 +152,70 @@ func TestNormalizeProxyInstanceForSaveAuthOffClearsCredentials(t *testing.T) {
 	}
 }
 
-func TestNormalizeProxyInstanceForSaveRestoresMaskedPassword(t *testing.T) {
-	old := &config.ProxyInstance{Password: "secret-pass"}
-	out, err := normalizeProxyInstanceForSave(config.ProxyInstance{
-		ID:          "inst-1",
-		DeviceID:    "dev-1",
-		ListenAddr:  "0.0.0.0",
-		ListenPort:  1080,
-		Mode:        "http",
-		AuthEnabled: true,
-		Username:    "user",
-		Password:    "******",
-	}, old)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestNormalizeProxyInstanceForSavePreservesExistingPasswordWhenOmittedOrLegacyMasked(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		password string
+	}{
+		{name: "omitted", password: ""},
+		{name: "legacy masked", password: "******"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			old := &config.ProxyInstance{Password: "secret-pass"}
+			out, err := normalizeProxyInstanceForSave(config.ProxyInstance{
+				ID:          "inst-1",
+				DeviceID:    "dev-1",
+				ListenAddr:  "0.0.0.0",
+				ListenPort:  1080,
+				Mode:        "http",
+				AuthEnabled: true,
+				Username:    "user",
+				Password:    tt.password,
+			}, old)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if out.Password != "secret-pass" {
+				t.Fatal("existing password was not preserved")
+			}
+		})
 	}
-	if out.Password != "secret-pass" {
-		t.Fatalf("password restore mismatch: got=%q", out.Password)
+}
+
+func TestProxyUpdateWarnsOnExplicitLANExposure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	server := &Server{proxyRepo: staticProxyInstanceRepo{}}
+	body := `{"instances":[{
+		"id":"proxy-lan",
+		"device_id":"device-synthetic",
+		"enabled":false,
+		"mode":"socks5",
+		"listen_addr":"0.0.0.0",
+		"listen_port":1080,
+		"auth_enabled":false
+	}]}`
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/proxy-instances/config", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	server.handleProxyUpdateConfig(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT proxy config status=%d want %d", rec.Code, http.StatusOK)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode proxy update response: %v", err)
+	}
+	warning, _ := payload["warning"].(string)
+	if !strings.Contains(warning, "defaults to 127.0.0.1") ||
+		!strings.Contains(warning, "explicit") ||
+		!strings.Contains(warning, "LAN exposure is enabled") {
+		t.Fatal("explicit LAN exposure response lacked a clear loopback/LAN warning")
+	}
+	if strings.Contains(warning, "???") {
+		t.Fatal("explicit LAN exposure response contained a corrupted warning")
 	}
 }
 
@@ -233,6 +317,42 @@ func TestBuildProxyConfigsAllowsInterfaceWithoutGlobalIPv4(t *testing.T) {
 	}
 	if cfgs[0].Interface != "lo" {
 		t.Fatalf("interface mismatch: got=%q want=lo", cfgs[0].Interface)
+	}
+}
+
+func TestBuildProxyConfigsDefaultsEmptyListenAddressToLoopback(t *testing.T) {
+	initProxyTestConfig(t, `devices:
+  - id: dev-loopback-default
+    name: Loopback Default
+`)
+	pool := device.NewPool(&config.Config{})
+	setNestedPrivateField(t, pool, []string{"workers"}, map[string]*device.Worker{
+		"dev-loopback-default": {
+			ID: "dev-loopback-default",
+			Config: config.DeviceConfig{
+				ID:        "dev-loopback-default",
+				Interface: "lo",
+			},
+		},
+	})
+	server := &Server{
+		pool: pool,
+		proxyRepo: staticProxyInstanceRepo{instances: []config.ProxyInstance{{
+			ID:         "proxy-loopback-default",
+			DeviceID:   "dev-loopback-default",
+			Enabled:    true,
+			Mode:       "socks5",
+			ListenAddr: "",
+			ListenPort: 10803,
+		}}},
+	}
+
+	cfgs, err := server.buildProxyConfigs(context.Background())
+	if err != nil {
+		t.Fatalf("buildProxyConfigs() error=%v", err)
+	}
+	if len(cfgs) != 1 || cfgs[0].ListenAddr != "127.0.0.1" {
+		t.Fatalf("runtime listen_addr=%q want=127.0.0.1", cfgs[0].ListenAddr)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -116,6 +117,10 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 	if err != nil {
 		return nil, fmt.Errorf("initialize API session signing: %w", err)
 	}
+	var websheets *vwebsheet.Broker
+	if cfg.Server.WebsheetEnabled {
+		websheets = vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"})
+	}
 	s := &Server{
 		cfg:           cfg.Server,
 		fullCfg:       cfg,
@@ -128,7 +133,7 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		voiceGW:       voiceGW,
 		notifyMgr:     notifyMgr,
 		proxyRepo:     repo.NewDBRepo(),
-		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
+		websheets:     websheets,
 		loginLimiter:  newLoginRateLimiter(0, 0, 0),
 		sessionSecret: sessionSecret,
 		shutdownCh:    make(chan struct{}),
@@ -338,9 +343,10 @@ func (s *Server) newRouter() *gin.Engine {
 
 func (s *Server) Run() error {
 	r := s.newRouter()
+	listenAddr := serverListenAddress(s.cfg.Port)
 
 	srv := &http.Server{
-		Addr:              s.cfg.Port,
+		Addr:              listenAddr,
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       120 * time.Second,
@@ -351,8 +357,51 @@ func (s *Server) Run() error {
 	s.httpSrvMu.Lock()
 	s.httpSrv = srv
 	s.httpSrvMu.Unlock()
-	logger.Info("启动 API 服务器", "port", s.cfg.Port)
+	if serverListenAddressUsesLoopbackDefault(s.cfg.Port) {
+		logger.Warn("API management listener now defaults to loopback; configure an explicit non-loopback address to enable LAN access", "addr", listenAddr)
+	} else if serverListenAddressNeedsLANWarning(listenAddr) {
+		logger.Warn("API management listener is explicitly exposed beyond loopback; LAN access is enabled", "addr", listenAddr)
+	}
+	logger.Info("启动 API 服务器", "addr", listenAddr)
 	return srv.ListenAndServe()
+}
+
+func serverListenAddress(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "127.0.0.1:7575"
+	}
+	if !strings.Contains(addr, ":") {
+		return net.JoinHostPort("127.0.0.1", addr)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil && host == "" {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return addr
+}
+
+func serverListenAddressUsesLoopbackDefault(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" || !strings.Contains(addr, ":") {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	return err == nil && host == ""
+}
+
+func serverListenAddressNeedsLANWarning(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	host := addr
+	if parsedHost, _, err := net.SplitHostPort(addr); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

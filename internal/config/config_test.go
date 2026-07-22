@@ -29,6 +29,20 @@ server:
 	}
 }
 
+func TestLoadDefaultsWebsheetDisabled(t *testing.T) {
+	path := writeTempConfig(t, `
+server:
+  port: 7575
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.WebsheetEnabled {
+		t.Fatal("Server.WebsheetEnabled=true, want fail-closed default false")
+	}
+}
+
 func TestLoadAcceptsConfigWithoutRemovedKeys(t *testing.T) {
 	path := writeTempConfig(t, `
 server:

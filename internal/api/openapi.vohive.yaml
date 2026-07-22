@@ -1045,7 +1045,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/UpstreamProxy'
+                  $ref: '#/components/schemas/UpstreamProxyDTO'
         '500':
           $ref: '#/components/responses/ErrorMessage'
     post:
@@ -2803,6 +2803,31 @@ components:
           type: boolean
         username:
           type: string
+        password_set:
+          type: boolean
+
+    ProxyInstanceInput:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        device_id:
+          type: string
+        enabled:
+          type: boolean
+        mode:
+          type: string
+          enum: [socks5, http]
+        listen_addr:
+          type: string
+        listen_port:
+          type: integer
+        auth_enabled:
+          type: boolean
+        username:
+          type: string
         password:
           type: string
 
@@ -2866,7 +2891,7 @@ components:
         instances:
           type: array
           items:
-            $ref: '#/components/schemas/ProxyInstanceDTO'
+            $ref: '#/components/schemas/ProxyInstanceInput'
 
     UpstreamProxy:
       type: object
@@ -2881,6 +2906,28 @@ components:
           type: string
         password:
           type: string
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    UpstreamProxyDTO:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        addr:
+          type: string
+        username:
+          type: string
+        password_set:
+          type: boolean
         enabled:
           type: boolean
         created_at:

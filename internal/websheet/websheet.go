@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -14,29 +15,37 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
-	defaultTTL           = 10 * time.Minute
-	defaultClientTimeout = 45 * time.Second
-	defaultBasePath      = "/api/websheets"
-	callbackURLToken     = "{{CALLBACK_URL}}"
-	targetQueryParam     = "target_query"
-	bootstrapBodyParam   = "bootstrap_body"
+	defaultTTL                      = 10 * time.Minute
+	defaultClientTimeout            = 45 * time.Second
+	defaultBasePath                 = "/api/websheets"
+	defaultMaxResponseBodyBytes     = 4 << 20
+	defaultMaxRedirects             = 5
+	websheetSessionIDToken          = "{{WEBSHEET_SESSION_ID}}"
+	websheetNonceToken              = "{{WEBSHEET_NONCE}}"
+	targetQueryParam                = "target_query"
+	bootstrapBodyParam              = "bootstrap_body"
 )
 
 var (
-	ErrNotFound     = errors.New("websheet session not found")
-	ErrExpired      = errors.New("websheet session expired")
-	ErrUnsafeURL    = errors.New("websheet URL is not allowed")
-	ErrUnauthorized = errors.New("websheet session unauthorized")
+	ErrDisabled              = errors.New("websheet is disabled")
+	ErrNotFound              = errors.New("websheet session not found")
+	ErrExpired               = errors.New("websheet session expired")
+	ErrInvalidCallback       = errors.New("invalid websheet callback")
+	ErrUnsafeURL             = errors.New("websheet URL is not allowed")
+	ErrUnauthorized          = errors.New("websheet session unauthorized")
+	ErrResponseTooLarge      = errors.New("websheet response is too large")
+	ErrTooManyRedirects      = errors.New("websheet redirect limit exceeded")
+	ErrUnsafeResponseHeaders = errors.New("websheet response headers are not compatible with safe embedding")
 )
 
 //go:embed bridge.js
@@ -46,6 +55,8 @@ type Config struct {
 	TTL               time.Duration
 	BasePath          string
 	AllowPrivateHosts bool
+	ResolveIP         func(context.Context, string) ([]netip.Addr, error)
+	DialContext       func(context.Context, string, string) (net.Conn, error)
 	Now               func() time.Time
 }
 
@@ -55,6 +66,8 @@ type Broker struct {
 	ttl               time.Duration
 	basePath          string
 	allowPrivateHosts bool
+	resolveIP         func(context.Context, string) ([]netip.Addr, error)
+	dialContext       func(context.Context, string, string) (net.Conn, error)
 	now               func() time.Time
 }
 
@@ -66,11 +79,12 @@ type Request struct {
 }
 
 type Info struct {
-	ID       string `json:"id"`
-	EmbedURL string `json:"embedUrl"`
-	Title    string `json:"title,omitempty"`
-	URL      string `json:"url"`
-	Method   string `json:"method"`
+	ID           string `json:"id"`
+	EmbedURL     string `json:"embedUrl"`
+	MessageNonce string `json:"messageNonce"`
+	Title        string `json:"title,omitempty"`
+	URL          string `json:"url"`
+	Method       string `json:"method"`
 }
 
 type Callback struct {
@@ -88,9 +102,74 @@ type Callback struct {
 	NextAction         string `json:"nextAction,omitempty"`
 }
 
+const maxCallbackBodyBytes = 16 << 10
+
+func DecodeCallback(r io.Reader) (Callback, error) {
+	if r == nil {
+		return Callback{}, fmt.Errorf("%w: body is required", ErrInvalidCallback)
+	}
+	data, err := io.ReadAll(io.LimitReader(r, maxCallbackBodyBytes+1))
+	if err != nil {
+		return Callback{}, fmt.Errorf("%w: read body", ErrInvalidCallback)
+	}
+	if len(data) == 0 || len(data) > maxCallbackBodyBytes {
+		return Callback{}, fmt.Errorf("%w: body size", ErrInvalidCallback)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var callback Callback
+	if err := dec.Decode(&callback); err != nil {
+		return Callback{}, fmt.Errorf("%w: decode", ErrInvalidCallback)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return Callback{}, fmt.Errorf("%w: trailing data", ErrInvalidCallback)
+	}
+	if err := validateCallback(&callback); err != nil {
+		return Callback{}, err
+	}
+	return callback, nil
+}
+
+func validateCallback(callback *Callback) error {
+	if callback == nil {
+		return fmt.Errorf("%w: callback is required", ErrInvalidCallback)
+	}
+	callback.Source = strings.ToLower(strings.TrimSpace(callback.Source))
+	if callback.Source != "vowifi" && callback.Source != "odsa" {
+		return fmt.Errorf("%w: source", ErrInvalidCallback)
+	}
+	fields := []struct {
+		value    *string
+		required bool
+		max      int
+	}{
+		{&callback.Controller, false, 128},
+		{&callback.Method, false, 128},
+		{&callback.Event, true, 128},
+		{&callback.ResultCode, false, 128},
+		{&callback.Href, false, 2048},
+		{&callback.ActivationCode, false, 2048},
+		{&callback.DefaultSMDPAddress, false, 512},
+		{&callback.SMDPFQDN, false, 255},
+		{&callback.ICCID, false, 64},
+		{&callback.IMEI, false, 64},
+		{&callback.NextAction, false, 256},
+	}
+	for _, field := range fields {
+		*field.value = strings.TrimSpace(*field.value)
+		if field.required && *field.value == "" {
+			return fmt.Errorf("%w: required field", ErrInvalidCallback)
+		}
+		if len(*field.value) > field.max || strings.IndexFunc(*field.value, unicode.IsControl) >= 0 {
+			return fmt.Errorf("%w: field value", ErrInvalidCallback)
+		}
+	}
+	return nil
+}
+
 type Session struct {
 	id                string
-	accessToken       string
+	messageNonce      string
 	target            *url.URL
 	userData          string
 	contentType       string
@@ -100,6 +179,7 @@ type Session struct {
 	client            *http.Client
 	now               func() time.Time
 	allowPrivateHosts bool
+	resolveIP         func(context.Context, string) ([]netip.Addr, error)
 
 	callbackCh chan Callback
 	doneCh     chan struct{}
@@ -119,11 +199,22 @@ func New(cfg Config) *Broker {
 	if now == nil {
 		now = time.Now
 	}
+	resolveIP := cfg.ResolveIP
+	if resolveIP == nil {
+		resolveIP = defaultResolveIP
+	}
+	dialContext := cfg.DialContext
+	if dialContext == nil {
+		dialer := &net.Dialer{}
+		dialContext = dialer.DialContext
+	}
 	return &Broker{
 		sessions:          make(map[string]*Session),
 		ttl:               ttl,
 		basePath:          basePath,
 		allowPrivateHosts: cfg.AllowPrivateHosts,
+		resolveIP:         resolveIP,
+		dialContext:       dialContext,
 		now:               now,
 	}
 }
@@ -132,25 +223,21 @@ func (b *Broker) Create(ctx context.Context, req Request) (*Session, error) {
 	if b == nil {
 		return nil, errors.New("websheet broker is nil")
 	}
-	target, err := parseAllowedURL(ctx, req.URL, b.allowPrivateHosts)
+	target, err := parseAllowedURL(ctx, req.URL, b.allowPrivateHosts, b.resolveIP)
 	if err != nil {
 		return nil, err
-	}
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("create websheet cookie jar: %w", err)
 	}
 	id, err := randomID()
 	if err != nil {
 		return nil, err
 	}
-	accessToken, err := randomToken()
+	messageNonce, err := randomNonce()
 	if err != nil {
 		return nil, err
 	}
 	session := &Session{
 		id:                id,
-		accessToken:       accessToken,
+		messageNonce:      messageNonce,
 		target:            target,
 		userData:          strings.TrimSpace(req.UserData),
 		contentType:       strings.TrimSpace(req.ContentType),
@@ -159,14 +246,26 @@ func (b *Broker) Create(ctx context.Context, req Request) (*Session, error) {
 		basePath:          b.basePath,
 		now:               b.now,
 		allowPrivateHosts: b.allowPrivateHosts,
+		resolveIP:         b.resolveIP,
 		callbackCh:        make(chan Callback, 1),
 		doneCh:            make(chan struct{}),
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = dialAllowedContext(b.resolveIP, b.dialContext, b.allowPrivateHosts)
 	session.client = &http.Client{
-		Jar:     jar,
-		Timeout: defaultClientTimeout,
+		Transport: transport,
+		Timeout:   defaultClientTimeout,
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
-			_, err := parseAllowedURL(r.Context(), r.URL.String(), b.allowPrivateHosts)
+			if r.Response != nil {
+				if err := validateResponseHeaders(r.Response.Header); err != nil {
+					return err
+				}
+			}
+			_, err := parseAllowedURL(r.Context(), r.URL.String(), b.allowPrivateHosts, b.resolveIP)
+			if err == nil && len(via) > defaultMaxRedirects {
+				return ErrTooManyRedirects
+			}
 			return err
 		},
 	}
@@ -204,14 +303,13 @@ func (b *Broker) Delete(id string) {
 }
 
 func (s *Session) Info() Info {
-	values := url.Values{}
-	values.Set("token", s.accessToken)
 	return Info{
-		ID:       s.id,
-		EmbedURL: s.basePath + "/" + url.PathEscape(s.id) + "?" + values.Encode(),
-		Title:    s.title,
-		URL:      s.target.String(),
-		Method:   s.method(),
+		ID:           s.id,
+		EmbedURL:     s.basePath + "/" + url.PathEscape(s.id),
+		MessageNonce: s.messageNonce,
+		Title:        s.title,
+		URL:          s.target.String(),
+		Method:       s.method(),
 	}
 }
 
@@ -222,19 +320,14 @@ func (s *Session) Authorize(r *http.Request) error {
 	if s.expired() {
 		return ErrExpired
 	}
-	token := ""
+	nonce := ""
 	if r != nil {
-		if r.URL != nil {
-			token = strings.TrimSpace(r.URL.Query().Get("token"))
-		}
-		if token == "" {
-			token = strings.TrimSpace(r.Header.Get("X-Websheet-Token"))
-		}
+		nonce = strings.TrimSpace(r.Header.Get("X-Websheet-Nonce"))
 	}
-	if token == "" || s.accessToken == "" {
+	if nonce == "" || s.messageNonce == "" {
 		return ErrUnauthorized
 	}
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.accessToken)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(nonce), []byte(s.messageNonce)) != 1 {
 		return ErrUnauthorized
 	}
 	return nil
@@ -274,12 +367,11 @@ func (s *Session) ServeBootstrap(w http.ResponseWriter, r *http.Request) error {
 	if s.expired() {
 		return ErrExpired
 	}
-	token := strings.TrimSpace(r.URL.Query().Get("token"))
 	target := *s.target
 	if s.method() == http.MethodGet && s.userData != "" {
 		appendRawQuery(&target, s.userData)
 	}
-	proxyURL := s.proxyURL(target.String(), token)
+	proxyURL := s.proxyURL(target.String())
 	if s.method() == http.MethodGet {
 		http.Redirect(w, r, proxyURL, http.StatusFound)
 		return nil
@@ -303,14 +395,14 @@ func (s *Session) Proxy(w http.ResponseWriter, r *http.Request) error {
 	if rawTarget == "" {
 		rawTarget = s.target.String()
 	}
-	target, err := parseAllowedURL(r.Context(), rawTarget, s.allowPrivateHosts)
+	target, err := parseAllowedURL(r.Context(), rawTarget, s.allowPrivateHosts, s.resolveIP)
 	if err != nil {
 		return err
 	}
 	if callback, ok := callbackFromURL(target); ok {
 		s.Callback(callback)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, err := io.WriteString(w, callbackHTML())
+		_, err := io.WriteString(w, callbackHTML(s.id, s.messageNonce))
 		return err
 	}
 
@@ -342,25 +434,27 @@ func (s *Session) Proxy(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("proxy websheet request: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := validateResponseHeaders(resp.Header); err != nil {
+		return err
+	}
 
+	data, err := readResponseBody(resp.Body)
+	if err != nil {
+		return err
+	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	contentType := resp.Header.Get("Content-Type")
 	if isHTML(contentType) {
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("read websheet response: %w", err)
-		}
-		token := strings.TrimSpace(r.URL.Query().Get("token"))
 		base := target
 		if resp.Request != nil && resp.Request.URL != nil {
 			base = resp.Request.URL
 		}
-		html := s.rewriteHTML(string(data), base, token, shouldInjectBridge(r))
+		html := s.rewriteHTML(string(data), base, shouldInjectBridge(r))
 		_, err = io.WriteString(w, html)
 		return err
 	}
-	_, err = io.Copy(w, resp.Body)
+	_, err = w.Write(data)
 	return err
 }
 
@@ -375,14 +469,11 @@ func (s *Session) expired() bool {
 	return !s.now().Before(s.expiresAt)
 }
 
-func (s *Session) proxyURL(rawTarget string, token string) string {
+func (s *Session) proxyURL(rawTarget string) string {
 	if target, err := url.Parse(rawTarget); err == nil && target.Scheme != "" && target.Host != "" {
 		values := url.Values{}
 		if target.RawQuery != "" {
 			values.Set(targetQueryParam, target.RawQuery)
-		}
-		if token != "" {
-			values.Set("token", token)
 		}
 		proxyPath := s.basePath + "/" + url.PathEscape(s.id) + "/proxy/" + target.Scheme + "/" + target.Host + target.EscapedPath()
 		if target.EscapedPath() == "" {
@@ -395,9 +486,6 @@ func (s *Session) proxyURL(rawTarget string, token string) string {
 	}
 	values := url.Values{}
 	values.Set("target", rawTarget)
-	if token != "" {
-		values.Set("token", token)
-	}
 	return s.basePath + "/" + url.PathEscape(s.id) + "/proxy?" + values.Encode()
 }
 
@@ -432,18 +520,6 @@ func (s *Session) proxyPathTarget(r *http.Request) string {
 	return target.String()
 }
 
-func (s *Session) callbackURL(token string) string {
-	values := url.Values{}
-	if token != "" {
-		values.Set("token", token)
-	}
-	path := s.basePath + "/" + url.PathEscape(s.id) + "/callback"
-	if encoded := values.Encode(); encoded != "" {
-		path += "?" + encoded
-	}
-	return path
-}
-
 func (s *Session) postBootstrapHTML(action string) string {
 	values, err := url.ParseQuery(strings.TrimLeft(s.userData, "?&"))
 	var body bytes.Buffer
@@ -470,7 +546,7 @@ func (s *Session) postBootstrapHTML(action string) string {
 	return body.String()
 }
 
-func (s *Session) rewriteHTML(doc string, base *url.URL, token string, injectBridge bool) string {
+func (s *Session) rewriteHTML(doc string, base *url.URL, injectBridge bool) string {
 	docBase := s.documentBaseURL(doc, base)
 	rewritten := attrURLPattern.ReplaceAllStringFunc(doc, func(match string) string {
 		parts := attrURLPattern.FindStringSubmatch(match)
@@ -485,7 +561,7 @@ func (s *Session) rewriteHTML(doc string, base *url.URL, token string, injectBri
 		if raw == "" {
 			raw = parts[5]
 		}
-		next, ok := s.rewriteURL(raw, docBase, token)
+		next, ok := s.rewriteURL(raw, docBase)
 		if !ok {
 			return match
 		}
@@ -494,7 +570,7 @@ func (s *Session) rewriteHTML(doc string, base *url.URL, token string, injectBri
 	if !injectBridge {
 		return rewritten
 	}
-	script := s.bridgeScript(token, docBase)
+	script := s.bridgeScript(docBase)
 	lower := strings.ToLower(rewritten)
 	if idx := strings.Index(lower, "<head"); idx >= 0 {
 		if end := strings.Index(rewritten[idx:], ">"); end >= 0 {
@@ -546,7 +622,7 @@ func (s *Session) documentBaseURL(doc string, fallback *url.URL) *url.URL {
 	return fallback.ResolveReference(ref)
 }
 
-func (s *Session) rewriteURL(raw string, base *url.URL, token string) (string, bool) {
+func (s *Session) rewriteURL(raw string, base *url.URL) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.HasPrefix(raw, "#") {
 		return raw, false
@@ -560,25 +636,23 @@ func (s *Session) rewriteURL(raw string, base *url.URL, token string) (string, b
 		return raw, false
 	}
 	target := base.ResolveReference(ref)
-	return s.proxyURL(target.String(), token), true
+	return s.proxyURL(target.String()), true
 }
 
-func (s *Session) bridgeScript(token string, carrierBase *url.URL) string {
-	callbackURL := s.callbackURL(token)
-	script := strings.ReplaceAll(websheetBridgeJS, callbackURLToken, jsString(callbackURL))
-	script = strings.ReplaceAll(script, "{{ABSOLUTE_PATH_PROXY_PREFIX}}", jsString(s.absolutePathProxyPrefix(carrierBase, token)))
-	script = strings.ReplaceAll(script, "{{WEBSHEET_TOKEN}}", jsString(token))
+func (s *Session) bridgeScript(carrierBase *url.URL) string {
+	script := strings.ReplaceAll(websheetBridgeJS, websheetSessionIDToken, jsString(s.id))
+	script = strings.ReplaceAll(script, websheetNonceToken, jsString(s.messageNonce))
+	script = strings.ReplaceAll(script, "{{ABSOLUTE_PATH_PROXY_PREFIX}}", jsString(s.absolutePathProxyPrefix(carrierBase)))
 	return "<script>\n" + script + "\n</script>"
 }
 
-func (s *Session) absolutePathProxyPrefix(carrierBase *url.URL, token string) string {
+func (s *Session) absolutePathProxyPrefix(carrierBase *url.URL) string {
 	origin := targetOrigin(carrierBase)
 	if origin == "" {
 		return ""
 	}
-	return strings.TrimRight(s.proxyURL(origin+"/", ""), "/")
+	return strings.TrimRight(s.proxyURL(origin+"/"), "/")
 }
-
 var (
 	attrURLPattern  = regexp.MustCompile("(?i)\\b(href|src|action)=(\"([^\"]*)\"|'([^']*)'|([^\\s\"'=<>`]+))")
 	baseHrefPattern = regexp.MustCompile("(?is)<base\\b[^>]*\\bhref=(\"([^\"]*)\"|'([^']*)'|([^\\s\"'=<>`]+))[^>]*>")
@@ -618,7 +692,7 @@ func targetOrigin(target *url.URL) string {
 func copyResponseHeaders(dst http.Header, src http.Header) {
 	for key, values := range src {
 		switch strings.ToLower(key) {
-		case "content-security-policy", "content-security-policy-report-only", "x-frame-options", "content-length", "set-cookie":
+		case "content-length":
 			continue
 		}
 		for _, value := range values {
@@ -635,7 +709,112 @@ func isHTML(contentType string) bool {
 	return mediaType == "text/html" || mediaType == "application/xhtml+xml"
 }
 
-func parseAllowedURL(ctx context.Context, raw string, allowPrivate bool) (*url.URL, error) {
+func validateResponseHeaders(headers http.Header) error {
+	for _, name := range []string{
+		"Content-Security-Policy",
+		"Content-Security-Policy-Report-Only",
+		"X-Content-Security-Policy",
+		"X-Frame-Options",
+		"Set-Cookie",
+		"Set-Cookie2",
+	} {
+		if len(headers.Values(name)) != 0 {
+			return ErrUnsafeResponseHeaders
+		}
+	}
+	return nil
+}
+
+func readResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, defaultMaxResponseBodyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read websheet response: %w", err)
+	}
+	if len(data) > defaultMaxResponseBodyBytes {
+		return nil, ErrResponseTooLarge
+	}
+	return data, nil
+}
+
+func defaultResolveIP(ctx context.Context, host string) ([]netip.Addr, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		ip, ok := netip.AddrFromSlice(addr.IP)
+		if ok {
+			ips = append(ips, ip.Unmap())
+		}
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("host resolved without an IP address")
+	}
+	return ips, nil
+}
+
+func resolveHostIPs(
+	ctx context.Context,
+	host string,
+	resolveIP func(context.Context, string) ([]netip.Addr, error),
+) ([]netip.Addr, error) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip.Unmap()}, nil
+	}
+	if resolveIP == nil {
+		resolveIP = defaultResolveIP
+	}
+	ips, err := resolveIP(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("host resolved without an IP address")
+	}
+	return ips, nil
+}
+
+func dialAllowedContext(
+	resolveIP func(context.Context, string) ([]netip.Addr, error),
+	dialContext func(context.Context, string, string) (net.Conn, error),
+	allowPrivate bool,
+) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("parse websheet dial address: %w", err)
+		}
+		if !allowPrivate && isLocalHostname(host) {
+			return nil, fmt.Errorf("%w: local dial host", ErrUnsafeURL)
+		}
+		ips, err := resolveHostIPs(ctx, host, resolveIP)
+		if err != nil {
+			return nil, fmt.Errorf("resolve websheet dial host: %w", err)
+		}
+		for _, ip := range ips {
+			if !ip.IsValid() || (!allowPrivate && unsafeIP(ip.Unmap())) {
+				return nil, fmt.Errorf("%w: unsafe dial address", ErrUnsafeURL)
+			}
+		}
+		var lastErr error
+		for _, ip := range ips {
+			conn, err := dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, fmt.Errorf("dial websheet target: %w", lastErr)
+	}
+}
+
+func parseAllowedURL(
+	ctx context.Context,
+	raw string,
+	allowPrivate bool,
+	resolveIP func(context.Context, string) ([]netip.Addr, error),
+) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, fmt.Errorf("%w: URL is required", ErrUnsafeURL)
@@ -660,19 +839,12 @@ func parseAllowedURL(ctx context.Context, raw string, allowPrivate bool) (*url.U
 	if isLocalHostname(host) {
 		return nil, fmt.Errorf("%w: local host %q", ErrUnsafeURL, host)
 	}
-	if ip, err := netip.ParseAddr(host); err == nil {
-		if unsafeIP(ip) {
-			return nil, fmt.Errorf("%w: private address %q", ErrUnsafeURL, host)
-		}
-		return parsed, nil
-	}
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	ips, err := resolveHostIPs(ctx, host, resolveIP)
 	if err != nil {
 		return nil, fmt.Errorf("resolve websheet host: %w", err)
 	}
-	for _, addr := range addrs {
-		ip, ok := netip.AddrFromSlice(addr.IP)
-		if ok && unsafeIP(ip.Unmap()) {
+	for _, ip := range ips {
+		if !ip.IsValid() || unsafeIP(ip.Unmap()) {
 			return nil, fmt.Errorf("%w: private address %q", ErrUnsafeURL, host)
 		}
 	}
@@ -684,8 +856,13 @@ func isLocalHostname(host string) bool {
 	return host == "localhost" || strings.HasSuffix(host, ".localhost")
 }
 
+var sharedAddressPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
 func unsafeIP(ip netip.Addr) bool {
-	return ip.IsLoopback() ||
+	ip = ip.Unmap()
+	return !ip.IsGlobalUnicast() ||
+		sharedAddressPrefix.Contains(ip) ||
+		ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
@@ -767,8 +944,8 @@ func firstValue(values url.Values, keys ...string) string {
 	return ""
 }
 
-func callbackHTML() string {
-	return `<!doctype html><html><body><script>try{window.parent.postMessage({type:"vohive-websheet-callback"},"*")}catch(_){}</script>Carrier flow returned to VoHive.</body></html>`
+func callbackHTML(sessionID, nonce string) string {
+	return "<!doctype html><html><body><script>try{const o=new URL(window.location.href).origin;window.parent.postMessage({type:\"vohive-websheet-callback\",sessionId:"+jsString(sessionID)+",nonce:"+jsString(nonce)+",callback:{source:\"odsa\",event:\"finishFlow\"}},o)}catch(_){}</script>Carrier flow returned to VoHive.</body></html>"
 }
 
 func jsString(value string) string {
@@ -787,10 +964,10 @@ func randomID() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-func randomToken() (string, error) {
+func randomNonce() (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("generate websheet token: %w", err)
+		return "", fmt.Errorf("generate websheet nonce: %w", err)
 	}
 	return hex.EncodeToString(raw[:]), nil
 }

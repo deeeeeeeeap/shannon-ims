@@ -6,6 +6,23 @@ export const api: AxiosInstance = axios.create({
   baseURL: '/api'
 })
 
+function isWebsheetRequestURL(raw: unknown) {
+  if (typeof raw !== 'string' || raw === '') return false
+  try {
+    const path = new URL(raw, 'http://vohive.invalid').pathname
+    return /^\/(?:api\/)?websheets(?:\/|$)/.test(path)
+  } catch {
+    return false
+  }
+}
+
+api.interceptors.request.use(config => {
+  if (isWebsheetRequestURL(config.url)) {
+    config.headers.delete('Authorization')
+  }
+  return config
+})
+
 try {
   const token = localStorage.getItem('token') || ''
   if (token) {

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -32,7 +33,7 @@ type proxyInstanceDTO struct {
 	ListenPort  int    `json:"listen_port"`
 	AuthEnabled bool   `json:"auth_enabled"`
 	Username    string `json:"username"`
-	Password    string `json:"password,omitempty"`
+	PasswordSet bool   `json:"password_set"`
 }
 
 // proxyDeviceDTO 设备 DTO
@@ -63,7 +64,7 @@ func (s *Server) handleProxyOverview(c *gin.Context) {
 	}
 	resp.Instances = make([]proxyInstanceDTO, 0, len(instances))
 	for _, inst := range instances {
-		resp.Instances = append(resp.Instances, instanceToDTO(inst, true))
+		resp.Instances = append(resp.Instances, instanceToDTO(inst))
 	}
 
 	{
@@ -101,7 +102,7 @@ func (s *Server) handleProxyInstanceGet(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "实例不存在: " + id})
 		return
 	}
-	c.JSON(http.StatusOK, instanceToDTO(*inst, false))
+	c.JSON(http.StatusOK, instanceToDTO(*inst))
 }
 
 // handleProxyUpdateConfig 更新代理配置
@@ -143,19 +144,42 @@ func (s *Server) handleProxyUpdateConfig(c *gin.Context) {
 		return
 	}
 
+	warning := proxyListenWarnings(normalizedInstances)
 	if err := s.SyncProxyConfigs(); err != nil {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "applied": false, "warning": err.Error()})
+		warning += " Runtime apply failed: " + err.Error()
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "applied": false, "warning": warning})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "applied": true})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "applied": true, "warning": warning})
+}
+
+func proxyListenWarnings(instances []config.ProxyInstance) string {
+	warnings := []string{"Empty listen_addr now defaults to 127.0.0.1; LAN exposure requires an explicit address."}
+	for _, inst := range instances {
+		addr := strings.TrimSpace(inst.ListenAddr)
+		if addr == "" || isLoopbackListenAddress(addr) {
+			continue
+		}
+		warnings = append(warnings, "Proxy instance "+inst.ID+" explicitly listens on "+addr+"; LAN exposure is enabled.")
+	}
+	return strings.Join(warnings, " ")
+}
+
+func isLoopbackListenAddress(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if strings.EqualFold(addr, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(addr, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func restoreProxySecrets(inst *config.ProxyInstance, oldInst config.ProxyInstance) {
 	if inst == nil {
 		return
 	}
-	if inst.Password == "******" {
+	if strings.TrimSpace(inst.Password) == "" || inst.Password == "******" {
 		inst.Password = oldInst.Password
 	}
 }
@@ -176,7 +200,7 @@ func normalizeProxyInstanceForSave(inst config.ProxyInstance, oldInst *config.Pr
 		return config.ProxyInstance{}, errors.New("listen_port 无效")
 	}
 	if strings.TrimSpace(inst.ListenAddr) == "" {
-		inst.ListenAddr = "0.0.0.0"
+		inst.ListenAddr = "127.0.0.1"
 	}
 	if oldInst != nil {
 		restoreProxySecrets(&inst, *oldInst)
@@ -309,7 +333,14 @@ func (s *Server) buildProxyConfigs(ctx context.Context) ([]server.InstanceConfig
 		}
 		inst.Mode = mode
 		if strings.TrimSpace(inst.ListenAddr) == "" {
-			inst.ListenAddr = "0.0.0.0"
+			inst.ListenAddr = "127.0.0.1"
+		}
+		if !isLoopbackListenAddress(inst.ListenAddr) {
+			logger.Warn(
+				"Proxy listener is explicitly exposed beyond loopback; LAN access is enabled",
+				"instance_id", inst.ID,
+				"listen_addr", inst.ListenAddr,
+			)
 		}
 		if inst.ListenPort <= 0 || inst.ListenPort > 65535 {
 			return nil, errors.New("listen_port 无效")
@@ -347,7 +378,7 @@ func (s *Server) buildProxyConfigs(ctx context.Context) ([]server.InstanceConfig
 	return out, nil
 }
 
-func instanceToDTO(inst config.ProxyInstance, mask bool) proxyInstanceDTO {
+func instanceToDTO(inst config.ProxyInstance) proxyInstanceDTO {
 	mode := strings.ToLower(strings.TrimSpace(inst.Mode))
 	if mode == "" {
 		mode = server.ModeSocks5
@@ -362,16 +393,6 @@ func instanceToDTO(inst config.ProxyInstance, mask bool) proxyInstanceDTO {
 		ListenPort:  inst.ListenPort,
 		AuthEnabled: inst.AuthEnabled,
 		Username:    inst.Username,
-		Password:    maybeMaskSecret(inst.Password, mask),
+		PasswordSet: strings.TrimSpace(inst.Password) != "",
 	}
-}
-
-func maybeMaskSecret(v string, mask bool) string {
-	if !mask {
-		return v
-	}
-	if strings.TrimSpace(v) == "" {
-		return ""
-	}
-	return "******"
 }
