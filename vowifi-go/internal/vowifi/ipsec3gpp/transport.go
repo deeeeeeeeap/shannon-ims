@@ -128,6 +128,10 @@ func (t *Transport) TransformOutbound(packet []byte) ([]byte, error) {
 		t.transformErrors.Add(1)
 		return nil, err
 	}
+	if parsed.fragmented && t.matchesOutboundEndpoints(parsed) {
+		t.transformErrors.Add(1)
+		return nil, errors.New("ipsec3gpp: fragmented outbound policy packet rejected")
+	}
 	flow, ok := t.matchOutbound(parsed)
 	if !ok {
 		t.passthroughPackets.Add(1)
@@ -163,6 +167,10 @@ func (t *Transport) TransformInbound(packet []byte) ([]byte, error) {
 	if err != nil {
 		t.transformErrors.Add(1)
 		return nil, err
+	}
+	if parsed.fragmented && t.matchesInboundEndpoints(parsed) {
+		t.transformErrors.Add(1)
+		return nil, errors.New("ipsec3gpp: fragmented inbound policy packet rejected")
 	}
 	if parsed.nextHeader != ipProtoESP {
 		t.passthroughPackets.Add(1)
@@ -237,12 +245,21 @@ func (t *Transport) matchOutbound(parsed parsedIPPacket) (*transportFlow, bool) 
 	return nil, false
 }
 
+func (t *Transport) matchesOutboundEndpoints(parsed parsedIPPacket) bool {
+	return ipEqual(parsed.src, t.policy.LocalIP) && ipEqual(parsed.dst, t.policy.RemoteIP)
+}
+
+func (t *Transport) matchesInboundEndpoints(parsed parsedIPPacket) bool {
+	return ipEqual(parsed.src, t.policy.RemoteIP) && ipEqual(parsed.dst, t.policy.LocalIP)
+}
+
 type parsedIPPacket struct {
 	header           []byte
 	transportPayload []byte
 	src, dst         []byte
 	srcPort, dstPort int
 	nextHeader       uint8
+	fragmented       bool
 }
 
 const (
@@ -279,6 +296,8 @@ func parseIPv4Packet(packet []byte) (parsedIPPacket, error) {
 	}
 	packet = packet[:totalLen]
 	nextHeader := packet[9]
+	fragmentField := binary.BigEndian.Uint16(packet[6:8])
+	fragmented := fragmentField&0x2000 != 0 || fragmentField&0x1fff != 0
 	header := append([]byte(nil), packet[:ihl]...)
 	payload := append([]byte(nil), packet[ihl:]...)
 	out := parsedIPPacket{
@@ -287,8 +306,9 @@ func parseIPv4Packet(packet []byte) (parsedIPPacket, error) {
 		src:              append([]byte(nil), packet[12:16]...),
 		dst:              append([]byte(nil), packet[16:20]...),
 		nextHeader:       nextHeader,
+		fragmented:       fragmented,
 	}
-	if (nextHeader == ipProtoTCP || nextHeader == ipProtoUDP) && len(payload) >= 4 {
+	if !fragmented && (nextHeader == ipProtoTCP || nextHeader == ipProtoUDP) && len(payload) >= 4 {
 		out.srcPort = int(binary.BigEndian.Uint16(payload[0:2]))
 		out.dstPort = int(binary.BigEndian.Uint16(payload[2:4]))
 	}
@@ -304,16 +324,17 @@ func parseIPv6Packet(packet []byte) (parsedIPPacket, error) {
 		return parsedIPPacket{}, errors.New("ipsec3gpp: invalid IPv6 payload length")
 	}
 	packet = packet[:40+payloadLen]
-	nextHeader, payload, err := parseIPv6ExtensionHeaders(packet[40:], packet[6])
+	nextHeader, payload, extensionLength, fragmented, err := parseIPv6ExtensionHeaders(packet[40:], packet[6])
 	if err != nil {
 		return parsedIPPacket{}, err
 	}
 	out := parsedIPPacket{
-		header:           append([]byte(nil), packet[:40]...),
+		header:           append([]byte(nil), packet[:40+extensionLength]...),
 		transportPayload: append([]byte(nil), payload...),
 		src:              append([]byte(nil), packet[8:24]...),
 		dst:              append([]byte(nil), packet[24:40]...),
 		nextHeader:       nextHeader,
+		fragmented:       fragmented,
 	}
 	if (nextHeader == ipProtoTCP || nextHeader == ipProtoUDP) && len(payload) >= 4 {
 		out.srcPort = int(binary.BigEndian.Uint16(payload[0:2]))
@@ -322,19 +343,41 @@ func parseIPv6Packet(packet []byte) (parsedIPPacket, error) {
 	return out, nil
 }
 
-func parseIPv6ExtensionHeaders(payload []byte, nextHeader uint8) (uint8, []byte, error) {
+func parseIPv6ExtensionHeaders(payload []byte, nextHeader uint8) (uint8, []byte, int, bool, error) {
+	consumed := 0
+	fragmented := false
 	for isIPv6ExtensionHeader(nextHeader) {
-		if len(payload) < 2 {
-			return 0, nil, errors.New("ipsec3gpp: truncated IPv6 extension header")
+		if nextHeader == 44 {
+			fragmented = true
 		}
-		hdrLen := int(payload[1]+1) * 8
-		if len(payload) < hdrLen {
-			return 0, nil, errors.New("ipsec3gpp: truncated IPv6 extension header length")
+		hdrLen, err := ipv6ExtensionHeaderLength(nextHeader, payload)
+		if err != nil {
+			return 0, nil, 0, false, err
 		}
 		nextHeader = payload[0]
 		payload = payload[hdrLen:]
+		consumed += hdrLen
 	}
-	return nextHeader, payload, nil
+	return nextHeader, payload, consumed, fragmented, nil
+}
+
+func ipv6ExtensionHeaderLength(proto uint8, payload []byte) (int, error) {
+	if len(payload) < 2 {
+		return 0, errors.New("ipsec3gpp: truncated IPv6 extension header")
+	}
+	var hdrLen int
+	switch proto {
+	case 44:
+		hdrLen = 8
+	case 51:
+		hdrLen = (int(payload[1]) + 2) * 4
+	default:
+		hdrLen = (int(payload[1]) + 1) * 8
+	}
+	if hdrLen < 8 || len(payload) < hdrLen {
+		return 0, errors.New("ipsec3gpp: truncated IPv6 extension header length")
+	}
+	return hdrLen, nil
 }
 
 func isIPv6ExtensionHeader(proto uint8) bool {
@@ -355,6 +398,10 @@ func replaceIPPayload(header []byte, payload []byte, nextProto uint8) ([]byte, e
 		if len(header) < 20 {
 			return nil, errors.New("ipsec3gpp: IPv4 header too short")
 		}
+		ihl := int(header[0]&0x0f) * 4
+		if ihl < 20 || len(header) < ihl {
+			return nil, errors.New("ipsec3gpp: invalid IPv4 header length")
+		}
 		out := append(append([]byte(nil), header...), payload...)
 		total := len(out)
 		if total > 0xffff {
@@ -368,24 +415,60 @@ func replaceIPPayload(header []byte, payload []byte, nextProto uint8) ([]byte, e
 		if len(header) < 40 {
 			return nil, errors.New("ipsec3gpp: IPv6 header too short")
 		}
+		nextHeaderOffset, err := ipv6FinalNextHeaderOffset(header)
+		if err != nil {
+			return nil, err
+		}
 		out := append(append([]byte(nil), header...), payload...)
 		if len(out)-40 > 0xffff {
 			return nil, errors.New("ipsec3gpp: IPv6 payload too large")
 		}
 		binary.BigEndian.PutUint16(out[4:6], uint16(len(out)-40))
-		out[6] = nextProto
+		out[nextHeaderOffset] = nextProto
 		return out, nil
 	default:
 		return nil, fmt.Errorf("ipsec3gpp: unsupported IP version %d", header[0]>>4)
 	}
 }
 
+func ipv6FinalNextHeaderOffset(header []byte) (int, error) {
+	if len(header) < 40 {
+		return 0, errors.New("ipsec3gpp: IPv6 header too short")
+	}
+	nextHeader := header[6]
+	nextHeaderOffset := 6
+	offset := 40
+	for isIPv6ExtensionHeader(nextHeader) {
+		if offset >= len(header) {
+			return 0, errors.New("ipsec3gpp: missing IPv6 extension header")
+		}
+		hdrLen, err := ipv6ExtensionHeaderLength(nextHeader, header[offset:])
+		if err != nil {
+			return 0, err
+		}
+		if offset+hdrLen > len(header) {
+			return 0, errors.New("ipsec3gpp: truncated IPv6 extension header chain")
+		}
+		nextHeaderOffset = offset
+		nextHeader = header[offset]
+		offset += hdrLen
+	}
+	if offset != len(header) {
+		return 0, errors.New("ipsec3gpp: IPv6 header contains trailing bytes")
+	}
+	return nextHeaderOffset, nil
+}
+
 func updateIPv4HeaderChecksum(hdr []byte) {
 	if len(hdr) < 20 {
 		return
 	}
+	ihl := int(hdr[0]&0x0f) * 4
+	if ihl < 20 || len(hdr) < ihl {
+		return
+	}
 	hdr[10], hdr[11] = 0, 0
-	sum := ipv4HeaderChecksum(hdr[:20])
+	sum := ipv4HeaderChecksum(hdr[:ihl])
 	binary.BigEndian.PutUint16(hdr[10:12], sum)
 }
 

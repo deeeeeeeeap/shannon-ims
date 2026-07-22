@@ -2,7 +2,11 @@ package modem
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/1239t/vohive/internal/config"
 )
 
 func TestParseFuserPIDs(t *testing.T) {
@@ -16,14 +20,6 @@ func TestParseFuserPIDs(t *testing.T) {
 		if _, ok := want[pid]; !ok {
 			t.Fatalf("unexpected pid parsed: %d (all=%v)", pid, got)
 		}
-	}
-}
-
-func TestCurrentProcessTaskPIDSetContainsSelf(t *testing.T) {
-	self := os.Getpid()
-	set := currentProcessTaskPIDSet()
-	if _, ok := set[self]; !ok {
-		t.Fatalf("expected self pid %d in task pid set", self)
 	}
 }
 
@@ -45,6 +41,84 @@ func TestIsRetryableSerialOpenErr(t *testing.T) {
 				t.Fatalf("isRetryableSerialOpenErr(%v)=%v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestManagerStartFailsClosedWhenATPortIsOccupied(t *testing.T) {
+	m, err := New(config.DeviceConfig{
+		ID:            "dev-at",
+		DeviceBackend: "at",
+		ATPort:        "/dev/synthetic-at-port",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	m.portUserLookup = func(string) ([]int, error) {
+		return []int{4242}, nil
+	}
+
+	err = m.Start()
+	if err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("Start() error = %v, want non-sensitive occupied-port failure", err)
+	}
+	if m.CanExecuteAT() {
+		t.Fatal("CanExecuteAT() = true after occupied-port failure, want false")
+	}
+}
+
+func TestLookupPortUsersFailsClosedWhenFuserExitsWithDiagnostic(t *testing.T) {
+	binDir := t.TempDir()
+	fakeFuser := filepath.Join(binDir, "fuser")
+	if err := os.WriteFile(fakeFuser, []byte("#!/bin/sh\nprintf 'permission denied' >&2\nexit 2\n"), 0o755); err != nil {
+		t.Fatalf("write fake fuser: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+	portPath := filepath.Join(t.TempDir(), "synthetic-at-port")
+	if err := os.WriteFile(portPath, nil, 0o600); err != nil {
+		t.Fatalf("write synthetic port: %v", err)
+	}
+
+	users, err := lookupPortUsers(portPath)
+	if err == nil {
+		t.Fatalf("lookupPortUsers() users=%v error=nil for abnormal fuser exit", users)
+	}
+}
+
+func TestLookupPortUsersFailsClosedOnUnexpectedExitWithoutDiagnostic(t *testing.T) {
+	binDir := t.TempDir()
+	fakeFuser := filepath.Join(binDir, "fuser")
+	if err := os.WriteFile(fakeFuser, []byte("#!/bin/sh\nexit 2\n"), 0o755); err != nil {
+		t.Fatalf("write fake fuser: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+	portPath := filepath.Join(t.TempDir(), "synthetic-at-port")
+	if err := os.WriteFile(portPath, nil, 0o600); err != nil {
+		t.Fatalf("write synthetic port: %v", err)
+	}
+
+	if users, err := lookupPortUsers(portPath); err == nil {
+		t.Fatalf("lookupPortUsers() users=%v error=nil for unexpected exit code", users)
+	}
+}
+
+func TestLookupPortUsersAcceptsConfirmedUnusedResult(t *testing.T) {
+	binDir := t.TempDir()
+	fakeFuser := filepath.Join(binDir, "fuser")
+	if err := os.WriteFile(fakeFuser, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake fuser: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+	portPath := filepath.Join(t.TempDir(), "synthetic-at-port")
+	if err := os.WriteFile(portPath, nil, 0o600); err != nil {
+		t.Fatalf("write synthetic port: %v", err)
+	}
+
+	users, err := lookupPortUsers(portPath)
+	if err != nil {
+		t.Fatalf("lookupPortUsers() error=%v for confirmed unused result", err)
+	}
+	if len(users) != 0 {
+		t.Fatalf("lookupPortUsers() users=%v, want none", users)
 	}
 }
 

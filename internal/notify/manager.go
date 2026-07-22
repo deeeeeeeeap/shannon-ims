@@ -3,6 +3,7 @@ package notify
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/1239t/vohive/internal/config"
@@ -13,8 +14,16 @@ import (
 // Manager 统一通知管理器
 // 持有多个 Channel 实例，向所有已启用渠道广播通知和命令
 type Manager struct {
-	pool     *device.Pool
-	channels []Channel // 所有已启用的通知渠道
+	pool        *device.Pool
+	lifecycleMu sync.Mutex
+	channelsMu  sync.Mutex
+	channelSet  *managedChannelSet
+}
+
+type managedChannelSet struct {
+	channels []Channel
+	sends    sync.WaitGroup
+	starts   sync.WaitGroup
 }
 
 type NotificationContext struct {
@@ -50,27 +59,35 @@ func NewManager(cfg *config.Config, pool *device.Pool) (*Manager, error) {
 		pool: pool,
 	}
 
-	// 初始化所有通知渠道
-	if err := m.initChannels(cfg); err != nil {
+	set, err := m.buildChannelSet(cfg)
+	if err != nil {
 		return nil, err
 	}
+	m.channelSet = set
+	m.startChannelSet(set)
 
 	return m, nil
 }
 
-// initChannels 根据配置创建并启动所有通知渠道
-func (m *Manager) initChannels(cfg *config.Config) error {
-	m.channels = nil
+// buildChannelSet 根据配置创建一个尚未启动的不可变渠道集合。
+func (m *Manager) buildChannelSet(cfg *config.Config) (*managedChannelSet, error) {
+	channels := make([]Channel, 0, 7)
+	cleanup := func() {
+		for _, ch := range channels {
+			_ = ch.Close()
+		}
+	}
 
 	// Telegram 渠道
 	if cfg.Telegram.Enabled {
 		tg, err := NewTelegramChannel(cfg.Telegram)
 		if err != nil {
 			logger.Error("初始化 Telegram 渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if tg != nil {
-			m.channels = append(m.channels, tg)
+			channels = append(channels, tg)
 		}
 	}
 
@@ -79,10 +96,11 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 		fs, err := NewFeishuChannel(cfg.Feishu)
 		if err != nil {
 			logger.Error("初始化飞书渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if fs != nil {
-			m.channels = append(m.channels, fs)
+			channels = append(channels, fs)
 		}
 	}
 
@@ -91,10 +109,11 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 		qq, err := NewQQChannel(cfg.QQ)
 		if err != nil {
 			logger.Error("初始化 QQ 渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if qq != nil {
-			m.channels = append(m.channels, qq)
+			channels = append(channels, qq)
 		}
 	}
 
@@ -103,10 +122,11 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 		wh, err := NewWebhookChannel(cfg.Webhook)
 		if err != nil {
 			logger.Error("初始化 Webhook 渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if wh != nil {
-			m.channels = append(m.channels, wh)
+			channels = append(channels, wh)
 		}
 	}
 
@@ -115,10 +135,11 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 		bk, err := NewBarkChannel(cfg.Bark)
 		if err != nil {
 			logger.Error("初始化 Bark 渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if bk != nil {
-			m.channels = append(m.channels, bk)
+			channels = append(channels, bk)
 		}
 	}
 
@@ -127,10 +148,11 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 		em, err := NewEmailChannel(cfg.Email)
 		if err != nil {
 			logger.Error("初始化 Email 渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if em != nil {
-			m.channels = append(m.channels, em)
+			channels = append(channels, em)
 		}
 	}
 
@@ -139,31 +161,21 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 		pp, err := NewPushplusChannel(cfg.Pushplus)
 		if err != nil {
 			logger.Error("初始化 Pushplus 渠道失败", "err", err)
-			return err
+			cleanup()
+			return nil, err
 		}
 		if pp != nil {
-			m.channels = append(m.channels, pp)
+			channels = append(channels, pp)
 		}
 	}
 
 	// 向所有渠道注册命令
-	m.registerCommands()
-
-	// 启动所有渠道的命令监听
-	for _, ch := range m.channels {
-		ch := ch
-		go func() {
-			if err := ch.Start(); err != nil {
-				logger.Error("通知渠道命令监听失败", "channel", ch.Name(), "err", err)
-			}
-		}()
-	}
-
-	return nil
+	m.registerCommands(channels)
+	return &managedChannelSet{channels: channels}, nil
 }
 
 // registerCommands 向所有已启用渠道注册同一组命令处理器
-func (m *Manager) registerCommands() {
+func (m *Manager) registerCommands(channels []Channel) {
 	commands := map[string]CommandHandler{
 		"send":   m.handleCmdSendSMS,
 		"status": m.handleCmdStatus,
@@ -175,28 +187,67 @@ func (m *Manager) registerCommands() {
 		"vocall": m.handleCmdCall,
 	}
 
-	for _, ch := range m.channels {
+	for _, ch := range channels {
 		for cmd, handler := range commands {
 			ch.RegisterCommand(cmd, handler)
 		}
 	}
 }
 
-// Close 关闭所有通知渠道
-func (m *Manager) Close() {
-	for _, ch := range m.channels {
+func (m *Manager) startChannelSet(set *managedChannelSet) {
+	if set == nil {
+		return
+	}
+	for _, ch := range set.channels {
+		ch := ch
+		set.starts.Add(1)
+		go func() {
+			defer set.starts.Done()
+			if err := ch.Start(); err != nil {
+				logger.Error("通知渠道命令监听失败", "channel", ch.Name(), "err", err)
+			}
+		}()
+	}
+}
+
+func (m *Manager) swapChannelSet(next *managedChannelSet) *managedChannelSet {
+	m.channelsMu.Lock()
+	old := m.channelSet
+	m.channelSet = next
+	m.channelsMu.Unlock()
+	return old
+}
+
+func closeChannelSet(set *managedChannelSet) {
+	if set == nil {
+		return
+	}
+	set.sends.Wait()
+	for _, ch := range set.channels {
 		_ = ch.Close()
 	}
+	set.starts.Wait()
+}
+
+// Close 关闭所有通知渠道
+func (m *Manager) Close() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	closeChannelSet(m.swapChannelSet(nil))
 }
 
 // UpdateConfig 重新加载通知配置（热更新）
 func (m *Manager) UpdateConfig(cfg *config.Config) error {
-	// 关闭现有渠道
-	m.Close()
-	m.channels = nil
-
-	// 重新初始化所有渠道
-	return m.initChannels(cfg)
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	next, err := m.buildChannelSet(cfg)
+	if err != nil {
+		return err
+	}
+	old := m.swapChannelSet(next)
+	m.startChannelSet(next)
+	closeChannelSet(old)
+	return nil
 }
 
 // NotifySMS 实现 device.Notifier 接口 — 收到短信通知
@@ -216,7 +267,7 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 		"event", "sms_received",
 		"sms_device", deviceID,
 		"source", source,
-		"channel_count", len(m.channels))
+		"channel_count", m.channelCount())
 
 	m.broadcastWithContext(NotificationContext{
 		Event:      "sms_received",
@@ -256,14 +307,15 @@ func (m *Manager) NotifyIPRotated(deviceID, oldIP, newIP string, duration time.D
 
 // NotifyIncomingCall 实现 voice.CallNotifier 接口 — 来电通知
 func (m *Manager) NotifyIncomingCall(deviceID, caller, callee string) {
-	if len(m.channels) == 0 {
+	channelCount := m.channelCount()
+	if channelCount == 0 {
 		return
 	}
 
 	msg := fmt.Sprintf("来电通知\n设备    %s\n主叫    %s\n被叫    %s",
 		deviceID, caller, callee)
 
-	logger.Info("开始发送来电通知", "device", deviceID, "caller", caller, "channel_count", len(m.channels))
+	logger.Info("开始发送来电通知", "device", deviceID, "caller", caller, "channel_count", channelCount)
 
 	m.broadcastWithContext(NotificationContext{
 		Event:      "incoming_call",
@@ -297,9 +349,20 @@ func (m *Manager) broadcastWithContext(ctx NotificationContext) {
 		ctx.Event = "notification"
 	}
 
-	for _, ch := range m.channels {
+	m.channelsMu.Lock()
+	set := m.channelSet
+	if set == nil || len(set.channels) == 0 {
+		m.channelsMu.Unlock()
+		return
+	}
+	channels := set.channels
+	set.sends.Add(len(channels))
+	m.channelsMu.Unlock()
+
+	for _, ch := range channels {
 		ch := ch // capture variable
 		go func() {
+			defer set.sends.Done()
 			if withCtx, ok := ch.(contextualChannel); ok {
 				if err := withCtx.SendWithContext(ctx); err != nil {
 					logger.Warn("通知渠道发送失败", "channel", ch.Name(), "event", ctx.Event, "err", err)
@@ -313,10 +376,30 @@ func (m *Manager) broadcastWithContext(ctx NotificationContext) {
 	}
 }
 
+func (m *Manager) channelCount() int {
+	m.channelsMu.Lock()
+	defer m.channelsMu.Unlock()
+	if m.channelSet == nil {
+		return 0
+	}
+	return len(m.channelSet.channels)
+}
+
 // GetChannelNames 返回所有已启用渠道的名称列表
 func (m *Manager) GetChannelNames() []string {
-	names := make([]string, 0, len(m.channels))
-	for _, ch := range m.channels {
+	m.channelsMu.Lock()
+	set := m.channelSet
+	if set == nil {
+		m.channelsMu.Unlock()
+		return nil
+	}
+	set.sends.Add(1)
+	channels := set.channels
+	m.channelsMu.Unlock()
+	defer set.sends.Done()
+
+	names := make([]string, 0, len(channels))
+	for _, ch := range channels {
 		names = append(names, ch.Name())
 	}
 	return names

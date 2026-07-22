@@ -1,8 +1,10 @@
 package modem
 
 import (
+	"bytes"
 	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -228,6 +230,18 @@ func (p *timeoutSerialPort) Close() error {
 }
 func (p *timeoutSerialPort) Break(time.Duration) error { return nil }
 
+type recordingTimeoutSerialPort struct {
+	timeoutSerialPort
+	payloads chan []byte
+}
+
+func (p *recordingTimeoutSerialPort) Write(b []byte) (int, error) {
+	p.timeoutSerialPort.writes.Add(1)
+	payload := append([]byte(nil), b...)
+	p.payloads <- payload
+	return len(b), nil
+}
+
 func TestHandleCommandNotifiesDisconnectOnFatalWriteError(t *testing.T) {
 	m, err := New(config.DeviceConfig{ID: "dev-at", ATPort: "/dev/ttyUSB6", DeviceBackend: "at"})
 	if err != nil {
@@ -293,6 +307,8 @@ func TestHandleCommandTriggersWatchdogAfterConsecutiveNormalTimeouts(t *testing.
 				t.Fatalf("disconnect reason=%q before threshold %d", reason, i)
 			default:
 			}
+			// 只有成功重开串口后，下一条命令才可继续用于累计 watchdog。
+			m.markATResponseStreamReady()
 		}
 	}
 
@@ -309,6 +325,80 @@ func TestHandleCommandTriggersWatchdogAfterConsecutiveNormalTimeouts(t *testing.
 	}
 	if !port.closed.Load() {
 		t.Fatal("serial port was not closed after timeout threshold")
+	}
+}
+
+func TestHandleCommandNormalTimeoutDoesNotWriteCancelSequence(t *testing.T) {
+	m, err := New(config.DeviceConfig{ID: "dev-at", ATPort: "/dev/ttyUSB6", DeviceBackend: "at"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	port := &timeoutSerialPort{}
+	m.port = port
+	m.running = true
+	m.healthy = true
+
+	req := commandRequest{
+		cmd:      "AT+PING",
+		timeout:  time.Millisecond,
+		respChan: make(chan string, 1),
+		errChan:  make(chan error, 1),
+	}
+	m.handleCommand(req)
+	if err := <-req.errChan; err == nil || err.Error() != "命令执行超时" {
+		t.Fatalf("handleCommand() error = %v, want 命令执行超时", err)
+	}
+	if got := port.writes.Load(); got != 1 {
+		t.Fatalf("serial writes after normal timeout = %d, want only the command write", got)
+	}
+	if m.IsHealthy() {
+		t.Fatal("IsHealthy() = true after the first timeout, want Pool health check to observe fail-closed state")
+	}
+	if m.CanExecuteAT() {
+		t.Fatal("CanExecuteAT() = true after the first timeout, want response stream quarantined")
+	}
+	m.atTimeoutMu.Lock()
+	timeoutStreak := m.atTimeoutStreak
+	m.atTimeoutMu.Unlock()
+	if timeoutStreak != 1 {
+		t.Fatalf("AT timeout streak=%d after first timeout, want 1 (below direct disconnect threshold)", timeoutStreak)
+	}
+}
+
+func TestHandleCommandInteractiveTimeoutWritesDeclaredCancelSequence(t *testing.T) {
+	m, err := New(config.DeviceConfig{ID: "dev-at", ATPort: "/dev/ttyUSB6", DeviceBackend: "at"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	port := &recordingTimeoutSerialPort{payloads: make(chan []byte, 2)}
+	m.port = port
+	m.running = true
+	m.healthy = true
+
+	req := commandRequest{
+		cmd:            "AT+CMGS=1",
+		timeout:        time.Millisecond,
+		respChan:       make(chan string, 1),
+		errChan:        make(chan error, 1),
+		interactive:    true,
+		cancelSequence: []byte{0x1B},
+	}
+	m.handleCommand(req)
+	if err := <-req.errChan; err == nil || err.Error() != "命令执行超时" {
+		t.Fatalf("handleCommand() error = %v, want 命令执行超时", err)
+	}
+
+	commandWrite := <-port.payloads
+	if string(commandWrite) != "AT+CMGS=1\r\n" {
+		t.Fatalf("first serial write = %q, want AT+CMGS=1\\r\\n", commandWrite)
+	}
+	select {
+	case cancelWrite := <-port.payloads:
+		if !bytes.Equal(cancelWrite, []byte{0x1B}) {
+			t.Fatalf("cancel sequence = %x, want ESC", cancelWrite)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("declared cancel sequence was not written")
 	}
 }
 
@@ -335,6 +425,8 @@ func TestHandleCommandIgnoresHighPriorityTimeoutsForWatchdog(t *testing.T) {
 		if err := <-req.errChan; err == nil || err.Error() != "命令执行超时" {
 			t.Fatalf("timeout %d error=%v want 命令执行超时", i, err)
 		}
+		// 高优先级 timeout 不计入 watchdog，但仍须经串口重开解除响应隔离。
+		m.markATResponseStreamReady()
 	}
 
 	select {
@@ -367,6 +459,7 @@ func TestHandleCommandResetsTimeoutWatchdogOnDeviceError(t *testing.T) {
 		}
 		m.handleCommand(req)
 		<-req.errChan
+		m.markATResponseStreamReady()
 	}
 
 	req := commandRequest{
@@ -393,6 +486,7 @@ func TestHandleCommandResetsTimeoutWatchdogOnDeviceError(t *testing.T) {
 		}
 		m.handleCommand(req)
 		<-req.errChan
+		m.markATResponseStreamReady()
 	}
 
 	select {
@@ -469,5 +563,278 @@ func TestManagerExecuteATReturnsResponseWhenRunning(t *testing.T) {
 	}
 	if resp != "OK" {
 		t.Fatalf("ExecuteAT() resp = %q, want %q", resp, "OK")
+	}
+}
+
+func TestManagerExecuteATLateResultCannotCompleteNextRequest(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	m, err := New(config.DeviceConfig{
+		ID:            "dev-at",
+		DeviceBackend: "at",
+		ATPort:        "/dev/ttyUSB6",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	m.running = true
+	m.healthy = true
+
+	type executeResult struct {
+		response string
+		err      error
+	}
+
+	firstDone := make(chan executeResult, 1)
+	go func() {
+		response, executeErr := m.ExecuteAT("AT+FIRST", time.Second)
+		firstDone <- executeResult{response: response, err: executeErr}
+	}()
+	firstRequest := <-m.cmdChan
+	firstRequest.errChan <- errors.New("synthetic request A timeout")
+
+	select {
+	case result := <-firstDone:
+		if result.err == nil || result.err.Error() != "synthetic request A timeout" {
+			t.Fatalf("first ExecuteAT() error = %v, want synthetic request A timeout", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first ExecuteAT() did not finish")
+	}
+
+	secondDone := make(chan executeResult, 1)
+	go func() {
+		response, executeErr := m.ExecuteAT("AT+SECOND", time.Second)
+		secondDone <- executeResult{response: response, err: executeErr}
+	}()
+	secondRequest := <-m.cmdChan
+
+	firstRequest.respChan <- "late response from request A"
+	select {
+	case result := <-secondDone:
+		t.Fatalf("second ExecuteAT() completed from request A late result: response=%q err=%v", result.response, result.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	secondRequest.respChan <- "response from request B"
+	select {
+	case result := <-secondDone:
+		if result.err != nil {
+			t.Fatalf("second ExecuteAT() error = %v", result.err)
+		}
+		if result.response != "response from request B" {
+			t.Fatalf("second ExecuteAT() response = %q, want response from request B", result.response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second ExecuteAT() did not finish with its own response")
+	}
+}
+
+func TestManagerExecuteATLatePhysicalResponseCannotCompleteNextRequest(t *testing.T) {
+	m, err := New(config.DeviceConfig{
+		ID:            "dev-at",
+		DeviceBackend: "at",
+		ATPort:        "/dev/ttyUSB6",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	port := &recordingTimeoutSerialPort{payloads: make(chan []byte, 4)}
+	m.port = port
+	m.running = true
+	m.healthy = true
+	t.Cleanup(m.Stop)
+
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		for i := 0; i < 2; i++ {
+			req := <-m.cmdChan
+			m.handleCommand(req)
+		}
+	}()
+
+	type executeResult struct {
+		response string
+		err      error
+	}
+	firstDone := make(chan executeResult, 1)
+	go func() {
+		response, executeErr := m.ExecuteAT("AT+FIRST", 30*time.Millisecond)
+		firstDone <- executeResult{response: response, err: executeErr}
+	}()
+	select {
+	case payload := <-port.payloads:
+		if string(payload) != "AT+FIRST\r\n" {
+			t.Fatalf("first serial write = %q, want AT+FIRST\\r\\n", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first command was not written")
+	}
+
+	secondDone := make(chan executeResult, 1)
+	go func() {
+		response, executeErr := m.ExecuteAT("AT+SECOND", 500*time.Millisecond)
+		secondDone <- executeResult{response: response, err: executeErr}
+	}()
+	queueDeadline := time.Now().Add(time.Second)
+	for len(m.cmdChan) != 1 {
+		if time.Now().After(queueDeadline) {
+			t.Fatal("second command was not queued behind the first command")
+		}
+		runtime.Gosched()
+	}
+
+	select {
+	case result := <-firstDone:
+		if result.err == nil || result.err.Error() != "命令执行超时" {
+			t.Fatalf("first ExecuteAT() error = %v, want 命令执行超时", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first ExecuteAT() did not time out")
+	}
+
+	m.rxChan <- rxMsg{Data: "OK"}
+	select {
+	case result := <-secondDone:
+		if result.err == nil {
+			t.Fatalf("second ExecuteAT() completed from the first command's late physical response: %q", result.response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second ExecuteAT() did not fail closed after response desynchronization")
+	}
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("command worker did not stop")
+	}
+	if got := port.writes.Load(); got != 1 {
+		t.Fatalf("serial writes after response desynchronization = %d, want only the first command", got)
+	}
+}
+
+func TestManagerExecuteATAssignsMonotonicRequestIDs(t *testing.T) {
+	m, err := New(config.DeviceConfig{
+		ID:            "dev-at",
+		DeviceBackend: "at",
+		ATPort:        "/dev/ttyUSB6",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	m.running = true
+	m.healthy = true
+
+	execute := func(cmd string) commandRequest {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			_, executeErr := m.ExecuteAT(cmd, time.Second)
+			done <- executeErr
+		}()
+		req := <-m.cmdChan
+		req.respChan <- "OK"
+		select {
+		case executeErr := <-done:
+			if executeErr != nil {
+				t.Fatalf("ExecuteAT(%q) error = %v", cmd, executeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("ExecuteAT(%q) did not finish", cmd)
+		}
+		return req
+	}
+
+	firstRequest := execute("AT+FIRST")
+	secondRequest := execute("AT+SECOND")
+	if firstRequest.requestID == 0 {
+		t.Fatal("first request ID = 0, want a non-zero generation")
+	}
+	if secondRequest.requestID <= firstRequest.requestID {
+		t.Fatalf("request IDs are not monotonic: first=%d second=%d", firstRequest.requestID, secondRequest.requestID)
+	}
+}
+
+func TestManagerSendSMSAssignsRequestIDToInteractiveCommand(t *testing.T) {
+	m, err := New(config.DeviceConfig{
+		ID:            "dev-at",
+		DeviceBackend: "at",
+		ATPort:        "/dev/ttyUSB6",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	m.running = true
+	m.healthy = true
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.SendSMS("1234", "synthetic")
+	}()
+
+	setupRequest := <-m.cmdChanHigh
+	setupRequest.respChan <- "OK"
+	interactiveRequest := <-m.cmdChanHigh
+	interactiveRequest.respChan <- "+CMGS: 1\r\nOK"
+	select {
+	case sendErr := <-done:
+		if sendErr != nil {
+			t.Fatalf("SendSMS() error = %v", sendErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendSMS() did not finish")
+	}
+	if interactiveRequest.requestID == 0 {
+		t.Fatal("interactive SMS request ID = 0, want a non-zero generation")
+	}
+	if interactiveRequest.requestID <= setupRequest.requestID {
+		t.Fatalf("interactive SMS request ID=%d, want greater than setup request ID=%d", interactiveRequest.requestID, setupRequest.requestID)
+	}
+}
+
+func TestManagerHealthStateConcurrentFatalTransition(t *testing.T) {
+	m, err := New(config.DeviceConfig{
+		ID:            "dev-at",
+		DeviceBackend: "at",
+		ATPort:        "/dev/ttyUSB6",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	m.running = true
+	m.healthy = true
+
+	started := make(chan struct{})
+	stopReads := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		close(started)
+		for {
+			select {
+			case <-stopReads:
+				return
+			default:
+				_ = m.IsHealthy()
+				_ = m.CanExecuteAT()
+			}
+		}
+	}()
+	<-started
+
+	m.handleFatalSerialRuntimeErr(errors.New("input/output error"), "read", "AT+PING")
+	close(stopReads)
+	select {
+	case <-readerDone:
+	case <-time.After(time.Second):
+		t.Fatal("health-state reader did not stop")
+	}
+
+	if m.IsHealthy() {
+		t.Fatal("IsHealthy() = true after fatal transition, want false")
+	}
+	if m.CanExecuteAT() {
+		t.Fatal("CanExecuteAT() = true after fatal transition, want false")
 	}
 }

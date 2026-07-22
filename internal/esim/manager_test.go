@@ -35,6 +35,69 @@ func newTestManagerWithOverviewLoader(loader func() (*EsimOverview, error)) *Man
 	}
 }
 
+func TestOperationDoneNotificationIsRaceFreeAcrossRepeatedWaits(t *testing.T) {
+	mgr := &Manager{
+		opDone:               make(chan struct{}),
+		readQueueWaitTimeout: time.Second,
+	}
+	for i := 0; i < 100; i++ {
+		unlock, err := mgr.lockOperation("synthetic")
+		if err != nil {
+			t.Fatalf("lockOperation() iteration %d error=%v", i, err)
+		}
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- mgr.waitForNoWriteOperation()
+		}()
+		time.Sleep(time.Microsecond)
+		unlock()
+		select {
+		case waitErr := <-waitDone:
+			if waitErr != nil {
+				t.Fatalf("waitForNoWriteOperation() iteration %d error=%v", i, waitErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waitForNoWriteOperation() iteration %d did not return", i)
+		}
+	}
+}
+
+func TestStaleOperationReleaseDoesNotNotifyNextOperation(t *testing.T) {
+	mgr := &Manager{readQueueWaitTimeout: time.Second}
+	firstUnlock, err := mgr.lockOperation("first")
+	if err != nil {
+		t.Fatalf("first lockOperation() error=%v", err)
+	}
+	firstUnlock()
+
+	secondUnlock, err := mgr.lockOperation("second")
+	if err != nil {
+		t.Fatalf("second lockOperation() error=%v", err)
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- mgr.waitForNoWriteOperation()
+	}()
+	time.Sleep(time.Millisecond)
+
+	firstUnlock()
+	select {
+	case waitErr := <-waitDone:
+		t.Fatalf("stale first release notified second operation waiter: %v", waitErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	secondUnlock()
+	select {
+	case waitErr := <-waitDone:
+		if waitErr != nil {
+			t.Fatalf("waitForNoWriteOperation() after second release error=%v", waitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForNoWriteOperation() did not return after second release")
+	}
+}
+
 type fakeAPDUIdleWaiter struct {
 	wait func(ctx context.Context) error
 }
@@ -1369,20 +1432,27 @@ func TestNotifyModemResetDelayedClearsCacheImmediatelyAndReloadsAfterDelay(t *te
 		loaded <- struct{}{}
 		return &EsimOverview{ChipInfo: &EUICCChipInfo{SkuName: "reloaded"}}, nil
 	})
+	mgr.cacheMu.Lock()
 	mgr.overviewCache = &EsimOverview{ChipInfo: &EUICCChipInfo{SkuName: "cached"}}
 	mgr.chipInfoCache = &EUICCChipInfo{SkuName: "cached"}
 	mgr.discoveredEUICCs = []EUICCInfo{{AIDHex: "0102", EID: "eid-before-reset", Spec: EUICCSpecSGP22}}
+	mgr.cacheMu.Unlock()
 
 	mgr.NotifyModemResetDelayed(80 * time.Millisecond)
 
-	if mgr.cachedOverview() != nil {
+	mgr.cacheMu.RLock()
+	cachedOverview := mgr.overviewCache
+	cachedChipInfo := mgr.chipInfoCache
+	discoveredCount := len(mgr.discoveredEUICCs)
+	mgr.cacheMu.RUnlock()
+	if cachedOverview != nil {
 		t.Fatal("overview cache should be cleared immediately")
 	}
-	if mgr.chipInfoCache != nil {
+	if cachedChipInfo != nil {
 		t.Fatal("chipInfoCache should be cleared immediately")
 	}
-	if len(mgr.discoveredEUICCs) != 0 {
-		t.Fatalf("discoveredEUICCs = %v, want cleared", mgr.discoveredEUICCs)
+	if discoveredCount != 0 {
+		t.Fatalf("discoveredEUICCs count = %d, want 0", discoveredCount)
 	}
 	select {
 	case <-loaded:
@@ -1402,10 +1472,12 @@ func TestNotifyModemResetDelayedSkipsReloadDuringSwitchSuppressionWindow(t *test
 		calls.Add(1)
 		return &EsimOverview{ChipInfo: &EUICCChipInfo{SkuName: "reloaded"}}, nil
 	})
+	mgr.cacheMu.Lock()
 	mgr.overviewCache = &EsimOverview{ChipInfo: &EUICCChipInfo{SkuName: "cached"}}
 	mgr.chipInfoCache = &EUICCChipInfo{SkuName: "cached"}
 	mgr.discoveredEUICCs = []EUICCInfo{{AIDHex: "0102", EID: "eid-before-reset", Spec: EUICCSpecSGP22}}
 	mgr.suppressOverviewReloadUntil = time.Now().Add(2 * time.Second)
+	mgr.cacheMu.Unlock()
 
 	mgr.NotifyModemResetDelayed(80 * time.Millisecond)
 	select {
@@ -1415,14 +1487,19 @@ func TestNotifyModemResetDelayedSkipsReloadDuringSwitchSuppressionWindow(t *test
 	if calls.Load() != 0 {
 		t.Fatalf("overview reload calls = %d, want 0 during switch suppression window", calls.Load())
 	}
-	if got := mgr.cachedOverview(); got != nil {
-		t.Fatalf("cachedOverview() = %#v, want cleared during reset suppression window", got)
+	mgr.cacheMu.RLock()
+	cachedOverview := mgr.overviewCache
+	cachedChipInfo := mgr.chipInfoCache
+	discoveredCount := len(mgr.discoveredEUICCs)
+	mgr.cacheMu.RUnlock()
+	if cachedOverview != nil {
+		t.Fatalf("cachedOverview() = %#v, want cleared during reset suppression window", cachedOverview)
 	}
-	if mgr.chipInfoCache != nil {
-		t.Fatalf("chipInfoCache = %#v, want cleared during reset suppression window", mgr.chipInfoCache)
+	if cachedChipInfo != nil {
+		t.Fatalf("chipInfoCache = %#v, want cleared during reset suppression window", cachedChipInfo)
 	}
-	if len(mgr.discoveredEUICCs) != 0 {
-		t.Fatalf("discoveredEUICCs = %v, want cleared during reset suppression window", mgr.discoveredEUICCs)
+	if discoveredCount != 0 {
+		t.Fatalf("discoveredEUICCs count = %d, want 0 during reset suppression window", discoveredCount)
 	}
 }
 

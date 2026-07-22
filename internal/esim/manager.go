@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -17,14 +18,14 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/damonto/euicc-go/bertlv"
-	"github.com/damonto/euicc-go/driver"
-	"github.com/damonto/euicc-go/lpa"
-	sgp22 "github.com/damonto/euicc-go/v2"
 	"github.com/1239t/vohive/internal/apduarbiter"
 	backendpkg "github.com/1239t/vohive/internal/backend"
 	"github.com/1239t/vohive/internal/modem"
 	"github.com/1239t/vohive/pkg/logger"
+	"github.com/damonto/euicc-go/bertlv"
+	"github.com/damonto/euicc-go/driver"
+	"github.com/damonto/euicc-go/lpa"
+	sgp22 "github.com/damonto/euicc-go/v2"
 )
 
 // 支持的 ISD-R AID 列表
@@ -279,9 +280,11 @@ type Manager struct {
 	// clearChannels 是在首轮 AID 扫描前清理逐辑通道的回调（可选）
 	clearChannels func()
 
-	cacheMu                     sync.RWMutex   // 保护 chipInfoCache、overviewCache 与 discoveredEUICCs 等快照状态
-	opMu                        sync.Mutex     // eSIM 硬件操作互斥（同时只允许一个写操作）
-	opDone                      chan struct{}  // 写操作完成通知（替代 TryLock+Sleep 轮询）
+	cacheMu                     sync.RWMutex // 保护 chipInfoCache、overviewCache 与 discoveredEUICCs 等快照状态
+	opMu                        sync.Mutex   // eSIM 硬件操作互斥（同时只允许一个写操作）
+	opDoneMu                    sync.Mutex
+	opDone                      chan struct{} // 写操作完成通知（替代 TryLock+Sleep 轮询）
+	opActive                    bool
 	chipInfoCache               *EUICCChipInfo // 芯片信息缓存（硬件信息基本不变）
 	overviewCache               *EsimOverview  // eSIM 总览缓存（跟随 Manager / Worker 实例）
 	overviewLastErr             error
@@ -947,11 +950,6 @@ func (m *Manager) forEachEUICC(fn func(client *lpa.Client, aid []byte, eidStr st
 }
 
 func (m *Manager) waitForNoWriteOperation() error {
-	// 快路径：锁空闲则直接返回
-	if m.opMu.TryLock() {
-		m.opMu.Unlock()
-		return nil
-	}
 	timeout := m.readQueueWaitTimeout
 	if timeout <= 0 {
 		timeout = defaultReadQueueWaitTimeout
@@ -959,23 +957,29 @@ func (m *Manager) waitForNoWriteOperation() error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
-		select {
-		case <-m.opDone:
-			// 写操作已发出完成通知，尝试确认锁已释放
-			if m.opMu.TryLock() {
-				m.opMu.Unlock()
-				return nil
+		if m.opMu.TryLock() {
+			m.opMu.Unlock()
+			return nil
+		}
+		done := m.currentOperationDone()
+		if done == nil {
+			select {
+			case <-timer.C:
+				return ErrOperationInProgress
+			default:
+				runtime.Gosched()
+				continue
 			}
+		}
+		select {
+		case <-done:
 		case <-timer.C:
 			return ErrOperationInProgress
 		}
 	}
 }
 
-func (m *Manager) acquireOperationLock() error {
-	if m.opMu.TryLock() {
-		return nil
-	}
+func (m *Manager) acquireOperationLock() (chan struct{}, error) {
 	timeout := m.readQueueWaitTimeout
 	if timeout <= 0 {
 		timeout = defaultReadQueueWaitTimeout
@@ -983,42 +987,76 @@ func (m *Manager) acquireOperationLock() error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
-		done := m.opDone
+		if m.opMu.TryLock() {
+			return m.publishOperationDone(), nil
+		}
+		done := m.currentOperationDone()
 		if done == nil {
-			done = make(chan struct{})
+			select {
+			case <-timer.C:
+				return nil, ErrOperationInProgress
+			default:
+				runtime.Gosched()
+				continue
+			}
 		}
 		select {
 		case <-done:
-			if m.opMu.TryLock() {
-				return nil
-			}
 		case <-timer.C:
-			return ErrOperationInProgress
+			return nil, ErrOperationInProgress
 		}
 	}
 }
 
 func (m *Manager) lockOperation(operation string) (func(), error) {
-	if err := m.acquireOperationLock(); err != nil {
+	done, err := m.acquireOperationLock()
+	if err != nil {
 		return nil, err
 	}
 	started := time.Now()
+	var once sync.Once
 	return func() {
-		m.logWriteOperationHold(operation, started)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		once.Do(func() {
+			m.logWriteOperationHold(operation, started)
+			m.finishWriteOperation(done)
+		})
 	}, nil
 }
 
-// notifyWriteDone 通知所有等待写操作完成的读方。
-// 必须在 opMu.Unlock() 之后立即调用。
-func (m *Manager) notifyWriteDone() {
-	// 关闭旧 channel（广播通知），并新建一个供下次写操作使用
-	old := m.opDone
-	m.opDone = make(chan struct{})
-	if old != nil {
-		close(old)
+func (m *Manager) beginWriteOperation() chan struct{} {
+	m.opMu.Lock()
+	return m.publishOperationDone()
+}
+
+func (m *Manager) publishOperationDone() chan struct{} {
+	done := make(chan struct{})
+	m.opDoneMu.Lock()
+	m.opDone = done
+	m.opActive = true
+	m.opDoneMu.Unlock()
+	return done
+}
+
+func (m *Manager) currentOperationDone() chan struct{} {
+	m.opDoneMu.Lock()
+	defer m.opDoneMu.Unlock()
+	if !m.opActive {
+		return nil
 	}
+	return m.opDone
+}
+
+func (m *Manager) finishWriteOperation(done chan struct{}) {
+	m.opMu.Unlock()
+	m.opDoneMu.Lock()
+	if m.opDone == done {
+		m.opDone = nil
+		m.opActive = false
+	}
+	if done != nil {
+		close(done)
+	}
+	m.opDoneMu.Unlock()
 }
 
 func (m *Manager) emitSwitchPhase(operation SwitchOperation, token uint64, phase SwitchPhase) {
@@ -2536,7 +2574,7 @@ func (m *Manager) SwitchProfile(ctx context.Context, targetICCID string, aidHex 
 func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID string, aidHex string) (SwitchProfileResult, error) {
 	const operation = SwitchOperationEnableProfile
 	result := SwitchProfileResult{TargetICCID: targetICCID}
-	m.opMu.Lock()
+	writeDone := m.beginWriteOperation()
 	writeStarted := time.Now()
 	switchSucceeded := false
 	switchStarted := false
@@ -2547,8 +2585,7 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 			m.emitSwitchPhase(operation, switchToken, SwitchPhaseFailed)
 		}
 		m.logWriteOperationHold("switch_profile", writeStarted)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		m.finishWriteOperation(writeDone)
 		if !switchSucceeded && switchStarted && m.onSwitchFailed != nil {
 			m.onSwitchFailed(operation, switchToken, switchFailureErr)
 		}
@@ -2682,7 +2719,7 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 // aidHex 可选，前端已知时直接传入可跳过全量 AID 遍历。
 func (m *Manager) DisableProfile(ctx context.Context, targetICCID string, aidHex string) error {
 	const operation = SwitchOperationDisableProfile
-	m.opMu.Lock()
+	writeDone := m.beginWriteOperation()
 	writeStarted := time.Now()
 	disableSucceeded := false
 	disableStarted := false
@@ -2693,8 +2730,7 @@ func (m *Manager) DisableProfile(ctx context.Context, targetICCID string, aidHex
 			m.emitSwitchPhase(operation, switchToken, SwitchPhaseFailed)
 		}
 		m.logWriteOperationHold("disable_profile", writeStarted)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		m.finishWriteOperation(writeDone)
 		if !disableSucceeded && disableStarted && m.onSwitchFailed != nil {
 			m.onSwitchFailed(operation, switchToken, switchFailureErr)
 		}
@@ -3463,12 +3499,11 @@ func (m *Manager) ListNotifications(aidHex string) ([]NotificationItem, error) {
 }
 
 func (m *Manager) RetryNotification(sequenceNumber int64, aidHex string) error {
-	m.opMu.Lock()
+	writeDone := m.beginWriteOperation()
 	writeStarted := time.Now()
 	defer func() {
 		m.logWriteOperationHold("retry_notification", writeStarted)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		m.finishWriteOperation(writeDone)
 	}()
 	if sequenceNumber <= 0 {
 		return NewNotificationError(NotificationErrorInvalidSequence, fmt.Sprintf("无效的通知序号 %d", sequenceNumber), nil)
@@ -3518,13 +3553,12 @@ func (m *Manager) DownloadProfile(ctx context.Context, aidHex, smdp, matchingID,
 		}
 	}
 	result := DownloadProfileResult{}
-	m.opMu.Lock()
+	writeDone := m.beginWriteOperation()
 	writeStarted := time.Now()
 	defer func() {
 		m.logWriteOperationHold("download_profile", writeStarted)
 		m.downloadCtx.Store(nil)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		m.finishWriteOperation(writeDone)
 	}()
 	m.downloadCtx.Store(&ctx)
 	var client *lpa.Client
@@ -3740,12 +3774,11 @@ func imeiLuhnCheckDigit(base string) byte {
 // RenameProfile 修改指定 ICCID 的 eSIM profile 名称（Nickname）
 // aidHex 可选，前端已知时直接传入可跳过全量 AID 遍历
 func (m *Manager) RenameProfile(targetICCID string, newName string, aidHex string) error {
-	m.opMu.Lock()
+	writeDone := m.beginWriteOperation()
 	writeStarted := time.Now()
 	defer func() {
 		m.logWriteOperationHold("rename_profile", writeStarted)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		m.finishWriteOperation(writeDone)
 	}()
 
 	iccid, err := sgp22.NewICCID(targetICCID)
@@ -3792,12 +3825,11 @@ func (m *Manager) RenameProfile(targetICCID string, newName string, aidHex strin
 // DeleteProfile 删除指定 ICCID 的 eSIM profile
 // aidHex 可选，前端已知时直接传入可跳过全量 AID 遍历
 func (m *Manager) DeleteProfile(targetICCID string, aidHex string) (DeleteProfileResult, error) {
-	m.opMu.Lock()
+	writeDone := m.beginWriteOperation()
 	writeStarted := time.Now()
 	defer func() {
 		m.logWriteOperationHold("delete_profile", writeStarted)
-		m.opMu.Unlock()
-		m.notifyWriteDone()
+		m.finishWriteOperation(writeDone)
 	}()
 
 	result := DeleteProfileResult{}

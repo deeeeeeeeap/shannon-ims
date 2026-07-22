@@ -53,6 +53,10 @@ type Options struct {
 	// MaxQMITransports 限制 QMI logical-channel transport 并发数量。
 	// 只有显式使用 TransportScopeQMIChannel 的 QMI channel APDU 会使用该并发窗口。
 	MaxQMITransports int
+	// RecoverTransport 在 watchdog 将 lease 标为 suspect 后执行 transport reset/recovery。
+	// 只有回调成功返回，arbiter 才会重新开放 transport；nil 表示保持 suspect。
+	RecoverTransport func(context.Context, Request) error
+	RecoveryTimeout  time.Duration
 }
 
 type Request struct {
@@ -78,6 +82,7 @@ type Stats struct {
 	ActiveTransport  bool
 	ActiveTransports int
 	ActiveBarriers   int
+	SuspectLeases    int
 	CurrentQueueType string
 }
 
@@ -91,6 +96,7 @@ type SnapshotEntry struct {
 	LeaseType LeaseType
 	WaitMS    int64
 	HoldMS    int64
+	Suspect   bool
 }
 
 type Snapshot struct {
@@ -123,16 +129,21 @@ type activeLease struct {
 	acquiredAt time.Time
 	expiresAt  time.Time
 	timer      *time.Timer
+	suspect    bool
+	recovering bool
+	ownerDone  bool
 }
 
 type activeBarrier struct {
 	waitTicket
-	acquiredAt time.Time
+	acquiredAt     time.Time
+	suspect        bool
+	stopOwnerWatch func() bool
 }
 
 type Arbiter struct {
 	// 64 位 atomic 变量必须放在头部
-	seq              uint64
+	seq uint64
 
 	deviceID string
 	opts     Options
@@ -182,6 +193,9 @@ func New(deviceID string, opts Options) *Arbiter {
 	}
 	if opts.MaxQMITransports <= 0 {
 		opts.MaxQMITransports = 1
+	}
+	if opts.RecoveryTimeout <= 0 {
+		opts.RecoveryTimeout = 5 * time.Second
 	}
 	return &Arbiter{
 		deviceID: strings.TrimSpace(deviceID),
@@ -237,10 +251,14 @@ func (a *Arbiter) BeginBarrier(ctx context.Context, req Request, policy BarrierP
 	for {
 		if a.canAcquireBarrierLocked(ticket) {
 			a.removeTicketLocked(ticket.id)
-			a.activeBarriers = append(a.activeBarriers, &activeBarrier{
+			active := &activeBarrier{
 				waitTicket: ticket,
 				acquiredAt: time.Now(),
+			}
+			active.stopOwnerWatch = context.AfterFunc(ctx, func() {
+				a.markBarrierSuspect(ticket.id)
 			})
+			a.activeBarriers = append(a.activeBarriers, active)
 			a.acquires.Add(1)
 			waitMs := time.Since(ticket.enqueued).Milliseconds()
 			a.logEvent(ticket, "barrier_enter", len(a.queue), waitMs, 0, "")
@@ -325,6 +343,7 @@ func (a *Arbiter) Stats() Stats {
 		ActiveTransport:  len(a.activeTransports) > 0,
 		ActiveTransports: len(a.activeTransports),
 		ActiveBarriers:   len(a.activeBarriers),
+		SuspectLeases:    a.suspectLeaseCountLocked(),
 		CurrentQueueType: queueType,
 	}
 }
@@ -354,6 +373,7 @@ func (a *Arbiter) Snapshot() Snapshot {
 			Scope:     barrier.scope,
 			LeaseType: LeaseTypeBarrier,
 			HoldMS:    now.Sub(barrier.acquiredAt).Milliseconds(),
+			Suspect:   barrier.suspect,
 		})
 	}
 	queue := make([]SnapshotEntry, 0, len(a.queue))
@@ -574,6 +594,9 @@ func (a *Arbiter) canAcquireTransportNowLocked(ticket waitTicket) bool {
 	if ticket.leaseType != LeaseTypeTransport {
 		return false
 	}
+	if a.hasSuspectTransportLocked() {
+		return false
+	}
 	if ticket.scope != TransportScopeQMIChannel {
 		return !a.hasActiveTransportLocked()
 	}
@@ -588,6 +611,9 @@ func (a *Arbiter) canAcquireTransportNowLocked(ticket waitTicket) bool {
 
 func (a *Arbiter) transportWaitGatesQueueLocked(ticket waitTicket) bool {
 	if ticket.leaseType != LeaseTypeTransport {
+		return true
+	}
+	if a.hasSuspectTransportLocked() {
 		return true
 	}
 	if ticket.scope != TransportScopeQMIChannel {
@@ -650,6 +676,9 @@ func (a *Arbiter) touch(leaseID uint64, leaseType LeaseType) bool {
 	if active == nil {
 		return false
 	}
+	if active.suspect {
+		return false
+	}
 	active.expiresAt = time.Now().Add(a.opts.MaxLeaseHold)
 	if active.timer == nil {
 		lType := leaseType
@@ -666,6 +695,16 @@ func (a *Arbiter) release(leaseID uint64, leaseType LeaseType, reason string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	active := a.findActiveLocked(leaseID, leaseType)
+	if active == nil {
+		return
+	}
+	if active.recovering {
+		active.ownerDone = true
+		a.logEvent(active.waitTicket, "owner-done", len(a.queue), 0, time.Since(active.acquiredAt).Milliseconds(), "recovery-in-flight")
+		a.signalLocked()
+		return
+	}
 	released := a.removeActiveLocked(leaseID, leaseType)
 	if released == nil {
 		return
@@ -691,6 +730,9 @@ func (a *Arbiter) releaseBarrier(barrierID uint64) {
 		if barrier.id != barrierID {
 			continue
 		}
+		if barrier.stopOwnerWatch != nil {
+			barrier.stopOwnerWatch()
+		}
 		a.activeBarriers = append(a.activeBarriers[:i], a.activeBarriers[i+1:]...)
 		holdMs := time.Since(barrier.acquiredAt).Milliseconds()
 		a.logEvent(barrier.waitTicket, "barrier_leave", len(a.queue), 0, holdMs, "")
@@ -701,10 +743,9 @@ func (a *Arbiter) releaseBarrier(barrierID uint64) {
 
 func (a *Arbiter) releaseExpired(leaseID uint64, leaseType LeaseType) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	active := a.findActiveLocked(leaseID, leaseType)
 	if active == nil {
+		a.mu.Unlock()
 		return
 	}
 	if !active.expiresAt.IsZero() {
@@ -712,20 +753,69 @@ func (a *Arbiter) releaseExpired(leaseID uint64, leaseType LeaseType) {
 			if active.timer != nil {
 				active.timer.Reset(remaining)
 			}
+			a.mu.Unlock()
 			return
 		}
 	}
 
+	active.suspect = true
+	active.timer = nil
+	holdMs := time.Since(active.acquiredAt).Milliseconds()
+	a.logEvent(active.waitTicket, "suspect", len(a.queue), 0, holdMs, "watchdog-timeout")
+	a.signalLocked()
+	recoverTransport := a.opts.RecoverTransport
+	recoveryTimeout := a.opts.RecoveryTimeout
+	recoveryRequest := requestFromTicket(active.waitTicket)
+	active.recovering = recoverTransport != nil
+	a.mu.Unlock()
+
+	if recoverTransport == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recoveryTimeout)
+	err := recoverTransport(ctx, recoveryRequest)
+	cancel()
+	if err != nil {
+		a.mu.Lock()
+		if current := a.findActiveLocked(leaseID, leaseType); current != nil && current.suspect {
+			current.recovering = false
+			a.logEvent(current.waitTicket, "recovery-failed", len(a.queue), 0, time.Since(current.acquiredAt).Milliseconds(), "reset-failed")
+		}
+		a.mu.Unlock()
+		return
+	}
+	a.releaseRecovered(leaseID, leaseType)
+}
+
+func (a *Arbiter) markBarrierSuspect(barrierID uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, barrier := range a.activeBarriers {
+		if barrier.id != barrierID || barrier.suspect {
+			continue
+		}
+		barrier.suspect = true
+		a.logEvent(barrier.waitTicket, "barrier_suspect", len(a.queue), 0, time.Since(barrier.acquiredAt).Milliseconds(), "owner-context-done")
+		a.signalLocked()
+		return
+	}
+}
+
+func (a *Arbiter) releaseRecovered(leaseID uint64, leaseType LeaseType) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	active := a.findActiveLocked(leaseID, leaseType)
+	if active == nil || !active.suspect {
+		return
+	}
 	released := a.removeActiveLocked(leaseID, leaseType)
 	if released == nil {
 		return
 	}
-	if released.timer != nil {
-		released.timer.Stop()
-	}
-	a.forcedReleases.Add(1)
 	holdMs := time.Since(released.acquiredAt).Milliseconds()
-	a.logEvent(released.waitTicket, "force-release", len(a.queue), 0, holdMs, "force-timeout")
+	a.logEvent(released.waitTicket, "recovered", len(a.queue), 0, holdMs, "reset-succeeded")
 	a.signalLocked()
 }
 
@@ -825,6 +915,33 @@ func (a *Arbiter) activeQMITransportCountLocked() int {
 	return count
 }
 
+func (a *Arbiter) hasSuspectTransportLocked() bool {
+	for _, transport := range a.activeTransports {
+		if transport.suspect {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Arbiter) suspectLeaseCountLocked() int {
+	count := 0
+	for _, session := range a.activeSessions {
+		if session.suspect {
+			count++
+		}
+	}
+	if a.activeOneshot != nil && a.activeOneshot.suspect {
+		count++
+	}
+	for _, transport := range a.activeTransports {
+		if transport.suspect {
+			count++
+		}
+	}
+	return count
+}
+
 func (a *Arbiter) hasActiveTransportOnChannelLocked(channel int) bool {
 	for _, transport := range a.activeTransports {
 		if transport.scope == TransportScopeQMIChannel && transport.channel == channel {
@@ -840,7 +957,7 @@ func (a *Arbiter) signalLocked() {
 }
 
 func shouldLogEvent(phase string, queueLen int, waitMs int64, holdMs int64) bool {
-	if phase == "timeout" || phase == "force-release" || strings.HasPrefix(phase, "barrier_") {
+	if phase == "timeout" || phase == "force-release" || phase == "suspect" || phase == "recovery-failed" || strings.HasPrefix(phase, "barrier_") {
 		return true
 	}
 	if waitMs > 0 || holdMs >= 500 || queueLen > 1 {
@@ -871,7 +988,7 @@ func (a *Arbiter) logEvent(ticket waitTicket, phase string, queueLen int, waitMs
 		fields = append(fields, "reason", reason)
 	}
 	switch phase {
-	case "timeout", "force-release":
+	case "timeout", "force-release", "suspect", "recovery-failed":
 		logger.Warn("APDU 仲裁事件", fields...)
 	default:
 		logger.Debug("APDU 仲裁事件", fields...)
@@ -888,6 +1005,7 @@ func snapshotActiveLease(active *activeLease, now time.Time) SnapshotEntry {
 		Scope:     active.scope,
 		LeaseType: active.leaseType,
 		HoldMS:    now.Sub(active.acquiredAt).Milliseconds(),
+		Suspect:   active.suspect,
 	}
 }
 
@@ -897,6 +1015,16 @@ func normalizeRequest(req Request, leaseType LeaseType) Request {
 	req.Class = normalizeClass(req.Class, leaseType)
 	req.Scope = normalizeTransportScope(req.Scope, req.Mode, req.Channel, leaseType)
 	return req
+}
+
+func requestFromTicket(ticket waitTicket) Request {
+	return Request{
+		Owner:   ticket.owner,
+		Mode:    ticket.mode,
+		Class:   ticket.class,
+		Channel: ticket.channel,
+		Scope:   ticket.scope,
+	}
 }
 
 func normalizeTransportScope(scope TransportScope, mode string, channel int, leaseType LeaseType) TransportScope {

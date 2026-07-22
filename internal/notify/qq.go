@@ -4,10 +4,11 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
-	qqbot "github.com/iniwex5/qqbot"
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/pkg/logger"
+	qqbot "github.com/iniwex5/qqbot"
 )
 
 type qqApp interface {
@@ -123,7 +124,7 @@ func (q *QQChannel) RegisterCommand(cmd string, handler CommandHandler) {
 			return nil
 		}
 
-		cmdCtx := &qqCommandContext{conversation: c}
+		cmdCtx := &qqCommandContext{ctx: ctx, conversation: c}
 		response := handler(cmdCtx, append([]string(nil), parsed.Params...))
 		if response == "" {
 			return nil
@@ -220,16 +221,23 @@ func parseAllowedRecipients(groupIDs, directIDs string) map[string]qqbot.Recipie
 }
 
 type qqCommandContext struct {
+	ctx          context.Context
 	conversation qqbot.Conversation
 }
+
+const qqReplyTimeout = 5 * time.Second
 
 func (c *qqCommandContext) Reply(text string) {
 	if c == nil || c.conversation == nil {
 		return
 	}
-	go func() {
-		if _, err := c.conversation.RespondText(context.Background(), text); err != nil {
-			logger.Warn("回复 QQ 命令消息失败", "err", err)
-		}
-	}()
+	parent := c.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	replyCtx, cancel := context.WithTimeout(parent, qqReplyTimeout)
+	defer cancel()
+	if _, err := c.conversation.RespondText(replyCtx, text); err != nil {
+		logger.Warn("回复 QQ 命令消息失败", "err", err)
+	}
 }

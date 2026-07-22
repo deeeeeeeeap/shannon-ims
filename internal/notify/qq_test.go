@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"testing"
+	"time"
 
 	qqbot "github.com/iniwex5/qqbot"
 )
@@ -94,6 +95,65 @@ func TestQQChannelRegisterCommandBlocksUnallowed(t *testing.T) {
 	}
 	if len(conv.replies) != 0 {
 		t.Fatalf("expected no reply for unallowed recipient, got %d", len(conv.replies))
+	}
+}
+
+func TestQQCommandReplyUsesBoundedRequestContext(t *testing.T) {
+	app := &fakeQQApp{}
+	channel := &QQChannel{
+		app: app,
+		allowedRecipients: map[string]qqbot.Recipient{
+			"direct:user-1": {Kind: qqbot.DirectRecipient, ID: "user-1"},
+		},
+	}
+	channel.RegisterCommand("status", func(cmdCtx CommandContext, _ []string) string {
+		cmdCtx.Reply("synthetic")
+		return ""
+	})
+
+	conv := &fakeConversation{
+		incoming: qqbot.Incoming{
+			ID: "msg-context",
+			To: qqbot.Recipient{Kind: qqbot.DirectRecipient, ID: "user-1"},
+		},
+		replyStarted:     make(chan struct{}),
+		forceReplyReturn: make(chan struct{}),
+		replyCtxErr:      make(chan error, 1),
+		replyHasDeadline: make(chan bool, 1),
+	}
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- app.commands["status"](requestCtx, conv, qqbot.ParsedCommand{Name: "status"})
+	}()
+	select {
+	case <-conv.replyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Reply() did not call conversation")
+	}
+	hasDeadline := <-conv.replyHasDeadline
+	cancelRequest()
+
+	var handlerErr error
+	returnedOnCancel := false
+	select {
+	case handlerErr = <-handlerDone:
+		returnedOnCancel = true
+	case <-time.After(50 * time.Millisecond):
+		close(conv.forceReplyReturn)
+		handlerErr = <-handlerDone
+	}
+	if !returnedOnCancel {
+		t.Fatal("Reply() ignored request context cancellation")
+	}
+	if handlerErr != nil {
+		t.Fatalf("command handler error=%v", handlerErr)
+	}
+	if !hasDeadline {
+		t.Fatal("Reply() context had no bounded deadline")
+	}
+	if err := <-conv.replyCtxErr; err != context.Canceled {
+		t.Fatalf("Reply() context error=%v, want context.Canceled", err)
 	}
 }
 
@@ -194,9 +254,13 @@ func (f *fakeQQApp) Close() error {
 }
 
 type fakeConversation struct {
-	incoming qqbot.Incoming
-	replies  []string
-	err      error
+	incoming         qqbot.Incoming
+	replies          []string
+	err              error
+	replyStarted     chan struct{}
+	forceReplyReturn chan struct{}
+	replyCtxErr      chan error
+	replyHasDeadline chan bool
 }
 
 func (f *fakeConversation) Incoming() qqbot.Incoming {
@@ -212,6 +276,19 @@ func (f *fakeConversation) Respond(ctx context.Context, delivery qqbot.Delivery)
 }
 
 func (f *fakeConversation) RespondText(ctx context.Context, text string) (qqbot.Receipt, error) {
+	if f.replyStarted != nil {
+		close(f.replyStarted)
+		_, hasDeadline := ctx.Deadline()
+		f.replyHasDeadline <- hasDeadline
+		select {
+		case <-ctx.Done():
+			f.replyCtxErr <- ctx.Err()
+			return qqbot.Receipt{}, ctx.Err()
+		case <-f.forceReplyReturn:
+			f.replyCtxErr <- ctx.Err()
+			return qqbot.Receipt{}, context.Canceled
+		}
+	}
 	if f.err != nil {
 		return qqbot.Receipt{}, f.err
 	}

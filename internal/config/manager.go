@@ -67,10 +67,35 @@ func ReloadFromFile() error {
 func GetConfig() *Config {
 	configMu.RLock()
 	defer configMu.RUnlock()
-	if globalConfig == nil {
+	return cloneConfig(globalConfig)
+}
+
+func cloneConfig(src *Config) *Config {
+	if src == nil {
 		return &Config{}
 	}
-	return globalConfig
+	dst := *src
+	dst.Devices = append([]DeviceConfig(nil), src.Devices...)
+	for i := range dst.Devices {
+		if src.Devices[i].USBNetMode != nil {
+			mode := *src.Devices[i].USBNetMode
+			dst.Devices[i].USBNetMode = &mode
+		}
+	}
+	dst.Proxy.Instances = append([]ProxyInstance(nil), src.Proxy.Instances...)
+	dst.Feishu.ChatIDs = append([]string(nil), src.Feishu.ChatIDs...)
+	dst.Webhook.URLs = append([]string(nil), src.Webhook.URLs...)
+	if src.Webhook.Headers != nil {
+		dst.Webhook.Headers = make(map[string]string, len(src.Webhook.Headers))
+		for key, value := range src.Webhook.Headers {
+			dst.Webhook.Headers[key] = value
+		}
+	}
+	dst.Bark.URLs = append([]string(nil), src.Bark.URLs...)
+	dst.Email.ToAddresses = append([]string(nil), src.Email.ToAddresses...)
+	dst.VoWiFi.VoiceGateway.Users = append([]VoWiFiVoiceUserConfig(nil), src.VoWiFi.VoiceGateway.Users...)
+	dst.VoWiFi.VoiceGateway.Media.Codecs = append([]string(nil), src.VoWiFi.VoiceGateway.Media.Codecs...)
+	return &dst
 }
 
 // GetConfigPath 返回当前全局配置文件路径，供需要直接读写配置文件的场景使用

@@ -74,7 +74,11 @@ jobs:
         run: >-
           go test -race
           ./internal/apduarbiter
+          ./internal/config
           ./internal/device
+          ./internal/esim
+          ./internal/modem
+          ./internal/notify
           ./internal/vowifihost
           ./pkg/logger
           -count=1
@@ -85,6 +89,7 @@ jobs:
           go test -race
           ./internal/vowifi/ipsec3gpp
           ./internal/vowifi/imscore
+          ./runtimehost
           ./runtimehost/simauth
           ./runtimehost/voiceclient
           -count=1

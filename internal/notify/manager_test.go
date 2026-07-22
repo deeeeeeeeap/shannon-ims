@@ -20,6 +20,143 @@ type captureChannel struct {
 	calls []NotificationContext
 }
 
+func newTestNotifyManager(channels ...Channel) *Manager {
+	return &Manager{channelSet: &managedChannelSet{channels: channels}}
+}
+
+type blockingLifecycleChannel struct {
+	started        chan struct{}
+	release        chan struct{}
+	startOnce      sync.Once
+	mu             sync.Mutex
+	closed         bool
+	sentAfterClose bool
+}
+
+func (c *blockingLifecycleChannel) Name() string { return "blocking" }
+func (c *blockingLifecycleChannel) Send(string) error {
+	c.startOnce.Do(func() { close(c.started) })
+	<-c.release
+	c.mu.Lock()
+	c.sentAfterClose = c.closed
+	c.mu.Unlock()
+	return nil
+}
+func (c *blockingLifecycleChannel) RegisterCommand(string, CommandHandler) {}
+func (c *blockingLifecycleChannel) Start() error                           { return nil }
+func (c *blockingLifecycleChannel) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func TestManagerCloseWaitsForInFlightBroadcast(t *testing.T) {
+	channel := &blockingLifecycleChannel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	m := newTestNotifyManager(channel)
+	m.NotifyRaw("synthetic notification")
+	select {
+	case <-channel.started:
+	case <-time.After(time.Second):
+		t.Fatal("broadcast did not start")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		m.Close()
+		close(closeDone)
+	}()
+	closedEarly := false
+	select {
+	case <-closeDone:
+		closedEarly = true
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(channel.release)
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Manager.Close() did not finish after broadcast completed")
+	}
+
+	channel.mu.Lock()
+	sentAfterClose := channel.sentAfterClose
+	channel.mu.Unlock()
+	if closedEarly || sentAfterClose {
+		t.Fatalf("channel closed before in-flight broadcast completed: closed_early=%v sent_after_close=%v", closedEarly, sentAfterClose)
+	}
+}
+
+func TestManagerUpdateConfigWaitsForPreviousGenerationBroadcast(t *testing.T) {
+	channel := &blockingLifecycleChannel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	m := newTestNotifyManager(channel)
+	m.NotifyRaw("old generation")
+	select {
+	case <-channel.started:
+	case <-time.After(time.Second):
+		t.Fatal("old-generation broadcast did not start")
+	}
+
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- m.UpdateConfig(&config.Config{})
+	}()
+	waitUntil(t, time.Second, func() bool { return len(m.GetChannelNames()) == 0 })
+	select {
+	case err := <-updateDone:
+		t.Fatalf("UpdateConfig() returned before old broadcast completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(channel.release)
+	select {
+	case err := <-updateDone:
+		if err != nil {
+			t.Fatalf("UpdateConfig() error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UpdateConfig() did not finish after old broadcast completed")
+	}
+	channel.mu.Lock()
+	closed := channel.closed
+	sentAfterClose := channel.sentAfterClose
+	channel.mu.Unlock()
+	if !closed || sentAfterClose {
+		t.Fatalf("old generation lifecycle invalid: closed=%v sent_after_close=%v", closed, sentAfterClose)
+	}
+}
+
+func TestManagerBroadcastUpdateAndNamesAreRaceFree(t *testing.T) {
+	m := newTestNotifyManager(&captureChannel{})
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			m.NotifyRaw("synthetic")
+		}()
+		go func() {
+			defer wg.Done()
+			_ = m.GetChannelNames()
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := m.UpdateConfig(&config.Config{}); err != nil {
+			t.Errorf("UpdateConfig() error=%v", err)
+		}
+	}()
+	wg.Wait()
+	m.Close()
+}
+
 func (c *captureChannel) Name() string { return "capture" }
 
 func (c *captureChannel) Send(text string) error {
@@ -118,7 +255,7 @@ func TestManagerNotifyEventsToWebhookWithTemplate(t *testing.T) {
 		t.Fatalf("NewWebhookChannel() error = %v", err)
 	}
 
-	m := &Manager{channels: []Channel{wh}}
+	m := newTestNotifyManager(wh)
 
 	ts := time.Date(2026, 4, 13, 12, 0, 0, 0, time.UTC)
 	m.NotifySMS("wwan0", "+8613800000000", "hello", ts)
@@ -152,7 +289,7 @@ func TestManagerNotifyEventsToWebhookWithTemplate(t *testing.T) {
 
 func TestManagerNotifyRawKeepsPlainChannelText(t *testing.T) {
 	capture := &captureChannel{}
-	m := &Manager{channels: []Channel{capture}}
+	m := newTestNotifyManager(capture)
 
 	m.NotifyRaw("plain channel text")
 	waitUntil(t, time.Second, func() bool { return capture.Last() != "" })
@@ -163,7 +300,7 @@ func TestManagerNotifyRawKeepsPlainChannelText(t *testing.T) {
 
 func TestManagerNotifyIPRotatedUsesPlainTemplate(t *testing.T) {
 	capture := &captureChannel{}
-	m := &Manager{channels: []Channel{capture}}
+	m := newTestNotifyManager(capture)
 
 	m.NotifyIPRotated("wwan0", "1.1.1.1", "2.2.2.2", 2*time.Second)
 	waitUntil(t, time.Second, func() bool { return capture.Last() != "" })
@@ -175,7 +312,7 @@ func TestManagerNotifyIPRotatedUsesPlainTemplate(t *testing.T) {
 
 func TestManagerNotifyIncomingCallUsesPlainTemplate(t *testing.T) {
 	capture := &captureChannel{}
-	m := &Manager{channels: []Channel{capture}}
+	m := newTestNotifyManager(capture)
 
 	m.NotifyIncomingCall("wwan0", "10086", "10010")
 	time.Sleep(20 * time.Millisecond)
@@ -188,7 +325,7 @@ func TestManagerNotifyIncomingCallUsesPlainTemplate(t *testing.T) {
 func TestManagerNotifySMSLogsBroadcastSummary(t *testing.T) {
 	logger.Setup(logger.LogConfig{Debug: true, Filename: filepath.Join(t.TempDir(), "app.log")})
 	capture := &captureChannel{}
-	m := &Manager{channels: []Channel{capture}}
+	m := newTestNotifyManager(capture)
 	ch := logger.GlobalBroadcaster.Subscribe()
 	defer logger.GlobalBroadcaster.Unsubscribe(ch)
 
@@ -209,7 +346,7 @@ func TestManagerNotifySMSLogsBroadcastSummary(t *testing.T) {
 
 func TestManagerNotifySMSWithSourceUsesProvidedSourceLabel(t *testing.T) {
 	capture := &captureChannel{}
-	m := &Manager{channels: []Channel{capture}}
+	m := newTestNotifyManager(capture)
 	notifier, ok := any(m).(interface {
 		NotifySMSWithSource(deviceID, sender, content, source string, timestamp time.Time)
 	})
