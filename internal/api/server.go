@@ -78,8 +78,11 @@ type Server struct {
 	notifyMgr   *notify.Manager
 	websheets   *vwebsheet.Broker
 
-	httpSrvMu sync.Mutex
-	httpSrv   *http.Server
+	httpSrvMu     sync.Mutex
+	httpSrv       *http.Server
+	httpState     httpServerLifecycleState
+	httpCancel    context.CancelFunc
+	listenContext func(ctx context.Context, network, address string) (net.Listener, error)
 
 	loginLimiter  *loginRateLimiter
 	sessionSecret []byte
@@ -91,6 +94,17 @@ type Server struct {
 	// authorization can be verified without touching the filesystem/process.
 	uninstallRunner func()
 }
+
+type httpServerLifecycleState uint8
+
+const (
+	httpServerIdle httpServerLifecycleState = iota
+	httpServerPublished
+	httpServerServing
+	httpServerStopped
+)
+
+var errHTTPServerAlreadyRunning = errors.New("HTTP server is already running")
 
 type realtimeTrafficSubscriber interface {
 	Subscribe(ctx context.Context, deviceID string) (<-chan proxytraffic.RealtimeSnapshot, func())
@@ -192,6 +206,8 @@ func (s *Server) newRouter() *gin.Engine {
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "pong"})
 	})
+	r.GET("/livez", s.handleLiveness)
+	r.GET("/readyz", s.handleReadiness)
 
 	if s.cfg.Debug {
 		r.GET("/debug/embed", s.authMiddleware(), func(c *gin.Context) {
@@ -341,21 +357,61 @@ func (s *Server) newRouter() *gin.Engine {
 	return r
 }
 
+func (s *Server) handleLiveness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "alive"})
+}
+
+func (s *Server) handleReadiness(c *gin.Context) {
+	snapshot := s.pool.ReadinessSnapshot()
+	status := http.StatusServiceUnavailable
+	if snapshot.Ready {
+		status = http.StatusOK
+	}
+	c.JSON(status, snapshot)
+}
+
 func (s *Server) Run() error {
+	return s.RunContext(context.Background())
+}
+
+func (s *Server) RunContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r := s.newRouter()
 	listenAddr := serverListenAddress(s.cfg.Port)
 
-	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       120 * time.Second,
-		WriteTimeout:      120 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
+	srv := newHTTPServer(ctx, listenAddr, r)
 	s.httpSrvMu.Lock()
+	if s.httpState == httpServerStopped {
+		cancel := s.httpCancel
+		s.httpCancel = nil
+		s.httpSrvMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return http.ErrServerClosed
+	}
+	if err := ctx.Err(); err != nil {
+		s.httpSrvMu.Unlock()
+		return err
+	}
+	if s.httpState != httpServerIdle {
+		s.httpSrvMu.Unlock()
+		return errHTTPServerAlreadyRunning
+	}
+	listenCtx, listenCancel := context.WithCancel(ctx)
 	s.httpSrv = srv
+	s.httpState = httpServerPublished
+	s.httpCancel = listenCancel
+	listenContext := s.listenContext
+	if listenContext == nil {
+		listenConfig := &net.ListenConfig{}
+		listenContext = listenConfig.Listen
+	}
 	s.httpSrvMu.Unlock()
 	if serverListenAddressUsesLoopbackDefault(s.cfg.Port) {
 		logger.Warn("API management listener now defaults to loopback; configure an explicit non-loopback address to enable LAN access", "addr", listenAddr)
@@ -363,7 +419,86 @@ func (s *Server) Run() error {
 		logger.Warn("API management listener is explicitly exposed beyond loopback; LAN access is enabled", "addr", listenAddr)
 	}
 	logger.Info("启动 API 服务器", "addr", listenAddr)
-	return srv.ListenAndServe()
+
+	s.httpSrvMu.Lock()
+	if s.httpState == httpServerStopped {
+		cancel := s.httpCancel
+		s.httpCancel = nil
+		s.httpSrvMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return http.ErrServerClosed
+	}
+	if err := ctx.Err(); err != nil {
+		s.httpSrv = nil
+		s.httpState = httpServerIdle
+		s.httpCancel = nil
+		s.httpSrvMu.Unlock()
+		listenCancel()
+		return err
+	}
+	s.httpState = httpServerServing
+	s.httpSrvMu.Unlock()
+
+	listener, err := listenContext(listenCtx, "tcp", listenAddr)
+	if err != nil {
+		return s.finishHTTPServe(srv, err)
+	}
+	s.httpSrvMu.Lock()
+	stopped := s.httpState == httpServerStopped
+	contextErr := ctx.Err()
+	s.httpSrvMu.Unlock()
+	if stopped || contextErr != nil {
+		_ = listener.Close()
+		if stopped {
+			return s.finishHTTPServe(srv, http.ErrServerClosed)
+		}
+		return s.finishHTTPServe(srv, contextErr)
+	}
+	return s.finishHTTPServe(srv, srv.Serve(listener))
+}
+
+func (s *Server) finishHTTPServe(srv *http.Server, serveErr error) error {
+	s.httpSrvMu.Lock()
+	cancel := s.httpCancel
+	if s.httpSrv == srv {
+		s.httpCancel = nil
+	}
+	if s.httpState == httpServerStopped {
+		s.httpSrvMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return http.ErrServerClosed
+	}
+	if s.httpSrv == srv {
+		s.httpSrv = nil
+		s.httpState = httpServerIdle
+	}
+	s.httpSrvMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return serveErr
+}
+
+func newHTTPServer(ctx context.Context, addr string, handler http.Handler) *http.Server {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
+	}
 }
 
 func serverListenAddress(addr string) string {
@@ -405,16 +540,26 @@ func serverListenAddressNeedsLANWarning(addr string) bool {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	// 广播关闭信号给所有内部持有的长连接（如 SSE），让它们主动退出
-	select {
-	case <-s.shutdownCh:
-	default:
-		close(s.shutdownCh)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
 	s.httpSrvMu.Lock()
+	// 广播关闭信号给所有内部持有的长连接（如 SSE），让它们主动退出。
+	// 关闭与 lifecycle 状态在同一把锁下发布，保证并发 Shutdown 幂等。
+	if s.shutdownCh != nil {
+		select {
+		case <-s.shutdownCh:
+		default:
+			close(s.shutdownCh)
+		}
+	}
+	s.httpState = httpServerStopped
 	srv := s.httpSrv
+	cancel := s.httpCancel
 	s.httpSrvMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if srv == nil {
 		return nil
 	}
@@ -533,12 +678,12 @@ func (s *Server) handleDeviceRescan(c *gin.Context) {
 
 // handleLogStream SSE 实时日志流
 func (s *Server) handleLogStream(c *gin.Context) {
-	// 设置 SSE 响应头
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
 	s.setLogStreamCORSHeaders(c)
+	stream, err := newSSEStream(c, defaultSSEWriteTimeout)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "streaming unavailable"})
+		return
+	}
 
 	// 订阅日志流
 	logChan := logger.GlobalBroadcaster.Subscribe()
@@ -551,8 +696,11 @@ func (s *Server) handleLogStream(c *gin.Context) {
 	clientGone := c.Request.Context().Done()
 
 	// 发送初始连接成功事件
-	c.SSEvent("connected", gin.H{"message": "已连接日志流"})
-	c.Writer.Flush()
+	if err := stream.Event("connected", gin.H{"message": "已连接日志流"}); err != nil {
+		return
+	}
+	heartbeat := newSSEHeartbeat()
+	defer heartbeat.Stop()
 
 	for {
 		select {
@@ -560,6 +708,10 @@ func (s *Server) handleLogStream(c *gin.Context) {
 			return
 		case <-s.shutdownCh:
 			return
+		case <-heartbeat.C:
+			if err := stream.Heartbeat(); err != nil {
+				return
+			}
 		case entry, ok := <-logChan:
 			if !ok {
 				return
@@ -575,8 +727,9 @@ func (s *Server) handleLogStream(c *gin.Context) {
 			}
 
 			// 发送日志条目
-			c.SSEvent("log", entry)
-			c.Writer.Flush()
+			if err := stream.Event("log", entry); err != nil {
+				return
+			}
 		}
 	}
 }

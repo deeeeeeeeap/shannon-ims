@@ -1,7 +1,6 @@
 package modem
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -679,6 +678,15 @@ func (m *Manager) handleCommand(req commandRequest) {
 
 	// 等待响应
 	fullResponse := []string{}
+	fullResponseBytes := 0
+	appendResponse := func(line string) bool {
+		if err := appendATResponseLine(&fullResponse, &fullResponseBytes, line); err != nil {
+			m.quarantineATResponseStream()
+			req.errChan <- err
+			return false
+		}
+		return true
+	}
 	timeoutTimer := time.NewTimer(req.timeout)
 	defer timeoutTimer.Stop()
 
@@ -720,7 +728,9 @@ RespLoop:
 				break RespLoop
 			} else if strings.Contains(line, "ERROR") {
 				m.resetATTimeoutWatchdog()
-				fullResponse = append(fullResponse, line)
+				if !appendResponse(line) {
+					return
+				}
 				if !req.silent {
 					logger.Warn(fmt.Sprintf("[%s] AT 执行失败", m.cfg.ID),
 						"cmd", req.cmd,
@@ -731,7 +741,9 @@ RespLoop:
 				break RespLoop
 			} else if strings.Contains(line, ">") {
 				m.resetATTimeoutWatchdog()
-				fullResponse = append(fullResponse, line)
+				if !appendResponse(line) {
+					return
+				}
 				if !req.silent {
 					logger.Debug(fmt.Sprintf("[%s] AT 收到提示", m.cfg.ID),
 						"cmd", req.cmd,
@@ -766,10 +778,14 @@ RespLoop:
 				}
 
 				if !isPureAsyncURC(line) {
-					fullResponse = append(fullResponse, line)
+					if !appendResponse(line) {
+						return
+					}
 				}
 			} else {
-				fullResponse = append(fullResponse, line)
+				if !appendResponse(line) {
+					return
+				}
 			}
 		}
 	}
@@ -784,7 +800,7 @@ func (m *Manager) readLoop() {
 	}()
 
 	buf := make([]byte, 1024)
-	var lineBuf bytes.Buffer
+	parser := newATStreamParser(defaultATMaxLineBytes)
 
 	for {
 		select {
@@ -830,55 +846,21 @@ func (m *Manager) readLoop() {
 
 		if n > 0 {
 			m.eofCount = 0 // 成功读取数据，重置 EOF 计数
-			// 处理读取到的数据
-			for i := 0; i < n; i++ {
-				b := buf[i]
-				lineBuf.WriteByte(b)
-
-				// 遇到换行符，或者遇到 '>' 提示符
-				// 判定为行结束 (注意处理 > )
-				// 这里的逻辑有点 tricky，因为 "> " 通常是最后两个字符
-				// 简化逻辑：遇到 \n 发送；遇到 > 且前一个是 \r 或 \n 或者是行首？
-				// 为了稳健，只要遇到 \n 就发送。
-			}
-
-			// 重新实现更简单的逻辑：
-			// 循环处理所有换行符
-			data := lineBuf.String()
-			for {
-				idx := strings.IndexByte(data, '\n')
-				if idx >= 0 {
-					// 有换行符，将前面的内容发送出去
-					line := strings.TrimSpace(data[:idx+1])
-					if line != "" {
-						select {
-						case m.rxChan <- rxMsg{Data: line}:
-						case <-m.stop:
-							return
-						}
-					}
-					// 更新数据，继续处理剩余部分
-					data = data[idx+1:]
-				} else {
-					break
-				}
-			}
-
-			// 重置 buffer 并写入剩余数据
-			lineBuf.Reset()
-			lineBuf.WriteString(data)
-
-			// 检查剩余部分是否是特殊提示符
-			// 注意：有些模组返回 "\r\n> "，上面的循环会处理掉 "\r\n"，剩下 "> "
-			if strings.HasSuffix(data, "> ") || data == "> " || strings.HasSuffix(data, ">") {
-				// 遇到特殊提示符
+			lines, parseErr := parser.Feed(buf[:n])
+			if parseErr != nil {
+				m.quarantineATResponseStream()
 				select {
-				case m.rxChan <- rxMsg{Data: "> "}:
+				case m.rxChan <- rxMsg{Err: parseErr}:
+				case <-m.stop:
+				}
+				return
+			}
+			for _, line := range lines {
+				select {
+				case m.rxChan <- rxMsg{Data: line}:
 				case <-m.stop:
 					return
 				}
-				// 清空缓冲区，因为已经消费了提示符
-				lineBuf.Reset()
 			}
 		}
 	}

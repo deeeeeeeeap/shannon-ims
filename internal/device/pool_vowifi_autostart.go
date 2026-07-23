@@ -1,6 +1,7 @@
 package device
 
 import (
+	"context"
 	"time"
 
 	"github.com/1239t/vohive/pkg/logger"
@@ -17,8 +18,7 @@ func (p *Pool) startInitialDesiredVoWiFiAutoStart(delay time.Duration) {
 	if delay < 0 {
 		delay = 0
 	}
-	go func() {
-		ctx := p.Context()
+	p.startOwnedBackground(func(ctx context.Context) {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
@@ -27,7 +27,7 @@ func (p *Pool) startInitialDesiredVoWiFiAutoStart(delay time.Duration) {
 		case now := <-timer.C:
 			p.scheduleInitialDesiredVoWiFiStarts(now)
 		}
-	}()
+	})
 }
 
 func (p *Pool) scheduleInitialDesiredVoWiFiStarts(now time.Time) {

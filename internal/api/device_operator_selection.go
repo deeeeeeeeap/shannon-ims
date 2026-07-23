@@ -5,11 +5,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/1239t/vohive/internal/backend"
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/internal/device"
 	"github.com/1239t/vohive/pkg/logger"
+	"github.com/gin-gonic/gin"
 )
 
 type operatorScanResponse struct {
@@ -56,44 +56,47 @@ func (s *Server) handleDeviceMgmtOperatorScan(c *gin.Context) {
 }
 
 func (s *Server) handleDeviceMgmtOperatorScanStream(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
+	stream, err := newSSEStream(c, defaultSSEWriteTimeout)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unavailable"})
+		return
+	}
 
 	deviceID := deviceIDParam(c)
 	w := s.pool.GetWorker(deviceID)
 	if w == nil {
-		c.SSEvent("operator_scan", operatorScanResponse{
+		_ = stream.Event("operator_scan", operatorScanResponse{
 			Status:    string(device.OperatorScanStatusFailed),
 			UpdatedAt: time.Now(),
 			Retryable: false,
 			Message:   "设备未找到或已离线",
 			Error:     "device_not_found",
 		})
-		c.Writer.Flush()
 		return
 	}
 
 	if err := validateOperatorScanWorker(w); err != nil {
-		c.SSEvent("operator_scan", operatorScanResponse{
+		_ = stream.Event("operator_scan", operatorScanResponse{
 			Status:    string(device.OperatorScanStatusFailed),
 			UpdatedAt: time.Now(),
 			Retryable: false,
 			Message:   "扫描失败: " + err.Error(),
 			Error:     err.Error(),
 		})
-		c.Writer.Flush()
 		return
 	}
 
 	notify := c.Writer.CloseNotify()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	heartbeat := newSSEHeartbeat()
+	defer heartbeat.Stop()
 
 	send := func(result device.OperatorScanResult) bool {
 		_, body := operatorScanHTTPStatusAndBody(result)
-		c.SSEvent("operator_scan", body)
-		c.Writer.Flush()
+		if err := stream.Event("operator_scan", body); err != nil {
+			return false
+		}
 		return operatorScanSSEShouldContinue(result)
 	}
 
@@ -109,6 +112,10 @@ func (s *Server) handleDeviceMgmtOperatorScanStream(c *gin.Context) {
 			return
 		case <-s.shutdownCh:
 			return
+		case <-heartbeat.C:
+			if err := stream.Heartbeat(); err != nil {
+				return
+			}
 		case <-ticker.C:
 			if !send(w.GetOperatorScanSnapshot()) {
 				return

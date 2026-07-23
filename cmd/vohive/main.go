@@ -77,6 +77,11 @@ func main() {
 	// 防止由于包含 APNs/FCM 推送 Token 的超长 Contact URI 导致 UDP 发送直接报错。
 	// 大包会自动在 IP 层被切片(IP Fragmentation)。
 	sip.UDPMTUSize = 65535
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	appLifecycle := newApplicationLifecycle(signalCtx)
+	appCtx := appLifecycle.Context()
+
 	// Parse flags
 	var configPath string
 	var backendOnly bool
@@ -107,7 +112,7 @@ func main() {
 	runtimehost.SetLogger(logger.ZapLogger())
 	logger.Info("VoHive 模组管理器启动中...")
 
-	go func() {
+	appLifecycle.Go(func(ctx context.Context) {
 		disclaimer := `
 ======================================================================
 【VoHive 免责与使用声明】
@@ -119,10 +124,15 @@ func main() {
 		logger.Warn(disclaimer)
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			logger.Warn(disclaimer)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				logger.Warn(disclaimer)
+			}
 		}
-	}()
+	})
 
 	loadResult, err := carrier.LoadCarrierOverrides(layout.CarrierOverrides)
 	if err != nil {
@@ -150,7 +160,7 @@ func main() {
 		dbResolvedPath = absPath
 	}
 	logger.Info("数据库已初始化", "path", dbPath, "resolved_path", dbResolvedPath)
-	countryResult := upstreamproxy.InitCountryTable(context.Background(), upstreamproxy.CountryTableOptions{
+	countryResult := upstreamproxy.InitCountryTable(appCtx, upstreamproxy.CountryTableOptions{
 		CachePath: layout.CountryTable,
 	})
 	if countryResult.Err != nil {
@@ -166,7 +176,12 @@ func main() {
 			"rows", countryResult.RowCount,
 			"countries", countryResult.Countries)
 	}
-	go func() {
+	appLifecycle.Go(func(ctx context.Context) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		need, err := db.NeedBackfillSMSContacts()
 		if err != nil {
 			logger.Error("短信联系人回填检查失败", "err", err)
@@ -181,11 +196,11 @@ func main() {
 			return
 		}
 		logger.Info("短信联系人回填完成")
-	}()
+	})
 
 	// 4. 初始化设备池
 
-	pool := device.NewPool(cfg)
+	pool := device.NewPoolWithContext(appCtx, cfg)
 
 	// 卡策略：注入 db-backed resolver；一次性把旧 yaml 策略种子进 card_policies。
 	pool.SetPolicyResolver(db.CardPolicyResolver{})
@@ -224,7 +239,7 @@ func main() {
 	voiceGW := voicehost.NewGateway()
 	pool.SetVoiceGateway(voiceGW)
 
-	if err := voiceGW.Start(context.Background()); err != nil {
+	if err := voiceGW.Start(appCtx); err != nil {
 		logger.Error("语音网关启动失败", "err", err)
 	} else {
 		logger.Info("语音网关已启动")
@@ -300,7 +315,7 @@ func main() {
 
 				pool.SetSIPRegistrar(sipRegistrar)
 
-				if err := sipRegistrar.Start(context.Background()); err != nil {
+				if err := sipRegistrar.Start(appCtx); err != nil {
 					logger.Error("Registrar 启动失败", "err", err)
 				} else {
 					logger.Info("软电话 Registrar 已启动", "listen", sipgwCfg.SIP.Listen, "users", len(sipgwCfg.Users))
@@ -372,77 +387,72 @@ func main() {
 	})
 
 	// 启动后同步代理配置到实例管理器
-	go func() {
-		time.Sleep(500 * time.Millisecond) // 等待 API 服务器初始化
-		syncProxyConfigs("startup", "")
-	}()
+	appLifecycle.Go(func(ctx context.Context) {
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			syncProxyConfigs("startup", "")
+		}
+	})
 
 	apiErrCh := make(chan error, 1)
-	go func() {
-		if err := apiServer.Run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			apiErrCh <- err
+	appLifecycle.Go(func(ctx context.Context) {
+		err := apiServer.RunContext(ctx)
+		select {
+		case apiErrCh <- err:
+		case <-ctx.Done():
 		}
-	}()
+	})
 
 	logger.Info("所有服务已启动")
 
-	quit := make(chan os.Signal, 2)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(quit)
-
 	// 8. 等待关闭信号
-	var sig os.Signal
 	select {
-	case sig = <-quit:
-		logger.Info("收到关闭信号", "signal", sig.String())
+	case <-appCtx.Done():
+		logger.Info("收到应用生命周期关闭信号")
 	case err := <-apiErrCh:
-		logger.Error("API 服务器失败", "err", err)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("API 服务器失败", "err", err)
+		}
+		appLifecycle.Cancel()
 	}
 	logger.Info("正在优雅关闭所有服务...")
+	appLifecycle.Cancel()
 
 	// 9. 优雅关闭
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	done := make(chan struct{})
-	go func() {
-		if err := apiServer.Shutdown(shutdownCtx); err != nil {
-			logger.Error("关闭 API 服务器时出错", "err", err)
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("关闭 API 服务器时出错", "err", err)
+	}
+	if notifyMgr != nil {
+		if err := appLifecycle.RunCleanup(shutdownCtx, notifyMgr.Close); err != nil {
+			logger.Warn("通知管理器未在截止时间内关闭", "err", err)
 		}
-
-		if notifyMgr != nil {
-			notifyMgr.Close()
+	}
+	trafficSampler.Stop()
+	if err := proxyMgr.Shutdown(shutdownCtx); err != nil {
+		logger.Error("关闭代理实例时出错", "err", err)
+	}
+	if voiceGW != nil {
+		if err := voiceGW.Stop(); err != nil {
+			logger.Error("关闭语音网关时出错", "err", err)
 		}
-
-		trafficSampler.Stop()
-
-		if err := proxyMgr.Shutdown(shutdownCtx); err != nil {
-			logger.Error("关闭代理实例时出错", "err", err)
+	}
+	if sipRegistrar != nil {
+		if err := sipRegistrar.Stop(); err != nil {
+			logger.Error("关闭 Registrar 时出错", "err", err)
 		}
-
-		// 关闭语音网关与软电话 Registrar
-		if voiceGW != nil {
-			if err := voiceGW.Stop(); err != nil {
-				logger.Error("关闭语音网关时出错", "err", err)
-			}
-		}
-		if sipRegistrar != nil {
-			if err := sipRegistrar.Stop(); err != nil {
-				logger.Error("关闭 Registrar 时出错", "err", err)
-			}
-		}
-
-		if err := pool.Shutdown(); err != nil {
-			logger.Error("关闭工作器池时出错", "err", err)
-		}
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-quit:
-	case <-time.After(12 * time.Second):
-		logger.Warn("关闭超时，强制退出")
+	}
+	if err := pool.ShutdownContext(shutdownCtx); err != nil {
+		logger.Error("关闭工作器池时出错", "err", err)
+	}
+	if err := appLifecycle.Stop(shutdownCtx); err != nil {
+		logger.Warn("应用后台任务未在截止时间内退出", "err", err)
 	}
 
 	logger.Info("再见!")

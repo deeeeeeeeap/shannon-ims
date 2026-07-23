@@ -459,6 +459,9 @@ func TestStalePipelineCannotUpdateStateOrNotifyAfterStop(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pipeline did not reach controlled shouldRun check")
 	}
+	instance.mu.Lock()
+	watchDone := instance.watchDone
+	instance.mu.Unlock()
 	stopCtx, cancelStop := context.WithCancel(context.Background())
 	cancelStop()
 	if err := instance.Stop(stopCtx); !errors.Is(err, context.Canceled) {
@@ -466,7 +469,7 @@ func TestStalePipelineCannotUpdateStateOrNotifyAfterStop(t *testing.T) {
 	}
 	close(releaseShouldRun)
 	select {
-	case <-instance.watchDone:
+	case <-watchDone:
 	case <-time.After(time.Second):
 		t.Fatal("stale pipeline did not exit")
 	}

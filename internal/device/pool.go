@@ -177,6 +177,15 @@ type Pool struct {
 	mu                        sync.RWMutex
 	ctx                       context.Context
 	cancel                    context.CancelFunc
+	backgroundMu              sync.Mutex
+	backgroundAccepting       bool
+	backgroundActive          int
+	backgroundIdle            chan struct{}
+	shutdownMu                sync.Mutex
+	shutdownDone              chan struct{}
+	initializationMu          sync.RWMutex
+	initializationComplete    bool
+	initializationPending     int
 	dataConnectHandlersMu     sync.RWMutex
 	dataConnectHandlers       []func(deviceID string)
 	rescanAndReconnectForTest func() error
@@ -209,7 +218,16 @@ type Pool struct {
 }
 
 func NewPool(cfg *config.Config) *Pool {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewPoolWithContext(context.Background(), cfg)
+}
+
+func NewPoolWithContext(parent context.Context, cfg *config.Config) *Pool {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	backgroundIdle := make(chan struct{})
+	close(backgroundIdle)
 	p := &Pool{
 		workers:               make(map[string]*Worker),
 		rebuilding:            make(map[string]bool),
@@ -220,6 +238,8 @@ func NewPool(cfg *config.Config) *Pool {
 		cfg:                   cfg,
 		ctx:                   ctx,
 		cancel:                cancel,
+		backgroundAccepting:   true,
+		backgroundIdle:        backgroundIdle,
 		vowifiHost:            vowifihost.NewManager(),
 		simEventTimers:        make(map[string]*time.Timer),
 		deviceEventWakeups:    make(map[string]*deviceEventRecoverWakeup),
@@ -233,6 +253,56 @@ func NewPool(cfg *config.Config) *Pool {
 	p.voWiFiHost().ConfigureRuntimeDependencies(p.GetVoiceGateway(), vowifiDeliveryStore{}, poolVoWiFiRuntimeDispatcher{pool: p})
 
 	return p
+}
+
+func (p *Pool) startOwnedBackground(run func(context.Context)) bool {
+	if p == nil || run == nil {
+		return false
+	}
+	p.backgroundMu.Lock()
+	if !p.backgroundAccepting || p.ctx == nil || p.ctx.Err() != nil {
+		p.backgroundMu.Unlock()
+		return false
+	}
+	if p.backgroundActive == 0 {
+		p.backgroundIdle = make(chan struct{})
+	}
+	p.backgroundActive++
+	p.backgroundMu.Unlock()
+
+	go func() {
+		defer p.finishOwnedBackground()
+		run(p.ctx)
+	}()
+	return true
+}
+
+func (p *Pool) finishOwnedBackground() {
+	p.backgroundMu.Lock()
+	defer p.backgroundMu.Unlock()
+	if p.backgroundActive <= 0 {
+		return
+	}
+	p.backgroundActive--
+	if p.backgroundActive == 0 {
+		close(p.backgroundIdle)
+	}
+}
+
+func (p *Pool) stopOwnedBackground() <-chan struct{} {
+	p.backgroundMu.Lock()
+	p.backgroundAccepting = false
+	idle := p.backgroundIdle
+	if idle == nil {
+		idle = make(chan struct{})
+		close(idle)
+		p.backgroundIdle = idle
+	}
+	p.backgroundMu.Unlock()
+	if p.cancel != nil {
+		p.cancel()
+	}
+	return idle
 }
 
 func (p *Pool) OnDataConnected(handler func(deviceID string)) {
@@ -253,7 +323,9 @@ func (p *Pool) notifyDataConnected(deviceID string) {
 	p.dataConnectHandlersMu.RUnlock()
 	for _, handler := range handlers {
 		h := handler
-		go h(deviceID)
+		p.startOwnedBackground(func(context.Context) {
+			h(deviceID)
+		})
 	}
 }
 
@@ -1289,6 +1361,7 @@ func (p *Pool) StartAll() error {
 	p.startPoolBackgroundServicesOnce()
 
 	devices := append([]config.DeviceConfig(nil), p.cfg.Devices...)
+	startupDevices := make([]config.DeviceConfig, 0, len(devices))
 	for i := range devices {
 		devCfg := devices[i]
 		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID) {
@@ -1297,7 +1370,17 @@ func (p *Pool) StartAll() error {
 				"limit", DefaultFreeDeviceLimit)
 			continue
 		}
-		go p.startConfiguredDeviceBootstrap(devCfg, "start_all")
+		startupDevices = append(startupDevices, devCfg)
+	}
+	p.beginInitialization(len(startupDevices))
+	for i := range startupDevices {
+		devCfg := startupDevices[i]
+		if !p.startOwnedBackground(func(context.Context) {
+			defer p.finishInitializationAttempt()
+			p.startConfiguredDeviceBootstrap(devCfg, "start_all")
+		}) {
+			p.finishInitializationAttempt()
+		}
 	}
 	return nil
 }
@@ -1307,13 +1390,14 @@ func (p *Pool) startPoolBackgroundServicesOnce() {
 		return
 	}
 	p.startOnce.Do(func() {
-		go p.healthCheckLoop()
-		go p.overviewStreamLoop()
-		go p.startVoWiFiDesiredReconcileLoop()
+		p.startOwnedBackground(func(context.Context) { p.healthCheckLoop() })
+		p.startOwnedBackground(func(context.Context) { p.overviewStreamLoop() })
+		p.startOwnedBackground(func(context.Context) { p.startVoWiFiDesiredReconcileLoop() })
 		p.startInitialDesiredVoWiFiAutoStart(5 * time.Second)
 
 		p.udevWatcher = NewUdevWatcher(p)
-		p.udevWatcher.Start()
+		watcher := p.udevWatcher
+		p.startOwnedBackground(func(context.Context) { watcher.loop() })
 	})
 }
 
@@ -2668,17 +2752,69 @@ func (p *Pool) NotifyIPChanged(id, oldIP, newIP string, duration time.Duration) 
 }
 
 func (p *Pool) Shutdown() error {
-	// 先关闭所有 VoWiFi 应用实例（确保 XFRMI 接口和 SA/SP 被清理）
-	devIDs := p.voWiFiHost().InstanceIDs()
-	for _, devID := range devIDs {
-		logger.Info("正在关闭 VoWiFi", "device", devID)
-		_ = p.stopVoWiFiAppForTeardown(context.Background(), devID, "shutdown")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.ShutdownContext(ctx)
+}
+
+func (p *Pool) ShutdownContext(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := p.ensureShutdownStarted()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *Pool) ensureShutdownStarted() <-chan struct{} {
+	p.shutdownMu.Lock()
+	defer p.shutdownMu.Unlock()
+	if p.shutdownDone != nil {
+		return p.shutdownDone
+	}
+	done := make(chan struct{})
+	p.shutdownDone = done
+	backgroundIdle := p.stopOwnedBackground()
+	if p.udevWatcher != nil {
+		p.udevWatcher.Stop()
+	}
+	go p.finishShutdown(backgroundIdle, done)
+	return done
+}
+
+func (p *Pool) finishShutdown(backgroundIdle <-chan struct{}, done chan struct{}) {
+	defer close(done)
+	if backgroundIdle != nil {
+		<-backgroundIdle
 	}
 
-	p.cancel()
-	var wg sync.WaitGroup
+	// 先关闭所有 VoWiFi 应用实例（确保 XFRMI 接口和 SA/SP 被清理）。
+	for _, devID := range p.voWiFiHost().InstanceIDs() {
+		logger.Info("正在关闭 VoWiFi", "device", devID)
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = p.stopVoWiFiAppForTeardown(stopCtx, devID, "shutdown")
+		cancel()
+	}
+
 	p.mu.RLock()
-	for _, w := range p.workers {
+	workers := make([]*Worker, 0, len(p.workers))
+	for _, worker := range p.workers {
+		workers = append(workers, worker)
+	}
+	p.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, worker := range workers {
+		if worker == nil {
+			continue
+		}
 		wg.Add(1)
 		go func(worker *Worker) {
 			defer wg.Done()
@@ -2686,50 +2822,19 @@ func (p *Pool) Shutdown() error {
 				logger.Info(fmt.Sprintf("[%s] 正在关闭代理服务器", worker.ID))
 				worker.Proxy.Shutdown()
 			}
-		}(w)
-
-		// 停止 QMI Core
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
 			if worker.QMICore != nil {
 				worker.QMICore.Stop()
 			}
-		}(w)
-
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
 			if worker.MBIMCore != nil {
 				_ = worker.MBIMCore.Close()
 			}
-		}(w)
-
-		// 停止独立 QMI UIM transport（若存在）
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
 			if worker.ESIMQMITransport != nil {
 				_ = worker.ESIMQMITransport.Stop()
 			}
-		}(w)
+		}(worker)
 	}
-	p.mu.RUnlock()
-
-	// 等待 5 秒强制退出
-	c := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(c)
-	}()
-
-	select {
-	case <-c:
-		logger.Info("所有工作器已正常关闭")
-		return nil
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("关闭超时")
-	}
+	wg.Wait()
+	logger.Info("所有工作器已正常关闭")
 }
 
 func (p *Pool) PersistRuntimeState(worker *Worker) {

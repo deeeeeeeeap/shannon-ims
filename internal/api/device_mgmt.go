@@ -2069,43 +2069,42 @@ func (s *Server) handleEsimDownloadProfile(c *gin.Context) {
 	aidHex := c.Query("aid_hex")
 	imei := strings.TrimSpace(c.Query("imei"))
 
-	// 设置 SSE 响应头
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "流式输出不支持"})
+	stream, err := newSSEStream(c, defaultSSEWriteTimeout)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unavailable"})
 		return
-	}
-
-	// sseWrite 向客户端推送一条 SSE 事件
-	sseWrite := func(step, msg string, pct int) {
-		fmt.Fprintf(c.Writer, "data: {\"step\":%q,\"msg\":%q,\"pct\":%d}\n\n", step, msg, pct)
-		flusher.Flush()
-	}
-	sseWriteRaw := func(payload string) {
-		fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
-		flusher.Flush()
 	}
 
 	// 下载可能耗时较长，给 5 分钟超时
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
 	defer cancel()
 
+	var streamMu sync.Mutex
+	var streamErr error
 	progressFn := func(event esim.DownloadProgressEvent) {
-		sseWrite(event.Step, event.Msg, event.Pct)
+		payload := fmt.Sprintf("{\"step\":%q,\"msg\":%q,\"pct\":%d}", event.Step, event.Msg, event.Pct)
+		if err := stream.Data(payload); err != nil {
+			streamMu.Lock()
+			if streamErr == nil {
+				streamErr = err
+				cancel()
+			}
+			streamMu.Unlock()
+		}
 	}
 
 	result, err := esimDownloadExec(worker.EsimMgr.DownloadProfile, ctx, aidHex, smdp, matchingID, confirmationCode, imei, progressFn)
-	if err != nil {
-		writeEsimDownloadErrorEvent(c, err)
+	streamMu.Lock()
+	writeFailed := streamErr != nil
+	streamMu.Unlock()
+	if writeFailed {
 		return
 	}
-	_ = sseWriteRaw
-	writeEsimDownloadDoneEvent(c, result)
+	if err != nil {
+		_ = stream.Data(formatEsimDownloadErrorEvent(err))
+		return
+	}
+	_ = stream.Data(formatEsimDownloadDoneEvent(result))
 }
 
 // handleEsimRenameProfile 修改 eSIM profile 名称
@@ -2522,12 +2521,13 @@ func (s *Server) handleDeviceMgmtReconnectVoWiFi(c *gin.Context) {
 
 // handleDeviceMgmtOverviewStreamSingle 给前端管理的概览信息提供带有动态刷新的 SSE 推流（仅针对选中的单个设备）
 func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-
 	deviceID := deviceIDParam(c)
 	if deviceID == "" {
+		return
+	}
+	stream, err := newSSEStream(c, defaultSSEWriteTimeout)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unavailable"})
 		return
 	}
 
@@ -2540,6 +2540,8 @@ func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
 	notify := c.Writer.CloseNotify()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	heartbeat := newSSEHeartbeat()
+	defer heartbeat.Stop()
 
 	// 订阅 VoWiFi 运行态变更——状态一变（如 IMS 注册成功）立即推送，无需等待 Ticker。
 	// 若 VoWiFi 未启动则 stateCh 为 nil，nil channel 在 select 中永远阻塞，行为安全。
@@ -2566,10 +2568,10 @@ func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
 		return md
 	}
 
-	sendData := func(refreshConfig bool, fromStateEvent bool) {
+	sendData := func(refreshConfig bool, fromStateEvent bool) bool {
 		md := getConfig(refreshConfig)
 		if md == nil {
-			return
+			return true
 		}
 		var item deviceMgmtOverviewLiteItem
 
@@ -2620,7 +2622,7 @@ func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
 		trafficCh = trafficStream.sync(item)
 		curr := newOverviewStreamEmitVersion(item)
 		if fromStateEvent && shouldSkipOverviewStatePush(lastSent, curr) {
-			return
+			return true
 		}
 		lastSent = &curr
 		if fromStateEvent {
@@ -2632,11 +2634,12 @@ func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
 		}
 
 		// 仍然使用 devices 结构体包裹返回单项从而无缝对接前台旧结构
-		c.SSEvent("overview", gin.H{"devices": []deviceMgmtOverviewLiteItem{item}})
-		c.Writer.Flush()
+		return stream.Event("overview", gin.H{"devices": []deviceMgmtOverviewLiteItem{item}}) == nil
 	}
 
-	sendData(true, false)
+	if !sendData(true, false) {
+		return
+	}
 
 	for {
 		select {
@@ -2646,18 +2649,27 @@ func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
 			return
 		case <-s.shutdownCh:
 			return
+		case <-heartbeat.C:
+			if err := stream.Heartbeat(); err != nil {
+				return
+			}
 		case <-ticker.C:
-			sendData(true, false)
+			if !sendData(true, false) {
+				return
+			}
 		case <-stateCh: // VoWiFi 状态变化（隧道建立/IMS 注册/SMS 就绪等），立即推送
-			sendData(false, true)
+			if !sendData(false, true) {
+				return
+			}
 		case snap, ok := <-trafficCh:
 			if !ok {
 				trafficStream.stop()
 				trafficCh = nil
 				continue
 			}
-			c.SSEvent("traffic", snap)
-			c.Writer.Flush()
+			if err := stream.Event("traffic", snap); err != nil {
+				return
+			}
 		}
 	}
 }

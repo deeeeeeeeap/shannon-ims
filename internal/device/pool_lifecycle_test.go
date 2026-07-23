@@ -1,6 +1,7 @@
 package device
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,79 @@ import (
 	"github.com/1239t/vohive/internal/backend"
 	"github.com/1239t/vohive/internal/config"
 )
+
+func TestPoolContextFollowsApplicationLifecycle(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	pool := NewPoolWithContext(parent, &config.Config{})
+	cancelParent()
+
+	select {
+	case <-pool.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("Pool context did not follow application cancellation")
+	}
+}
+
+func TestPoolShutdownContextJoinsOwnedBackgroundTask(t *testing.T) {
+	pool := NewPoolWithContext(context.Background(), &config.Config{})
+	started := make(chan struct{})
+	exited := make(chan struct{})
+	if !pool.startOwnedBackground(func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(exited)
+	}) {
+		t.Fatal("startOwnedBackground() rejected task before shutdown")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("owned Pool task did not start")
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	defer cancelShutdown()
+	if err := pool.ShutdownContext(shutdownCtx); err != nil {
+		t.Fatalf("ShutdownContext() error=%v", err)
+	}
+	select {
+	case <-exited:
+	default:
+		t.Fatal("ShutdownContext() returned before owned Pool task exited")
+	}
+	if pool.startOwnedBackground(func(context.Context) {}) {
+		t.Fatal("startOwnedBackground() accepted task after shutdown")
+	}
+}
+
+func TestPoolShutdownContextJoinsDataConnectedCallback(t *testing.T) {
+	pool := NewPoolWithContext(context.Background(), &config.Config{})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pool.OnDataConnected(func(string) {
+		close(started)
+		<-release
+	})
+	pool.notifyDataConnected("synthetic-device")
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("data-connected callback did not start")
+	}
+
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShort()
+	if err := pool.ShutdownContext(shortCtx); err != context.DeadlineExceeded {
+		t.Fatalf("ShutdownContext() error=%v, want deadline while callback is active", err)
+	}
+
+	close(release)
+	joinCtx, cancelJoin := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoin()
+	if err := pool.ShutdownContext(joinCtx); err != nil {
+		t.Fatalf("ShutdownContext() after callback release error=%v", err)
+	}
+}
 
 func TestSuppressQMIUnhealthyEvictionDuringLifecycleRecovery(t *testing.T) {
 	pool := NewPool(&config.Config{})
