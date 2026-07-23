@@ -170,38 +170,56 @@ func TestTransportPriorityAgingPreventsEUICCStarvation(t *testing.T) {
 		t.Fatalf("AcquireTransport(first) error=%v", err)
 	}
 
-	order := make(chan string, 2)
+	type acquireResult struct {
+		name string
+		err  error
+	}
+	results := make(chan acquireResult, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	go func() {
-		lease, acquireErr := arb.AcquireTransport(ctx, Request{Owner: "aged-euicc", Mode: "QMI", Class: APDUClassEUICCWrite})
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+	acquire := func(name string, req Request) {
+		defer wg.Done()
+		lease, acquireErr := arb.AcquireTransport(ctx, req)
 		if acquireErr != nil {
-			t.Errorf("AcquireTransport(euicc) error=%v", acquireErr)
+			results <- acquireResult{name: name, err: acquireErr}
 			return
 		}
-		order <- "euicc"
+		results <- acquireResult{name: name}
 		lease.Release()
-	}()
+	}
+	wg.Add(1)
+	go acquire("euicc", Request{Owner: "aged-euicc", Mode: "QMI", Class: APDUClassEUICCWrite})
 	time.Sleep(transportPriorityAging + 80*time.Millisecond)
-	go func() {
-		lease, acquireErr := arb.AcquireTransport(ctx, Request{Owner: "vowifi_aka", Mode: "QMI", Class: APDUClassUSIMAKA})
-		if acquireErr != nil {
-			t.Errorf("AcquireTransport(aka) error=%v", acquireErr)
-			return
-		}
-		order <- "aka"
-		lease.Release()
-	}()
+	wg.Add(1)
+	go acquire("aka", Request{Owner: "vowifi_aka", Mode: "QMI", Class: APDUClassUSIMAKA})
 
 	time.Sleep(40 * time.Millisecond)
 	first.Release()
-	select {
-	case got := <-order:
-		if got != "euicc" {
-			t.Fatalf("first acquired transport=%q want euicc", got)
+	order := make([]acquireResult, 0, 2)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for len(order) < 2 {
+		select {
+		case result := <-results:
+			order = append(order, result)
+		case <-timer.C:
+			t.Fatal("timed out waiting for transports")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for first transport")
+	}
+	for _, result := range order {
+		if result.err != nil {
+			t.Fatalf("AcquireTransport(%s) error=%v", result.name, result.err)
+		}
+	}
+	if order[0].name != "euicc" {
+		t.Fatalf("first acquired transport=%q want euicc", order[0].name)
+	}
+	if order[1].name != "aka" {
+		t.Fatalf("second acquired transport=%q want aka", order[1].name)
 	}
 }
 
