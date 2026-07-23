@@ -699,6 +699,109 @@ func TestSwitchProfileQMIDoesNotPowerCycleAfterEnableSuccess(t *testing.T) {
 	}
 }
 
+func TestSwitchProfileBeforeHookFailurePreventsEnableProfile(t *testing.T) {
+	const aidHex = "A0000005591010FFFFFFFF8900000100"
+	const targetICCID = "8986001234567890123"
+	journalErr := errors.New("synthetic journal failure")
+	var enableCalls atomic.Int32
+	mgr := newTestQMIManagerForPowerCycle(t, &fakeSIMPowerBackend{}, &enableCalls)
+	mgr.onBeforeSwitch = func(SwitchOperation, string) (uint64, error) {
+		return 0, journalErr
+	}
+
+	if _, err := mgr.SwitchProfileWithResult(context.Background(), targetICCID, aidHex); !errors.Is(err, journalErr) {
+		t.Fatalf("SwitchProfileWithResult() error=%v", err)
+	}
+	if enableCalls.Load() != 0 {
+		t.Fatalf("EnableProfile calls=%d, want 0", enableCalls.Load())
+	}
+}
+
+func TestSwitchProfilePersistsApplyIntentBeforeEnableProfile(t *testing.T) {
+	const aidHex = "A0000005591010FFFFFFFF8900000100"
+	const targetICCID = "8986001234567890123"
+	var applyIntentPersisted atomic.Bool
+	var enableCalls atomic.Int32
+	mgr := newTestQMIManagerForPowerCycle(t, &fakeSIMPowerBackend{}, &enableCalls)
+	mgr.onBeforePhysicalApply = func(SwitchOperation, uint64) error {
+		applyIntentPersisted.Store(true)
+		return nil
+	}
+	mgr.channelFactory = func([]byte) (*lpa.Client, error) {
+		return &lpa.Client{APDU: fakeProfileOperationTransmitter{
+			calls: &enableCalls,
+			onProfileOperation: func() {
+				if !applyIntentPersisted.Load() {
+					t.Fatal("EnableProfile ran before apply intent was persisted")
+				}
+			}}}, nil
+	}
+
+	if _, err := mgr.SwitchProfileWithResult(context.Background(), targetICCID, aidHex); err != nil {
+		t.Fatalf("SwitchProfileWithResult() error=%v", err)
+	}
+	if enableCalls.Load() != 1 {
+		t.Fatalf("EnableProfile calls=%d, want 1", enableCalls.Load())
+	}
+}
+
+func TestSwitchProfileAcceptedJournalFailureDoesNotReportSuccess(t *testing.T) {
+	const aidHex = "A0000005591010FFFFFFFF8900000100"
+	const targetICCID = "8986001234567890123"
+	acceptedErr := errors.New("synthetic acceptance journal failure")
+	var enableCalls atomic.Int32
+	var afterCalls atomic.Int32
+	mgr := newTestQMIManagerForPowerCycle(t, &fakeSIMPowerBackend{}, &enableCalls)
+	mgr.onBeforeSwitch = func(SwitchOperation, string) (uint64, error) {
+		return 11, nil
+	}
+	mgr.onSwitchAccepted = func(SwitchOperation, uint64) error {
+		return acceptedErr
+	}
+	mgr.onAfterSwitch = func(SwitchOperation, uint64) {
+		afterCalls.Add(1)
+	}
+
+	result, err := mgr.SwitchProfileWithResult(context.Background(), targetICCID, aidHex)
+	if !errors.Is(err, acceptedErr) {
+		t.Fatalf("SwitchProfileWithResult() error=%v", err)
+	}
+	if enableCalls.Load() != 1 {
+		t.Fatalf("EnableProfile calls=%d, want 1", enableCalls.Load())
+	}
+	if result.SwitchAccepted || result.PostSwitchAsync || result.RecoveryPending {
+		t.Fatal("result reported success after acceptance journal failure")
+	}
+	if afterCalls.Load() != 0 {
+		t.Fatalf("post-switch recovery calls=%d, want 0", afterCalls.Load())
+	}
+}
+
+func TestSwitchProfileAfterPhysicalBoundaryRunsAfterEnableProfile(t *testing.T) {
+	const aidHex = "A0000005591010FFFFFFFF8900000100"
+	const targetICCID = "8986001234567890123"
+	crashErr := errors.New("synthetic interruption after physical apply")
+	var enableCalls atomic.Int32
+	mgr := newTestQMIManagerForPowerCycle(t, &fakeSIMPowerBackend{}, &enableCalls)
+	mgr.onBeforeSwitch = func(SwitchOperation, string) (uint64, error) {
+		return 13, nil
+	}
+	mgr.onAfterPhysicalApply = func(SwitchOperation, uint64, error) error {
+		if enableCalls.Load() != 1 {
+			t.Fatalf("EnableProfile calls at boundary=%d, want 1", enableCalls.Load())
+		}
+		return crashErr
+	}
+
+	result, err := mgr.SwitchProfileWithResult(context.Background(), targetICCID, aidHex)
+	if !errors.Is(err, crashErr) {
+		t.Fatalf("SwitchProfileWithResult() error=%v", err)
+	}
+	if result.SwitchAccepted || result.PostSwitchAsync || result.RecoveryPending {
+		t.Fatal("result advanced after physical boundary interruption")
+	}
+}
+
 func TestSwitchProfileATDoesNotReloadInsideManagerAfterEnableSuccess(t *testing.T) {
 	const aidHex = "A0000005591010FFFFFFFF8900000100"
 	const targetICCID = "8986001234567890123"
@@ -1075,14 +1178,14 @@ func TestSwitchProfileFailedCallbackReceivesOriginalError(t *testing.T) {
 			calls: &enableCalls,
 		}}, nil
 	}
-	mgr.onBeforeSwitch = func(operation SwitchOperation, target string) uint64 {
+	mgr.onBeforeSwitch = func(operation SwitchOperation, target string) (uint64, error) {
 		if operation != SwitchOperationEnableProfile {
 			t.Fatalf("operation=%q want %q", operation, SwitchOperationEnableProfile)
 		}
 		if target != targetICCID {
 			t.Fatalf("target=%q want %q", target, targetICCID)
 		}
-		return 42
+		return 42, nil
 	}
 	var callbackErr error
 	var callbackToken uint64
@@ -1106,6 +1209,34 @@ func TestSwitchProfileFailedCallbackReceivesOriginalError(t *testing.T) {
 	}
 }
 
+func TestSwitchProfileSuccessfulZeroTokenBeforeHookKeepsFailureCallback(t *testing.T) {
+	const aidHex = "A0000005591010FFFFFFFF8900000100"
+	const targetICCID = "8986001234567890123"
+	rootErr := errors.New("synthetic profile operation failure")
+	var enableCalls atomic.Int32
+	mgr := newTestQMIManagerForPowerCycle(t, &fakeSIMPowerBackend{}, &enableCalls)
+	mgr.channelFactory = func([]byte) (*lpa.Client, error) {
+		return &lpa.Client{APDU: fakeProfileOperationTransmitter{
+			err:   rootErr,
+			calls: &enableCalls,
+		}}, nil
+	}
+	mgr.onBeforeSwitch = func(SwitchOperation, string) (uint64, error) {
+		return 0, nil
+	}
+	callbackCalled := false
+	mgr.onSwitchFailed = func(SwitchOperation, uint64, error) {
+		callbackCalled = true
+	}
+
+	if _, err := mgr.SwitchProfileWithResult(context.Background(), targetICCID, aidHex); !errors.Is(err, rootErr) {
+		t.Fatal("SwitchProfileWithResult did not preserve the synthetic operation failure")
+	}
+	if !callbackCalled {
+		t.Fatal("successful zero-token before hook did not receive the failure callback")
+	}
+}
+
 func TestSwitchProfilePostSwitchHookStillRunsWhenBackendPowerWouldFail(t *testing.T) {
 	const aidHex = "A0000005591010FFFFFFFF8900000100"
 	const targetICCID = "8986001234567890123"
@@ -1118,8 +1249,8 @@ func TestSwitchProfilePostSwitchHookStillRunsWhenBackendPowerWouldFail(t *testin
 	mgr := newTestQMIManagerForPowerCycle(t, be, &enableCalls)
 	mgr.postSwitchMinDelay = time.Millisecond
 	hookDone := make(chan uint64, 1)
-	mgr.onBeforeSwitch = func(operation SwitchOperation, target string) uint64 {
-		return 12
+	mgr.onBeforeSwitch = func(operation SwitchOperation, target string) (uint64, error) {
+		return 12, nil
 	}
 	mgr.onAfterSwitch = func(operation SwitchOperation, token uint64) {
 		hookDone <- token

@@ -2,11 +2,15 @@ package device
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/1239t/vohive/internal/backend"
+	"github.com/1239t/vohive/internal/db"
 	"github.com/1239t/vohive/internal/esim"
 	"github.com/1239t/vohive/pkg/logger"
 )
@@ -30,6 +34,7 @@ type esimSwitchContext struct {
 	FlightModeBefore     bool
 	QMIConnectedBefore   bool
 	NetworkEnabledBefore bool
+	RadioStateBefore     db.ESIMSwitchRadioState
 	ICCIDBefore          string
 	IMSIBefore           string
 	TargetICCID          string
@@ -38,6 +43,42 @@ type esimSwitchContext struct {
 	CapturedAt           time.Time
 	Phase                esim.SwitchPhase
 	PhaseUpdatedAt       time.Time
+	OperationID          string
+	OwnerEpoch           string
+	WorkerGeneration     uint64
+	JournalVersion       uint64
+	JournalPhase         db.ESIMSwitchPhase
+}
+
+type esimSwitchJournalStore interface {
+	Create(context.Context, db.CreateESIMSwitchOperationInput) (db.ESIMSwitchOperation, error)
+	Transition(context.Context, db.TransitionESIMSwitchOperationInput) (db.ESIMSwitchOperation, error)
+}
+
+type esimSwitchReconciliationStore interface {
+	esimSwitchJournalStore
+	GetBlockingByDevice(context.Context, string) (db.ESIMSwitchOperation, error)
+	ClaimForReconciliation(context.Context, db.ClaimESIMSwitchOperationInput) (db.ESIMSwitchOperation, error)
+}
+
+type esimSwitchFailpoint string
+
+const (
+	esimSwitchFailpointAfterIntent           esimSwitchFailpoint = "after_intent"
+	esimSwitchFailpointAfterTeardownPlanned  esimSwitchFailpoint = "after_teardown_planned"
+	esimSwitchFailpointAfterTeardown         esimSwitchFailpoint = "after_teardown"
+	esimSwitchFailpointAfterApplyPlanned     esimSwitchFailpoint = "after_apply_planned"
+	esimSwitchFailpointAfterPhysicalApply    esimSwitchFailpoint = "after_physical_apply"
+	esimSwitchFailpointAfterAccepted         esimSwitchFailpoint = "after_accepted"
+	esimSwitchFailpointAfterFailurePersisted esimSwitchFailpoint = "after_failure_persisted"
+	esimSwitchFailpointDuringRecovery        esimSwitchFailpoint = "during_recovery"
+)
+
+func (p *Pool) hitESIMSwitchFailpoint(point esimSwitchFailpoint) error {
+	if p == nil || p.esimSwitchFailpoint == nil {
+		return nil
+	}
+	return p.esimSwitchFailpoint(point)
 }
 
 const (
@@ -52,6 +93,14 @@ var (
 	postSwitchIdentityPollInterval = postSwitchIdentityDefaultPollInterval
 	postSwitchIdentityRetryDelays  = []time.Duration{time.Second, 3 * time.Second, 6 * time.Second}
 )
+
+func newESIMSwitchOpaqueID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("eSIM switch identifier unavailable")
+	}
+	return hex.EncodeToString(value[:]), nil
+}
 
 func initialPostSwitchIdentityPollDelay(capDelay time.Duration) time.Duration {
 	if capDelay <= 0 {
@@ -116,8 +165,9 @@ func isFlightOperatingMode(mode backend.OperatingMode) bool {
 
 func (p *Pool) captureESIMSwitchContext(deviceID string, targetICCID string) esimSwitchContext {
 	ctx := esimSwitchContext{
-		CapturedAt:  time.Now(),
-		TargetICCID: normalizeSIMIdentity(targetICCID),
+		CapturedAt:       time.Now(),
+		TargetICCID:      normalizeSIMIdentity(targetICCID),
+		RadioStateBefore: db.ESIMSwitchRadioUnknown,
 	}
 	worker := p.GetWorker(deviceID)
 	if worker == nil {
@@ -136,6 +186,11 @@ func (p *Pool) captureESIMSwitchContext(deviceID string, targetICCID string) esi
 	if worker.Backend != nil {
 		if opMode, err := worker.Backend.GetOperatingMode(context.Background()); err == nil {
 			ctx.FlightModeBefore = isFlightOperatingMode(opMode)
+			if ctx.FlightModeBefore {
+				ctx.RadioStateBefore = db.ESIMSwitchRadioFlight
+			} else {
+				ctx.RadioStateBefore = db.ESIMSwitchRadioOnline
+			}
 		} else {
 			logger.Warn("切卡前读取飞行模式状态失败", "device", deviceID, "err", err)
 		}
@@ -145,6 +200,10 @@ func (p *Pool) captureESIMSwitchContext(deviceID string, targetICCID string) esi
 
 func (p *Pool) beginESIMSwitch(deviceID string, targetICCID string) esimSwitchContext {
 	snapshot := p.captureESIMSwitchContext(deviceID, targetICCID)
+	return p.registerESIMSwitchSnapshot(deviceID, snapshot)
+}
+
+func (p *Pool) registerESIMSwitchSnapshot(deviceID string, snapshot esimSwitchContext) esimSwitchContext {
 	p.switchMu.Lock()
 	if p.switchingDevices == nil {
 		p.switchingDevices = make(map[string]bool)
@@ -164,8 +223,15 @@ func (p *Pool) beginESIMSwitch(deviceID string, targetICCID string) esimSwitchCo
 	p.switchTokens[deviceID] = snapshot.SwitchToken
 	p.switchMu.Unlock()
 
-	go func(capturedAt time.Time) {
-		<-time.After(2 * time.Minute)
+	capturedAt := snapshot.CapturedAt
+	p.startOwnedBackground(func(ctx context.Context) {
+		timer := time.NewTimer(2 * time.Minute)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
 		p.switchMu.Lock()
 		defer p.switchMu.Unlock()
 		current, ok := p.switchContexts[deviceID]
@@ -176,7 +242,7 @@ func (p *Pool) beginESIMSwitch(deviceID string, targetICCID string) esimSwitchCo
 		delete(p.switchingDevices, deviceID)
 		delete(p.switchTokens, deviceID)
 		logger.Warn("切卡超时保护触发，已自动清理切卡中标记", "device", deviceID)
-	}(snapshot.CapturedAt)
+	})
 
 	logger.Info("切卡前已记录运行态快照",
 		"device", deviceID,
@@ -187,6 +253,266 @@ func (p *Pool) beginESIMSwitch(deviceID string, targetICCID string) esimSwitchCo
 		"target_iccid", snapshot.TargetICCID,
 		"switch_phase", string(snapshot.Phase))
 	return snapshot
+}
+
+func (p *Pool) beginDurableESIMSwitch(worker *Worker, targetICCID string) (uint64, error) {
+	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" || worker.generation == 0 {
+		return 0, db.ErrESIMSwitchOperationInvalid
+	}
+	operationLease, ok := worker.acquireESIMOperationLease(p.ctx)
+	if !ok {
+		return 0, db.ErrESIMSwitchOperationStale
+	}
+	defer operationLease.Release()
+	p.mu.RLock()
+	currentWorker := p.workers[worker.ID]
+	p.mu.RUnlock()
+	if currentWorker != worker || currentWorker.generation != worker.generation {
+		return 0, db.ErrESIMSwitchOperationStale
+	}
+	snapshot := p.captureESIMSwitchContext(worker.ID, targetICCID)
+	operationID, err := newESIMSwitchOpaqueID()
+	if err != nil {
+		return 0, db.ErrESIMSwitchJournalUnavailable
+	}
+	ownerEpoch := strings.TrimSpace(p.ownerEpoch)
+	if p.esimSwitchJournal == nil || ownerEpoch == "" {
+		return 0, db.ErrESIMSwitchJournalUnavailable
+	}
+	created, err := p.esimSwitchJournal.Create(p.ctx, db.CreateESIMSwitchOperationInput{
+		OperationID:         operationID,
+		DeviceID:            worker.ID,
+		OwnerEpoch:          ownerEpoch,
+		WorkerGeneration:    worker.generation,
+		TargetICCID:         snapshot.TargetICCID,
+		PreNetworkConnected: snapshot.QMIConnectedBefore,
+		PreNetworkEnabled:   snapshot.NetworkEnabledBefore,
+		PreVoWiFiActive:     snapshot.VoWiFiActiveBefore,
+		PreRadioState:       snapshot.RadioStateBefore,
+		Now:                 snapshot.CapturedAt.UTC(),
+	})
+	if err != nil {
+		if errors.Is(err, db.ErrESIMSwitchOperationInProgress) {
+			return 0, esim.ErrOperationInProgress
+		}
+		return 0, err
+	}
+	snapshot = p.registerESIMSwitchSnapshot(worker.ID, snapshot)
+	snapshot.OperationID = created.OperationID
+	snapshot.OwnerEpoch = created.OwnerEpoch
+	snapshot.WorkerGeneration = created.WorkerGeneration
+	snapshot.JournalVersion = created.Version
+	snapshot.JournalPhase = created.Phase
+	p.storeESIMSwitchJournalSnapshot(worker.ID, snapshot)
+	if err := p.hitESIMSwitchFailpoint(esimSwitchFailpointAfterIntent); err != nil {
+		return snapshot.SwitchToken, err
+	}
+
+	teardownPlanned, err := p.transitionOwnedESIMSwitch(worker.ID, snapshot, db.TransitionESIMSwitchOperationInput{
+		OperationID:         created.OperationID,
+		OwnerEpoch:          created.OwnerEpoch,
+		WorkerGeneration:    created.WorkerGeneration,
+		ExpectedPhase:       created.Phase,
+		ExpectedVersion:     created.Version,
+		NextPhase:           db.ESIMSwitchPhaseTeardownPlanned,
+		NextAcceptanceState: db.ESIMSwitchAcceptanceUnknown,
+		Now:                 time.Now().UTC(),
+	})
+	if err != nil {
+		return snapshot.SwitchToken, err
+	}
+	snapshot.JournalVersion = teardownPlanned.Version
+	snapshot.JournalPhase = teardownPlanned.Phase
+	p.storeESIMSwitchJournalSnapshot(worker.ID, snapshot)
+	if err := p.hitESIMSwitchFailpoint(esimSwitchFailpointAfterTeardownPlanned); err != nil {
+		return snapshot.SwitchToken, err
+	}
+	if err := operationLease.RunPhysical(func() error {
+		if err := p.validateESIMOperationLease(worker, operationLease); err != nil {
+			return err
+		}
+		p.performESIMSwitchTeardownForWorker(worker.ID, worker, snapshot)
+		return nil
+	}); err != nil {
+		return snapshot.SwitchToken, err
+	}
+	if err := p.hitESIMSwitchFailpoint(esimSwitchFailpointAfterTeardown); err != nil {
+		return snapshot.SwitchToken, err
+	}
+	return snapshot.SwitchToken, nil
+}
+
+func (p *Pool) validateESIMOperationLease(worker *Worker, lease *workerESIMOperationLease) error {
+	if p == nil || !lease.validFor(worker) {
+		return db.ErrESIMSwitchOperationStale
+	}
+	p.mu.RLock()
+	current := p.workers[worker.ID]
+	p.mu.RUnlock()
+	if current != worker || current.generation != lease.generation {
+		return db.ErrESIMSwitchOperationStale
+	}
+	return nil
+}
+
+func (p *Pool) storeESIMSwitchJournalSnapshot(deviceID string, snapshot esimSwitchContext) {
+	p.switchMu.Lock()
+	defer p.switchMu.Unlock()
+	if p.switchTokens[deviceID] != snapshot.SwitchToken {
+		return
+	}
+	current, ok := p.switchContexts[deviceID]
+	if !ok {
+		return
+	}
+	current.OperationID = snapshot.OperationID
+	current.OwnerEpoch = snapshot.OwnerEpoch
+	current.WorkerGeneration = snapshot.WorkerGeneration
+	current.JournalVersion = snapshot.JournalVersion
+	current.JournalPhase = snapshot.JournalPhase
+	p.switchContexts[deviceID] = current
+}
+
+func (p *Pool) transitionOwnedESIMSwitch(
+	deviceID string,
+	snapshot esimSwitchContext,
+	input db.TransitionESIMSwitchOperationInput,
+) (db.ESIMSwitchOperation, error) {
+	if p == nil || p.esimSwitchJournal == nil {
+		return db.ESIMSwitchOperation{}, db.ErrESIMSwitchJournalUnavailable
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	worker := p.workers[deviceID]
+	if worker == nil || worker.generation != snapshot.WorkerGeneration ||
+		strings.TrimSpace(snapshot.OwnerEpoch) == "" || snapshot.OwnerEpoch != p.ownerEpoch {
+		return db.ESIMSwitchOperation{}, db.ErrESIMSwitchOperationStale
+	}
+	return p.esimSwitchJournal.Transition(p.ctx, input)
+}
+
+func (p *Pool) prepareESIMSwitchPhysicalApply(deviceID string, token uint64) error {
+	if p == nil || strings.TrimSpace(deviceID) == "" || token == 0 || p.esimSwitchJournal == nil {
+		return db.ErrESIMSwitchOperationInvalid
+	}
+	p.switchMu.Lock()
+	snapshot, ok := p.switchContexts[deviceID]
+	currentToken := p.switchTokens[deviceID]
+	p.switchMu.Unlock()
+	if !ok || currentToken != token || snapshot.OperationID == "" || snapshot.OwnerEpoch == "" ||
+		snapshot.WorkerGeneration == 0 || snapshot.JournalVersion == 0 {
+		return db.ErrESIMSwitchOperationStale
+	}
+	updated, err := p.transitionOwnedESIMSwitch(deviceID, snapshot, db.TransitionESIMSwitchOperationInput{
+		OperationID:         snapshot.OperationID,
+		OwnerEpoch:          snapshot.OwnerEpoch,
+		WorkerGeneration:    snapshot.WorkerGeneration,
+		ExpectedPhase:       db.ESIMSwitchPhaseTeardownPlanned,
+		ExpectedVersion:     snapshot.JournalVersion,
+		NextPhase:           db.ESIMSwitchPhaseApplyPlanned,
+		NextAcceptanceState: db.ESIMSwitchAcceptanceUnknown,
+		Now:                 time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	snapshot.JournalVersion = updated.Version
+	snapshot.JournalPhase = updated.Phase
+	p.storeESIMSwitchJournalSnapshot(deviceID, snapshot)
+	return p.hitESIMSwitchFailpoint(esimSwitchFailpointAfterApplyPlanned)
+}
+
+func (p *Pool) markESIMSwitchAccepted(deviceID string, token uint64) error {
+	if p == nil || strings.TrimSpace(deviceID) == "" || token == 0 || p.esimSwitchJournal == nil {
+		return db.ErrESIMSwitchOperationInvalid
+	}
+	p.switchMu.Lock()
+	snapshot, ok := p.switchContexts[deviceID]
+	currentToken := p.switchTokens[deviceID]
+	p.switchMu.Unlock()
+	if !ok || currentToken != token || snapshot.OperationID == "" || snapshot.OwnerEpoch == "" ||
+		snapshot.WorkerGeneration == 0 || snapshot.JournalVersion == 0 {
+		return db.ErrESIMSwitchOperationStale
+	}
+	updated, err := p.transitionOwnedESIMSwitch(deviceID, snapshot, db.TransitionESIMSwitchOperationInput{
+		OperationID:         snapshot.OperationID,
+		OwnerEpoch:          snapshot.OwnerEpoch,
+		WorkerGeneration:    snapshot.WorkerGeneration,
+		ExpectedPhase:       db.ESIMSwitchPhaseApplyPlanned,
+		ExpectedVersion:     snapshot.JournalVersion,
+		NextPhase:           db.ESIMSwitchPhaseAccepted,
+		NextAcceptanceState: db.ESIMSwitchAcceptanceAccepted,
+		Now:                 time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	snapshot.JournalVersion = updated.Version
+	snapshot.JournalPhase = updated.Phase
+	p.storeESIMSwitchJournalSnapshot(deviceID, snapshot)
+	return p.hitESIMSwitchFailpoint(esimSwitchFailpointAfterAccepted)
+}
+
+func (p *Pool) beginESIMSwitchRecovery(deviceID string, token uint64) error {
+	if p == nil || strings.TrimSpace(deviceID) == "" || token == 0 || p.esimSwitchJournal == nil {
+		return db.ErrESIMSwitchOperationInvalid
+	}
+	p.switchMu.Lock()
+	snapshot, ok := p.switchContexts[deviceID]
+	currentToken := p.switchTokens[deviceID]
+	p.switchMu.Unlock()
+	if !ok || currentToken != token || snapshot.OperationID == "" ||
+		snapshot.JournalPhase != db.ESIMSwitchPhaseAccepted || snapshot.JournalVersion == 0 {
+		return db.ErrESIMSwitchOperationStale
+	}
+	updated, err := p.transitionOwnedESIMSwitch(deviceID, snapshot, db.TransitionESIMSwitchOperationInput{
+		OperationID:         snapshot.OperationID,
+		OwnerEpoch:          snapshot.OwnerEpoch,
+		WorkerGeneration:    snapshot.WorkerGeneration,
+		ExpectedPhase:       snapshot.JournalPhase,
+		ExpectedVersion:     snapshot.JournalVersion,
+		NextPhase:           db.ESIMSwitchPhaseRestoring,
+		NextAcceptanceState: db.ESIMSwitchAcceptanceAccepted,
+		Now:                 time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	snapshot.JournalVersion = updated.Version
+	snapshot.JournalPhase = updated.Phase
+	p.storeESIMSwitchJournalSnapshot(deviceID, snapshot)
+	return p.hitESIMSwitchFailpoint(esimSwitchFailpointDuringRecovery)
+}
+
+func (p *Pool) completeESIMSwitchRecovery(deviceID string, token uint64) error {
+	if p == nil || strings.TrimSpace(deviceID) == "" || token == 0 || p.esimSwitchJournal == nil {
+		return db.ErrESIMSwitchOperationInvalid
+	}
+	p.switchMu.Lock()
+	snapshot, ok := p.switchContexts[deviceID]
+	currentToken := p.switchTokens[deviceID]
+	p.switchMu.Unlock()
+	if !ok || currentToken != token || snapshot.OperationID == "" ||
+		snapshot.JournalPhase != db.ESIMSwitchPhaseRestoring || snapshot.JournalVersion == 0 {
+		return db.ErrESIMSwitchOperationStale
+	}
+	updated, err := p.transitionOwnedESIMSwitch(deviceID, snapshot, db.TransitionESIMSwitchOperationInput{
+		OperationID:         snapshot.OperationID,
+		OwnerEpoch:          snapshot.OwnerEpoch,
+		WorkerGeneration:    snapshot.WorkerGeneration,
+		ExpectedPhase:       snapshot.JournalPhase,
+		ExpectedVersion:     snapshot.JournalVersion,
+		NextPhase:           db.ESIMSwitchPhaseSucceeded,
+		NextAcceptanceState: db.ESIMSwitchAcceptanceAccepted,
+		Now:                 time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	snapshot.JournalVersion = updated.Version
+	snapshot.JournalPhase = updated.Phase
+	p.storeESIMSwitchJournalSnapshot(deviceID, snapshot)
+	return nil
 }
 
 func (p *Pool) markESIMSwitchPhase(deviceID string, phase esim.SwitchPhase) {
@@ -375,7 +701,16 @@ func (p *Pool) bringRadioOnlineAfterSwitch(deviceID string, worker *Worker, snap
 
 func (p *Pool) handleESIMSwitchBefore(deviceID string, targetICCID string) uint64 {
 	snapshot := p.beginESIMSwitch(deviceID, targetICCID)
-	if worker := p.GetWorker(deviceID); worker != nil {
+	p.performESIMSwitchTeardown(deviceID, snapshot)
+	return snapshot.SwitchToken
+}
+
+func (p *Pool) performESIMSwitchTeardown(deviceID string, snapshot esimSwitchContext) {
+	p.performESIMSwitchTeardownForWorker(deviceID, p.GetWorker(deviceID), snapshot)
+}
+
+func (p *Pool) performESIMSwitchTeardownForWorker(deviceID string, worker *Worker, snapshot esimSwitchContext) {
+	if worker != nil {
 		worker.markHealthRecoveryWindow(qmiHealthGraceAfterSwitch)
 		snapshot.IdentityGeneration = worker.BeginSIMIdentityTransition(snapshot.TargetICCID, "esim_switch_begin")
 		p.updateESIMSwitchIdentityGeneration(deviceID, snapshot.SwitchToken, snapshot.IdentityGeneration)
@@ -398,7 +733,7 @@ func (p *Pool) handleESIMSwitchBefore(deviceID string, targetICCID string) uint6
 	if err := p.voWiFiHost().SwitchBegin(context.Background(), deviceID); err != nil {
 		logger.Warn("切卡前注销 VoWiFi 隧道失败", "device", deviceID, "err", err)
 	}
-	if worker := p.GetWorker(deviceID); worker != nil && worker.QMICore != nil {
+	if worker != nil && worker.QMICore != nil {
 		if worker.Config.ESIMSwitch.RadioCycle {
 			releaseRadioBeforeSwitch(deviceID, worker)
 		}
@@ -408,10 +743,9 @@ func (p *Pool) handleESIMSwitchBefore(deviceID string, targetICCID string) uint6
 		if snap := worker.QMICore.GetDeviceSnapshot(); snap != nil {
 			snap.ResetIdentities(false)
 		}
-	} else if worker := p.GetWorker(deviceID); worker != nil && worker.Config.ESIMSwitch.RadioCycle {
+	} else if worker != nil && worker.Config.ESIMSwitch.RadioCycle {
 		releaseRadioBeforeSwitch(deviceID, worker)
 	}
-	return snapshot.SwitchToken
 }
 
 func (p *Pool) refreshPostSwitchIdentity(deviceID string, worker *Worker, snapshot esimSwitchContext) (bool, error) {
@@ -647,18 +981,42 @@ func (p *Pool) waitPostSwitchCoreReady(deviceID string, worker *Worker) {
 	logger.Info("切卡后控制面已就绪，开始恢复运行态", "device", deviceID)
 }
 
-func (p *Pool) newESIMSwitchCallbacks(deviceID string) (func(esim.SwitchOperation, string) uint64, func(uint64), func(uint64, error), func(uint64, esim.SwitchPhase, error), func(uint64, esim.SwitchPhase)) {
-	onBefore := func(operation esim.SwitchOperation, targetICCID string) uint64 {
-		if operation != esim.SwitchOperationEnableProfile {
-			targetICCID = ""
+func (p *Pool) newESIMSwitchCallbacks(deviceID string) (func(esim.SwitchOperation, string) (uint64, error), func(esim.SwitchOperation, uint64) error, func(esim.SwitchOperation, uint64) error, func(uint64), func(uint64, error), func(uint64, esim.SwitchPhase, error), func(uint64, esim.SwitchPhase)) {
+	worker := p.GetWorker(deviceID)
+	if worker == nil {
+		worker = &Worker{ID: deviceID}
+	}
+	return p.newESIMSwitchCallbacksForWorker(worker)
+}
+
+func (p *Pool) newESIMSwitchCallbacksForWorker(worker *Worker) (func(esim.SwitchOperation, string) (uint64, error), func(esim.SwitchOperation, uint64) error, func(esim.SwitchOperation, uint64) error, func(uint64), func(uint64, error), func(uint64, esim.SwitchPhase, error), func(uint64, esim.SwitchPhase)) {
+	deviceID := ""
+	if worker != nil {
+		deviceID = worker.ID
+	}
+	onBefore := func(operation esim.SwitchOperation, targetICCID string) (uint64, error) {
+		if operation == esim.SwitchOperationEnableProfile {
+			return p.beginDurableESIMSwitch(worker, targetICCID)
 		}
-		return p.handleESIMSwitchBefore(deviceID, targetICCID)
+		return p.handleESIMSwitchBefore(deviceID, ""), nil
+	}
+	onBeforePhysical := func(operation esim.SwitchOperation, token uint64) error {
+		if operation != esim.SwitchOperationEnableProfile {
+			return nil
+		}
+		return p.prepareESIMSwitchPhysicalApply(deviceID, token)
+	}
+	onAccepted := func(operation esim.SwitchOperation, token uint64) error {
+		if operation != esim.SwitchOperationEnableProfile {
+			return nil
+		}
+		return p.markESIMSwitchAccepted(deviceID, token)
 	}
 	onAfter := func(token uint64) {
 		p.handleESIMSwitchAfter(deviceID, token)
 	}
 	onFailed := func(token uint64, err error) {
-		p.handleESIMSwitchFailedWithError(deviceID, token, err)
+		p.handleESIMSwitchFailedWithErrorForWorker(worker, token, err)
 	}
 	onDegraded := func(token uint64, phase esim.SwitchPhase, err error) {
 		p.handleESIMSwitchDegradedWithError(deviceID, token, phase, err)
@@ -666,7 +1024,7 @@ func (p *Pool) newESIMSwitchCallbacks(deviceID string) (func(esim.SwitchOperatio
 	onPhase := func(token uint64, phase esim.SwitchPhase) {
 		p.markESIMSwitchPhaseIfToken(deviceID, token, phase)
 	}
-	return onBefore, onAfter, onFailed, onDegraded, onPhase
+	return onBefore, onBeforePhysical, onAccepted, onAfter, onFailed, onDegraded, onPhase
 }
 
 func normalizeSIMIdentity(v string) string {
@@ -1009,11 +1367,18 @@ func (p *Pool) restoreRadioDataForSwitchSnapshot(deviceID string, worker *Worker
 }
 
 func (p *Pool) handleESIMSwitchFailed(deviceID string, token uint64) {
+	p.handleESIMSwitchFailedForWorker(deviceID, token, p.GetWorker(deviceID))
+}
+
+func (p *Pool) handleESIMSwitchFailedForWorker(deviceID string, token uint64, worker *Worker) {
 	snapshot, ok := p.finishESIMSwitchForFailure(deviceID, token)
 	if !ok {
 		return
 	}
-	worker := p.GetWorker(deviceID)
+	if snapshot.OperationID != "" && snapshot.JournalPhase == db.ESIMSwitchPhaseFailedBeforePhysicalApply {
+		p.broadcastVoWiFiStateChange(deviceID)
+		return
+	}
 	if worker == nil {
 		logger.Warn("eSIM 切卡失败收尾：设备不存在，已清理切卡状态", "device", deviceID)
 		return
@@ -1029,8 +1394,105 @@ func (p *Pool) handleESIMSwitchFailed(deviceID string, token uint64) {
 	p.broadcastVoWiFiStateChange(deviceID)
 }
 
-func (p *Pool) handleESIMSwitchFailedWithError(deviceID string, token uint64, err error) {
-	p.handleESIMSwitchFailed(deviceID, token)
+func (p *Pool) handleESIMSwitchFailedWithError(deviceID string, token uint64, _ error) {
+	worker := p.GetWorker(deviceID)
+	if worker == nil {
+		if err := p.persistESIMSwitchFailure(deviceID, token); err != nil {
+			return
+		}
+		p.handleESIMSwitchFailedForWorker(deviceID, token, nil)
+		return
+	}
+	p.handleESIMSwitchFailedWithErrorForWorker(worker, token, nil)
+}
+
+func (p *Pool) handleESIMSwitchFailedWithErrorForWorker(worker *Worker, token uint64, _ error) {
+	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
+		return
+	}
+	deviceID := worker.ID
+	p.switchMu.Lock()
+	snapshot, ok := p.switchContexts[deviceID]
+	currentToken := p.switchTokens[deviceID]
+	p.switchMu.Unlock()
+	var operationLease *workerESIMOperationLease
+	if ok && currentToken == token && snapshot.OperationID != "" {
+		if worker.generation == 0 || worker.generation != snapshot.WorkerGeneration {
+			return
+		}
+		var acquired bool
+		operationLease, acquired = worker.acquireESIMOperationLease(p.ctx)
+		if !acquired {
+			return
+		}
+		defer operationLease.Release()
+	}
+	if err := p.persistESIMSwitchFailure(deviceID, token); err != nil {
+		return
+	}
+	if err := p.hitESIMSwitchFailpoint(esimSwitchFailpointAfterFailurePersisted); err != nil {
+		return
+	}
+	if operationLease != nil {
+		if err := operationLease.RunPhysical(func() error {
+			return p.validateESIMOperationLease(worker, operationLease)
+		}); err != nil {
+			return
+		}
+	}
+	p.handleESIMSwitchFailedForWorker(deviceID, token, worker)
+}
+
+func (p *Pool) persistESIMSwitchFailure(deviceID string, token uint64) error {
+	if p == nil || token == 0 || p.esimSwitchJournal == nil {
+		return nil
+	}
+	p.switchMu.Lock()
+	snapshot, ok := p.switchContexts[deviceID]
+	currentToken := p.switchTokens[deviceID]
+	p.switchMu.Unlock()
+	if !ok || currentToken != token || snapshot.OperationID == "" || snapshot.JournalVersion == 0 {
+		return nil
+	}
+	nextPhase := db.ESIMSwitchPhaseNeedsReconciliation
+	acceptance := db.ESIMSwitchAcceptanceUnknown
+	errorCode := db.ESIMSwitchErrorApplyUnknown
+	switch snapshot.JournalPhase {
+	case db.ESIMSwitchPhaseIntentPersisted:
+		nextPhase = db.ESIMSwitchPhaseFailedBeforePhysicalApply
+		errorCode = db.ESIMSwitchErrorJournalWrite
+	case db.ESIMSwitchPhaseTeardownPlanned:
+		errorCode = db.ESIMSwitchErrorTeardown
+	case db.ESIMSwitchPhaseApplyPlanned:
+		errorCode = db.ESIMSwitchErrorApplyUnknown
+	case db.ESIMSwitchPhaseAccepted, db.ESIMSwitchPhaseRestoring:
+		acceptance = db.ESIMSwitchAcceptanceAccepted
+		errorCode = db.ESIMSwitchErrorRecovery
+	case db.ESIMSwitchPhaseNeedsReconciliation,
+		db.ESIMSwitchPhaseFailedBeforePhysicalApply,
+		db.ESIMSwitchPhaseSucceeded:
+		return db.ErrESIMSwitchOperationStale
+	default:
+		return db.ErrESIMSwitchOperationInvalid
+	}
+	updated, transitionErr := p.transitionOwnedESIMSwitch(deviceID, snapshot, db.TransitionESIMSwitchOperationInput{
+		OperationID:         snapshot.OperationID,
+		OwnerEpoch:          snapshot.OwnerEpoch,
+		WorkerGeneration:    snapshot.WorkerGeneration,
+		ExpectedPhase:       snapshot.JournalPhase,
+		ExpectedVersion:     snapshot.JournalVersion,
+		NextPhase:           nextPhase,
+		NextAcceptanceState: acceptance,
+		ErrorCode:           errorCode,
+		Now:                 time.Now().UTC(),
+	})
+	if transitionErr != nil {
+		return transitionErr
+	}
+	snapshot.JournalVersion = updated.Version
+	snapshot.JournalPhase = updated.Phase
+	p.storeESIMSwitchJournalSnapshot(deviceID, snapshot)
+	return nil
 }
 
 func (p *Pool) handleESIMSwitchDegradedWithError(deviceID string, token uint64, phase esim.SwitchPhase, err error) {
@@ -1083,6 +1545,30 @@ func (p *Pool) handleESIMSwitchAfter(deviceID string, token uint64) {
 	if !ok {
 		return
 	}
+	worker := p.GetWorker(deviceID)
+	if worker == nil {
+		p.markESIMSwitchPhaseIfToken(deviceID, token, esim.SwitchPhaseFailed)
+		logger.Warn("切卡后恢复失败：设备不存在", "device", deviceID)
+		return
+	}
+	if snapshot.OperationID != "" {
+		if worker.generation == 0 || worker.generation != snapshot.WorkerGeneration {
+			return
+		}
+		operationLease, acquired := worker.acquireESIMOperationLease(p.ctx)
+		if !acquired {
+			return
+		}
+		defer operationLease.Release()
+		if err := p.beginESIMSwitchRecovery(deviceID, token); err != nil {
+			return
+		}
+		if err := operationLease.RunPhysical(func() error {
+			return p.validateESIMOperationLease(worker, operationLease)
+		}); err != nil {
+			return
+		}
+	}
 	defer func() {
 		if snapshot.SwitchToken != 0 {
 			p.clearESIMSwitchIfToken(deviceID, snapshot.SwitchToken)
@@ -1093,16 +1579,15 @@ func (p *Pool) handleESIMSwitchAfter(deviceID string, token uint64) {
 	finalizeOK := false
 	defer func() {
 		if finalizeOK {
+			if snapshot.OperationID != "" {
+				if err := p.completeESIMSwitchRecovery(deviceID, token); err != nil {
+					return
+				}
+			}
 			p.markESIMSwitchPhaseIfToken(deviceID, token, esim.SwitchPhaseDone)
 		}
 	}()
 
-	worker := p.GetWorker(deviceID)
-	if worker == nil {
-		p.markESIMSwitchPhaseIfToken(deviceID, token, esim.SwitchPhaseFailed)
-		logger.Warn("切卡后恢复失败：设备不存在", "device", deviceID)
-		return
-	}
 	snapshot.IdentityGeneration = worker.EnsureSIMIdentityTransition(snapshot.TargetICCID, "post_switch_finalize")
 	p.updateESIMSwitchIdentityGeneration(deviceID, snapshot.SwitchToken, snapshot.IdentityGeneration)
 	p.broadcastVoWiFiStateChange(deviceID)

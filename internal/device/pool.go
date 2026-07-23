@@ -106,13 +106,14 @@ type Worker struct {
 	qmiSMS      qmiSMSCore
 	// ESIMQMITransport 仅在未创建共享 QMI Core、但 eSIM 仍需走 QMI transport 时使用。
 	// 复用 QMICore/QMI Core 场景下为 nil。
-	ESIMQMITransport esim.QMIAPDUTransportLifecycle
-	Proxy            *server.Server
-	Pool             *Pool
-	EsimMgr          *esim.Manager
-	CSCallMgr        *cscall.Manager
-	stop             chan struct{}
-	stopOnce         sync.Once
+	ESIMQMITransport   esim.QMIAPDUTransportLifecycle
+	Proxy              *server.Server
+	Pool               *Pool
+	EsimMgr            *esim.Manager
+	CSCallMgr          *cscall.Manager
+	stop               chan struct{}
+	stopOnce           sync.Once
+	esimOperationOwner workerESIMOperationOwner
 
 	cachedIP            string
 	cachedPublicIPv6    string
@@ -202,11 +203,14 @@ type Pool struct {
 	deviceEventWakeMu  sync.Mutex
 	deviceEventWakeups map[string]*deviceEventRecoverWakeup
 
-	switchMu         sync.Mutex
-	switchingDevices map[string]bool
-	switchContexts   map[string]esimSwitchContext
-	switchTokens     map[string]uint64
-	switchSeq        uint64
+	switchMu            sync.Mutex
+	switchingDevices    map[string]bool
+	switchContexts      map[string]esimSwitchContext
+	switchTokens        map[string]uint64
+	switchSeq           uint64
+	esimSwitchJournal   esimSwitchJournalStore
+	ownerEpoch          string
+	esimSwitchFailpoint func(esimSwitchFailpoint) error
 
 	// 概览监控页面流定阅数统计
 	overviewSubs atomic.Int32
@@ -228,6 +232,7 @@ func NewPoolWithContext(parent context.Context, cfg *config.Config) *Pool {
 	ctx, cancel := context.WithCancel(parent)
 	backgroundIdle := make(chan struct{})
 	close(backgroundIdle)
+	ownerEpoch, _ := newESIMSwitchOpaqueID()
 	p := &Pool{
 		workers:               make(map[string]*Worker),
 		rebuilding:            make(map[string]bool),
@@ -246,6 +251,8 @@ func NewPoolWithContext(parent context.Context, cfg *config.Config) *Pool {
 		switchingDevices:      make(map[string]bool),
 		switchContexts:        make(map[string]esimSwitchContext),
 		switchTokens:          make(map[string]uint64),
+		esimSwitchJournal:     db.NewESIMSwitchJournalStore(db.DB),
+		ownerEpoch:            ownerEpoch,
 		lifecycle:             newLifecycleCoordinator(),
 	}
 	p.transportRecovery = NewTransportRecoveryController(p)
@@ -1086,17 +1093,19 @@ func (p *Pool) RemoveWorker(deviceID string) error {
 		}()
 	}
 
-	// 移除 Worker 时，使当前设备的 VoWiFi 运行态失效，防止未完成的旧启动例程回写状态
-	p.voWiFiHost().InvalidateRuntime(deviceID, "remove_worker")
-	if p.stopVoWiFiAppForTeardown(p.ctx, deviceID, "remove") {
-		logger.Info("设备移除时强制关闭并清理残留的 VoWiFi 实例", "device", deviceID)
-	}
-
+	esimOperationsIdle := worker.stopESIMOperationLeases(p.ctx)
 	worker.stopOnce.Do(func() {
 		if worker.stop != nil {
 			close(worker.stop)
 		}
 	})
+	<-esimOperationsIdle
+
+	// 移除 Worker 时，使当前设备的 VoWiFi 运行态失效，防止未完成的旧启动例程回写状态
+	p.voWiFiHost().InvalidateRuntime(deviceID, "remove_worker")
+	if p.stopVoWiFiAppForTeardown(p.ctx, deviceID, "remove") {
+		logger.Info("设备移除时强制关闭并清理残留的 VoWiFi 实例", "device", deviceID)
+	}
 
 	if worker.publicIPRetryTimer != nil {
 		worker.publicIPRetryTimer.Stop()
@@ -1653,8 +1662,8 @@ func (p *Pool) startAllSynchronousLegacy() error {
 			continue
 		}
 		w.Backend = be
-		onBeforeSwitch, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase := p.newESIMSwitchCallbacks(devCfg.ID)
-		w.EsimMgr, err = newESIMManagerForWorker(w, qmiTransport, onBeforeSwitch, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase)
+		onBeforeSwitch, onBeforePhysicalApply, onSwitchAccepted, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase := p.newESIMSwitchCallbacksForWorker(w)
+		w.EsimMgr, err = newESIMManagerForWorker(w, qmiTransport, onBeforeSwitch, onBeforePhysicalApply, onSwitchAccepted, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("设备 %s 的 eSIM 管理器初始化失败: %w", devCfg.ID, err)
@@ -1804,6 +1813,7 @@ func (p *Pool) startAllSynchronousLegacy() error {
 			p.workers[devCfg.ID] = w
 		}
 		w.uimIndicationsReady.Store(true)
+		p.scheduleESIMSwitchReconciliation(w)
 		p.scheduleATRadioWarmup(w, "startup")
 
 		go func(worker *Worker) {
@@ -2480,7 +2490,9 @@ func configureWorkerAPDUArbiter(w *Worker, qmiTransport esim.QMIAPDUTransport) {
 func newESIMManagerForWorker(
 	w *Worker,
 	qmiTransport esim.QMIAPDUTransport,
-	onBefore func(esim.SwitchOperation, string) uint64,
+	onBefore func(esim.SwitchOperation, string) (uint64, error),
+	onBeforePhysical func(esim.SwitchOperation, uint64) error,
+	onAccepted func(esim.SwitchOperation, uint64) error,
 	onAfter func(uint64),
 	onFailed func(uint64, error),
 	onDegraded func(uint64, esim.SwitchPhase, error),
@@ -2490,9 +2502,9 @@ func newESIMManagerForWorker(
 		return nil, fmt.Errorf("worker 不能为空")
 	}
 
-	var beforeWithOperation func(esim.SwitchOperation, string) uint64
+	var beforeWithOperation func(esim.SwitchOperation, string) (uint64, error)
 	if onBefore != nil {
-		beforeWithOperation = func(operation esim.SwitchOperation, targetICCID string) uint64 {
+		beforeWithOperation = func(operation esim.SwitchOperation, targetICCID string) (uint64, error) {
 			return onBefore(operation, targetICCID)
 		}
 	}
@@ -2522,12 +2534,21 @@ func newESIMManagerForWorker(
 	}
 
 	mgr, err := esim.NewManager(esim.ManagerOptions{
-		DeviceID:             w.Config.ID,
-		Transport:            resolveESIMTransport(w.Config, qmiTransport != nil),
-		Modem:                w.Modem,
-		Backend:              w.Backend,
-		QMITransport:         qmiTransport,
-		OnBeforeSwitch:       beforeWithOperation,
+		DeviceID:              w.Config.ID,
+		Transport:             resolveESIMTransport(w.Config, qmiTransport != nil),
+		Modem:                 w.Modem,
+		Backend:               w.Backend,
+		QMITransport:          qmiTransport,
+		OnBeforeSwitch:        beforeWithOperation,
+		AcquireSwitchLease:    w.acquireESIMManagerSwitchLease,
+		OnBeforePhysicalApply: onBeforePhysical,
+		OnAfterPhysicalApply: func(_ esim.SwitchOperation, _ uint64, _ error) error {
+			if w.Pool == nil {
+				return nil
+			}
+			return w.Pool.hitESIMSwitchFailpoint(esimSwitchFailpointAfterPhysicalApply)
+		},
+		OnSwitchAccepted:     onAccepted,
 		OnAfterSwitch:        afterWithOperation,
 		OnSwitchFailed:       failedWithOperation,
 		OnSwitchDegraded:     degradedWithOperation,
@@ -2794,6 +2815,28 @@ func (p *Pool) finishShutdown(backgroundIdle <-chan struct{}, done chan struct{}
 	if backgroundIdle != nil {
 		<-backgroundIdle
 	}
+	p.mu.RLock()
+	workers := make([]*Worker, 0, len(p.workers))
+	for _, worker := range p.workers {
+		workers = append(workers, worker)
+	}
+	p.mu.RUnlock()
+
+	esimOperationIdle := make([]<-chan struct{}, 0, len(workers))
+	for _, worker := range workers {
+		if worker == nil {
+			continue
+		}
+		esimOperationIdle = append(esimOperationIdle, worker.stopESIMOperationLeases(p.ctx))
+		worker.stopOnce.Do(func() {
+			if worker.stop != nil {
+				close(worker.stop)
+			}
+		})
+	}
+	for _, idle := range esimOperationIdle {
+		<-idle
+	}
 
 	// 先关闭所有 VoWiFi 应用实例（确保 XFRMI 接口和 SA/SP 被清理）。
 	for _, devID := range p.voWiFiHost().InstanceIDs() {
@@ -2802,13 +2845,6 @@ func (p *Pool) finishShutdown(backgroundIdle <-chan struct{}, done chan struct{}
 		_ = p.stopVoWiFiAppForTeardown(stopCtx, devID, "shutdown")
 		cancel()
 	}
-
-	p.mu.RLock()
-	workers := make([]*Worker, 0, len(p.workers))
-	for _, worker := range p.workers {
-		workers = append(workers, worker)
-	}
-	p.mu.RUnlock()
 
 	var wg sync.WaitGroup
 	for _, worker := range workers {

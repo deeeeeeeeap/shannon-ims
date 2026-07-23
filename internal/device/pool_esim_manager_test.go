@@ -35,7 +35,7 @@ func TestNewESIMManagerForWorkerRequiresBackend(t *testing.T) {
 		Modem:  newWorkerModemWithIMEI(t, "modem-imei"),
 	}
 
-	_, err := newESIMManagerForWorker(worker, nil, nil, nil, nil, nil, nil)
+	_, err := newESIMManagerForWorker(worker, nil, nil, nil, nil, nil, nil, nil, nil)
 	if err == nil || err.Error() != "AT 传输需要 device backend" {
 		t.Fatalf("newESIMManagerForWorker() error = %v, want %q", err, "AT 传输需要 device backend")
 	}
@@ -51,7 +51,7 @@ func TestNewESIMManagerForWorkerAT(t *testing.T) {
 		},
 	}
 
-	mgr, err := newESIMManagerForWorker(worker, nil, nil, nil, nil, nil, nil)
+	mgr, err := newESIMManagerForWorker(worker, nil, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newESIMManagerForWorker() error = %v", err)
 	}
@@ -70,7 +70,7 @@ func TestNewESIMManagerForWorkerQMI(t *testing.T) {
 		},
 	}
 
-	mgr, err := newESIMManagerForWorker(worker, &esimManagerQMITransportStub{controlDevice: "/dev/cdc-wdm0"}, nil, nil, nil, nil, nil)
+	mgr, err := newESIMManagerForWorker(worker, &esimManagerQMITransportStub{controlDevice: "/dev/cdc-wdm0"}, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newESIMManagerForWorker() error = %v", err)
 	}
@@ -126,7 +126,7 @@ func TestNewESIMManagerForWorkerUsesStaticAIDTraversal(t *testing.T) {
 		},
 	}
 
-	mgr, err := newESIMManagerForWorker(worker, transport, nil, nil, nil, nil, nil)
+	mgr, err := newESIMManagerForWorker(worker, transport, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newESIMManagerForWorker() error=%v", err)
 	}

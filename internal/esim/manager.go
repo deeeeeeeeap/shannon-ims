@@ -296,13 +296,17 @@ type Manager struct {
 	discoveredEUICCs            []EUICCInfo
 	sf                          *singleflight.Group
 
-	onBeforeSwitch       func(SwitchOperation, string) uint64              // 切卡前执行的回调，返回本次 switch token
-	onAfterSwitch        func(SwitchOperation, uint64)                     // 切卡后网络就绪后执行的回调
-	onSwitchFailed       func(SwitchOperation, uint64, error)              // 切卡失败后执行的回调
-	onSwitchDegraded     func(SwitchOperation, uint64, SwitchPhase, error) // 切卡已接受但后处理降级回调
-	onSwitchPhase        func(SwitchOperation, uint64, SwitchPhase)        // 切卡内部阶段变更回调
-	switchSignal         chan string
-	switchUseRefreshTrue bool
+	onBeforeSwitch        func(SwitchOperation, string) (uint64, error) // 切卡前执行的回调，持久化失败时阻止后续物理操作
+	acquireSwitchLease    func(context.Context) (SwitchOperationLease, error)
+	onBeforePhysicalApply func(SwitchOperation, uint64) error               // EnableProfile 前提交 write-ahead phase
+	onAfterPhysicalApply  func(SwitchOperation, uint64, error) error        // EnableProfile 返回后、acceptance 前的 crash 边界
+	onSwitchAccepted      func(SwitchOperation, uint64) error               // 卡片明确接受后、恢复前提交 acceptance
+	onAfterSwitch         func(SwitchOperation, uint64)                     // 切卡后网络就绪后执行的回调
+	onSwitchFailed        func(SwitchOperation, uint64, error)              // 切卡失败后执行的回调
+	onSwitchDegraded      func(SwitchOperation, uint64, SwitchPhase, error) // 切卡已接受但后处理降级回调
+	onSwitchPhase         func(SwitchOperation, uint64, SwitchPhase)        // 切卡内部阶段变更回调
+	switchSignal          chan string
+	switchUseRefreshTrue  bool
 
 	apduArbiter          apduIdleWaiter
 	postSwitchMinDelay   time.Duration
@@ -319,23 +323,35 @@ type Manager struct {
 var ErrOperationInProgress = fmt.Errorf("eSIM 操作进行中，请稍后重试")
 
 type ManagerOptions struct {
-	DeviceID             string
-	Transport            string
-	Modem                *modem.Manager
-	Backend              backendpkg.DeviceBackend
-	QMITransport         QMIAPDUTransport
-	IMEIProvider         func(ctx context.Context) (string, error)
-	OnBeforeSwitch       func(SwitchOperation, string) uint64
-	OnAfterSwitch        func(SwitchOperation, uint64)
-	OnSwitchFailed       func(SwitchOperation, uint64, error)
-	OnSwitchDegraded     func(SwitchOperation, uint64, SwitchPhase, error)
-	OnSwitchPhase        func(SwitchOperation, uint64, SwitchPhase)
-	APDUArbiter          *apduarbiter.Arbiter
-	PostSwitchMinDelay   time.Duration
-	SwitchUseRefreshTrue bool
+	DeviceID              string
+	Transport             string
+	Modem                 *modem.Manager
+	Backend               backendpkg.DeviceBackend
+	QMITransport          QMIAPDUTransport
+	IMEIProvider          func(ctx context.Context) (string, error)
+	OnBeforeSwitch        func(SwitchOperation, string) (uint64, error)
+	AcquireSwitchLease    func(context.Context) (SwitchOperationLease, error)
+	OnBeforePhysicalApply func(SwitchOperation, uint64) error
+	OnAfterPhysicalApply  func(SwitchOperation, uint64, error) error
+	OnSwitchAccepted      func(SwitchOperation, uint64) error
+	OnAfterSwitch         func(SwitchOperation, uint64)
+	OnSwitchFailed        func(SwitchOperation, uint64, error)
+	OnSwitchDegraded      func(SwitchOperation, uint64, SwitchPhase, error)
+	OnSwitchPhase         func(SwitchOperation, uint64, SwitchPhase)
+	APDUArbiter           *apduarbiter.Arbiter
+	PostSwitchMinDelay    time.Duration
+	SwitchUseRefreshTrue  bool
 }
 
 type SwitchOperation string
+
+// SwitchOperationLease keeps a switch bound to the Worker generation that
+// acquired it. RunPhysical linearizes a destructive action against Worker
+// removal; Release lets removal join the operation before closing transports.
+type SwitchOperationLease interface {
+	RunPhysical(func() error) error
+	Release()
+}
 
 const (
 	SwitchOperationEnableProfile  SwitchOperation = "enable_profile"
@@ -461,23 +477,27 @@ func newLPAClientWithChannel(ch driver.SmartCardChannel, aid []byte) (*lpa.Clien
 func NewManager(opts ManagerOptions) (*Manager, error) {
 	transport := normalizeTransport(opts.Transport)
 	mgr := &Manager{
-		modem:                opts.Modem,
-		backend:              opts.Backend,
-		deviceID:             opts.DeviceID,
-		transport:            transport,
-		sf:                   &singleflight.Group{},
-		imeiProvider:         opts.IMEIProvider,
-		onBeforeSwitch:       opts.OnBeforeSwitch,
-		onAfterSwitch:        opts.OnAfterSwitch,
-		onSwitchFailed:       opts.OnSwitchFailed,
-		onSwitchDegraded:     opts.OnSwitchDegraded,
-		onSwitchPhase:        opts.OnSwitchPhase,
-		switchSignal:         make(chan string, 16),
-		switchUseRefreshTrue: opts.SwitchUseRefreshTrue,
-		opDone:               make(chan struct{}),
-		apduArbiter:          opts.APDUArbiter,
-		postSwitchMinDelay:   defaultPostSwitchMinDelay,
-		readQueueWaitTimeout: defaultReadQueueWaitTimeout,
+		modem:                 opts.Modem,
+		backend:               opts.Backend,
+		deviceID:              opts.DeviceID,
+		transport:             transport,
+		sf:                    &singleflight.Group{},
+		imeiProvider:          opts.IMEIProvider,
+		onBeforeSwitch:        opts.OnBeforeSwitch,
+		acquireSwitchLease:    opts.AcquireSwitchLease,
+		onBeforePhysicalApply: opts.OnBeforePhysicalApply,
+		onAfterPhysicalApply:  opts.OnAfterPhysicalApply,
+		onSwitchAccepted:      opts.OnSwitchAccepted,
+		onAfterSwitch:         opts.OnAfterSwitch,
+		onSwitchFailed:        opts.OnSwitchFailed,
+		onSwitchDegraded:      opts.OnSwitchDegraded,
+		onSwitchPhase:         opts.OnSwitchPhase,
+		switchSignal:          make(chan string, 16),
+		switchUseRefreshTrue:  opts.SwitchUseRefreshTrue,
+		opDone:                make(chan struct{}),
+		apduArbiter:           opts.APDUArbiter,
+		postSwitchMinDelay:    defaultPostSwitchMinDelay,
+		readQueueWaitTimeout:  defaultReadQueueWaitTimeout,
 	}
 	if opts.PostSwitchMinDelay > 0 {
 		mgr.postSwitchMinDelay = opts.PostSwitchMinDelay
@@ -538,11 +558,15 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 }
 
 type ChannelFactorySwitchCallbacks struct {
-	OnBeforeSwitch   func(SwitchOperation, string) uint64
-	OnAfterSwitch    func(SwitchOperation, uint64)
-	OnSwitchFailed   func(SwitchOperation, uint64, error)
-	OnSwitchDegraded func(SwitchOperation, uint64, SwitchPhase, error)
-	OnSwitchPhase    func(SwitchOperation, uint64, SwitchPhase)
+	OnBeforeSwitch        func(SwitchOperation, string) (uint64, error)
+	AcquireSwitchLease    func(context.Context) (SwitchOperationLease, error)
+	OnBeforePhysicalApply func(SwitchOperation, uint64) error
+	OnAfterPhysicalApply  func(SwitchOperation, uint64, error) error
+	OnSwitchAccepted      func(SwitchOperation, uint64) error
+	OnAfterSwitch         func(SwitchOperation, uint64)
+	OnSwitchFailed        func(SwitchOperation, uint64, error)
+	OnSwitchDegraded      func(SwitchOperation, uint64, SwitchPhase, error)
+	OnSwitchPhase         func(SwitchOperation, uint64, SwitchPhase)
 }
 
 // NewManagerWithChannelFactoryCallbacks 创建 eSIM 管理器（通用模式，支持 PC/SC 等任意通道），
@@ -554,20 +578,24 @@ func NewManagerWithChannelFactoryCallbacks(
 	callbacks ChannelFactorySwitchCallbacks,
 ) *Manager {
 	mgr := &Manager{
-		deviceID:             deviceID,
-		transport:            transportCustom,
-		channelFactory:       channelFactory,
-		clearChannels:        clearFn,
-		sf:                   &singleflight.Group{},
-		onBeforeSwitch:       callbacks.OnBeforeSwitch,
-		onAfterSwitch:        callbacks.OnAfterSwitch,
-		onSwitchFailed:       callbacks.OnSwitchFailed,
-		onSwitchDegraded:     callbacks.OnSwitchDegraded,
-		onSwitchPhase:        callbacks.OnSwitchPhase,
-		switchSignal:         make(chan string, 16),
-		opDone:               make(chan struct{}),
-		postSwitchMinDelay:   defaultPostSwitchMinDelay,
-		readQueueWaitTimeout: defaultReadQueueWaitTimeout,
+		deviceID:              deviceID,
+		transport:             transportCustom,
+		channelFactory:        channelFactory,
+		clearChannels:         clearFn,
+		sf:                    &singleflight.Group{},
+		onBeforeSwitch:        callbacks.OnBeforeSwitch,
+		acquireSwitchLease:    callbacks.AcquireSwitchLease,
+		onBeforePhysicalApply: callbacks.OnBeforePhysicalApply,
+		onAfterPhysicalApply:  callbacks.OnAfterPhysicalApply,
+		onSwitchAccepted:      callbacks.OnSwitchAccepted,
+		onAfterSwitch:         callbacks.OnAfterSwitch,
+		onSwitchFailed:        callbacks.OnSwitchFailed,
+		onSwitchDegraded:      callbacks.OnSwitchDegraded,
+		onSwitchPhase:         callbacks.OnSwitchPhase,
+		switchSignal:          make(chan string, 16),
+		opDone:                make(chan struct{}),
+		postSwitchMinDelay:    defaultPostSwitchMinDelay,
+		readQueueWaitTimeout:  defaultReadQueueWaitTimeout,
 	}
 	mgr.overviewLoader = mgr.loadOverviewFresh
 	mgr.profilesLoader = mgr.loadProfilesFresh
@@ -583,11 +611,11 @@ func NewManagerWithChannelFactory(
 	onBefore func(),
 	onAfter func(),
 ) *Manager {
-	var beforeWithToken func(SwitchOperation, string) uint64
+	var beforeWithToken func(SwitchOperation, string) (uint64, error)
 	if onBefore != nil {
-		beforeWithToken = func(SwitchOperation, string) uint64 {
+		beforeWithToken = func(SwitchOperation, string) (uint64, error) {
 			onBefore()
-			return 0
+			return 0, nil
 		}
 	}
 	var afterWithToken func(SwitchOperation, uint64)
@@ -2595,6 +2623,17 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 	if err != nil {
 		return result, fmt.Errorf("无效的 ICCID %q: %w", targetICCID, err)
 	}
+	var operationLease SwitchOperationLease
+	if m.acquireSwitchLease != nil {
+		operationLease, err = m.acquireSwitchLease(ctx)
+		if err != nil {
+			return result, err
+		}
+		if operationLease == nil {
+			return result, fmt.Errorf("eSIM switch operation lease unavailable")
+		}
+		defer operationLease.Release()
+	}
 	m.drainSwitchSignals()
 
 	// 1. 查找 ICCID 所属的 eUICC
@@ -2633,7 +2672,12 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 
 	// 触发切卡前的回调（通常用于主动断开 VoWiFi 防冲突）
 	if m.onBeforeSwitch != nil {
-		switchToken = m.onBeforeSwitch(operation, targetICCID)
+		switchToken, err = m.onBeforeSwitch(operation, targetICCID)
+		if err != nil {
+			switchStarted = switchToken != 0
+			switchFailureErr = err
+			return result, err
+		}
 		switchStarted = true
 	}
 	result.SwitchToken = switchToken
@@ -2657,6 +2701,12 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 		switchFailureErr = err
 		return result, fmt.Errorf("等待切卡 APDU barrier 失败: %w", err)
 	}
+	if m.onBeforePhysicalApply != nil {
+		if err := m.onBeforePhysicalApply(operation, switchToken); err != nil {
+			switchFailureErr = err
+			return result, err
+		}
+	}
 
 	// refresh flag 由配置控制；refresh=true 可能立即触发 UIM refresh/slot indication，
 	// 必须在发 APDU 前抑制自动 overview reload。
@@ -2670,7 +2720,19 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 	var enableErr error
 	const maxCatBusyRetries = 3
 	for attempt := 0; attempt <= maxCatBusyRetries; attempt++ {
-		enableErr = client.EnableProfile(iccid, m.switchUseRefreshTrue)
+		apply := func() error {
+			if ctx != nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			return client.EnableProfile(iccid, m.switchUseRefreshTrue)
+		}
+		if operationLease != nil {
+			enableErr = operationLease.RunPhysical(apply)
+		} else {
+			enableErr = apply()
+		}
 		if enableErr == nil || !errors.Is(enableErr, sgp22.ErrCatBusy) {
 			break
 		}
@@ -2680,6 +2742,12 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 				"target", targetICCID,
 				"attempt", fmt.Sprintf("%d/%d", attempt+1, maxCatBusyRetries))
 			time.Sleep(800 * time.Millisecond)
+		}
+	}
+	if m.onAfterPhysicalApply != nil {
+		if err := m.onAfterPhysicalApply(operation, switchToken, enableErr); err != nil {
+			switchFailureErr = err
+			return result, err
 		}
 	}
 
@@ -2695,6 +2763,12 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 	if enableErr != nil && !isExpectedCardResetSignal(enableErr) {
 		switchFailureErr = enableErr
 		if err := m.finalizeEnableProfileResult(targetICCID, enableErr); err != nil {
+			return result, err
+		}
+	}
+	if m.onSwitchAccepted != nil {
+		if err := m.onSwitchAccepted(operation, switchToken); err != nil {
+			switchFailureErr = err
 			return result, err
 		}
 	}
@@ -2771,7 +2845,12 @@ func (m *Manager) DisableProfile(ctx context.Context, targetICCID string, aidHex
 		"AID", fmt.Sprintf("%X", targetAID))
 
 	if m.onBeforeSwitch != nil {
-		switchToken = m.onBeforeSwitch(operation, "")
+		switchToken, err = m.onBeforeSwitch(operation, "")
+		if err != nil {
+			disableStarted = switchToken != 0
+			switchFailureErr = err
+			return err
+		}
 		disableStarted = true
 	}
 	m.emitSwitchPhase(operation, switchToken, SwitchPhaseAPDUSwitching)

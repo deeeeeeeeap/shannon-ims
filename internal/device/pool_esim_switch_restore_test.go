@@ -30,6 +30,8 @@ type esimSwitchRestoreBackendStub struct {
 	getMode             backend.OperatingMode
 	setCalls            []backend.OperatingMode
 	liveICCID           string
+	liveICCIDErr        error
+	liveICCIDCalls      int
 	liveIMSI            string
 	liveSPN             string
 	liveSPNErr          error
@@ -150,6 +152,10 @@ func (s *esimSwitchRestoreBackendStub) GetIMSILive(ctx context.Context) (string,
 	return s.GetIMSI(ctx)
 }
 func (s *esimSwitchRestoreBackendStub) GetICCID(ctx context.Context) (string, error) {
+	s.liveICCIDCalls++
+	if s.liveICCIDErr != nil {
+		return "", s.liveICCIDErr
+	}
 	if s.liveICCID != "" {
 		return s.liveICCID, nil
 	}
@@ -391,7 +397,7 @@ func TestESIMSwitchFailedCallbackDoesNotRouteFatalErrorToRecovery(t *testing.T) 
 	defer p.cancel()
 	deviceID := "dev-1"
 	snapshot := p.beginESIMSwitch(deviceID, "")
-	_, _, onFailed, _, _ := p.newESIMSwitchCallbacks(deviceID)
+	_, _, _, _, onFailed, _, _ := p.newESIMSwitchCallbacks(deviceID)
 
 	onFailed(snapshot.SwitchToken, errors.New("QMI: read failed: EOF"))
 

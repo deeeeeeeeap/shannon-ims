@@ -3,12 +3,33 @@ package device
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/1239t/vohive/internal/backend"
 	"github.com/1239t/vohive/internal/config"
 )
+
+type shutdownESIMTransportStub struct {
+	stopCalls atomic.Int32
+}
+
+func (*shutdownESIMTransportStub) ControlDevice() string { return "synthetic-control" }
+func (*shutdownESIMTransportStub) OpenEUICCLogicalChannel(context.Context, byte, []byte) (byte, error) {
+	return 1, nil
+}
+func (*shutdownESIMTransportStub) CloseEUICCLogicalChannel(context.Context, byte, byte) error {
+	return nil
+}
+func (*shutdownESIMTransportStub) TransmitEUICCAPDU(context.Context, byte, byte, []byte) ([]byte, error) {
+	return nil, nil
+}
+func (*shutdownESIMTransportStub) Start() error { return nil }
+func (s *shutdownESIMTransportStub) Stop() error {
+	s.stopCalls.Add(1)
+	return nil
+}
 
 func TestPoolContextFollowsApplicationLifecycle(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
@@ -80,6 +101,63 @@ func TestPoolShutdownContextJoinsDataConnectedCallback(t *testing.T) {
 	defer cancelJoin()
 	if err := pool.ShutdownContext(joinCtx); err != nil {
 		t.Fatalf("ShutdownContext() after callback release error=%v", err)
+	}
+}
+
+func TestPoolShutdownJoinsESIMOperationBeforeClosingTransport(t *testing.T) {
+	pool := NewPoolWithContext(context.Background(), &config.Config{})
+	transport := &shutdownESIMTransportStub{}
+	worker := &Worker{
+		ID:               "device-shutdown-lease",
+		generation:       1,
+		stop:             make(chan struct{}),
+		ESIMQMITransport: transport,
+		Pool:             pool,
+	}
+	pool.workers[worker.ID] = worker
+	lease, ok := worker.acquireESIMOperationLease(pool.ctx)
+	if !ok {
+		t.Fatal("failed to acquire eSIM operation lease")
+	}
+	physicalEntered := make(chan struct{})
+	releasePhysical := make(chan struct{})
+	physicalDone := make(chan struct{})
+	go func() {
+		defer close(physicalDone)
+		defer lease.Release()
+		_ = lease.RunPhysical(func() error {
+			close(physicalEntered)
+			<-releasePhysical
+			return nil
+		})
+	}()
+	select {
+	case <-physicalEntered:
+	case <-time.After(time.Second):
+		t.Fatal("physical operation did not enter")
+	}
+
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShort()
+	if err := pool.ShutdownContext(shortCtx); err != context.DeadlineExceeded {
+		t.Fatalf("ShutdownContext error=%v, want deadline while eSIM operation is active", err)
+	}
+	if got := transport.stopCalls.Load(); got != 0 {
+		t.Fatalf("transport Stop calls=%d before eSIM operation release, want 0", got)
+	}
+	close(releasePhysical)
+	select {
+	case <-physicalDone:
+	case <-time.After(time.Second):
+		t.Fatal("physical operation did not exit")
+	}
+	joinCtx, cancelJoin := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoin()
+	if err := pool.ShutdownContext(joinCtx); err != nil {
+		t.Fatalf("ShutdownContext after eSIM operation release: %v", err)
+	}
+	if got := transport.stopCalls.Load(); got != 1 {
+		t.Fatalf("transport Stop calls=%d after shutdown, want 1", got)
 	}
 }
 

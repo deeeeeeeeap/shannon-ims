@@ -435,8 +435,8 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		return nil, err
 	}
 	w.Backend = be
-	onBeforeSwitch, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase := p.newESIMSwitchCallbacks(devCfg.ID)
-	w.EsimMgr, err = newESIMManagerForWorker(w, qmiTransport, onBeforeSwitch, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase)
+	onBeforeSwitch, onBeforePhysicalApply, onSwitchAccepted, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase := p.newESIMSwitchCallbacksForWorker(w)
+	w.EsimMgr, err = newESIMManagerForWorker(w, qmiTransport, onBeforeSwitch, onBeforePhysicalApply, onSwitchAccepted, onAfterSwitch, onSwitchFailed, onSwitchDegraded, onSwitchPhase)
 	if err != nil {
 		if qmiTransportLifecycle != nil {
 			_ = qmiTransportLifecycle.Stop()
@@ -648,6 +648,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		p.mu.Unlock()
 	}
 	w.uimIndicationsReady.Store(true)
+	p.scheduleESIMSwitchReconciliation(w)
 	p.scheduleATRadioWarmup(w, "startup")
 
 	go func(worker *Worker) {
