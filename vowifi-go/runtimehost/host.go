@@ -59,6 +59,11 @@ type providerOnlyAdapter struct {
 	imsi     string
 }
 
+type isimProviderOnlyAdapter struct {
+	*providerOnlyAdapter
+	provider swusim.ISIMAKAProvider
+}
+
 func (a *providerOnlyAdapter) GetIMSI() (string, error) {
 	if a != nil && strings.TrimSpace(a.imsi) != "" {
 		return strings.TrimSpace(a.imsi), nil
@@ -78,6 +83,21 @@ func (a *providerOnlyAdapter) CalculateAKA(rand16, autn16 []byte) (swusim.AKARes
 }
 
 func (a *providerOnlyAdapter) Close() error { return nil }
+
+func (a *isimProviderOnlyAdapter) CalculateISIMAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
+	if a == nil || a.provider == nil {
+		return swusim.AKAResult{}, errors.New("runtimehost: ISIM provider unavailable")
+	}
+	return a.provider.CalculateISIMAKA(rand16, autn16)
+}
+
+func newProviderOnlyAdapter(provider interface{}, imsi string) SIMAdapter {
+	base := &providerOnlyAdapter{provider: provider, imsi: strings.TrimSpace(imsi)}
+	if isimProvider, ok := provider.(swusim.ISIMAKAProvider); ok {
+		return &isimProviderOnlyAdapter{providerOnlyAdapter: base, provider: isimProvider}
+	}
+	return base
+}
 
 type ProxyConfig struct {
 	ID       string
@@ -164,6 +184,19 @@ type StartRequest struct {
 	Dispatch      interface{}
 	BeforeStart   func(context.Context, SessionConfig) error
 	ShouldRun     func() bool
+
+	// Package-private seams keep DNS and SWu lifecycle tests synthetic. They
+	// are intentionally unavailable to callers outside runtimehost.
+	epdgResolver            epdgResolver
+	swuStarter              swuSessionStarter
+	swuSessionFactory       swuSessionFactory
+	swuTunnelBudget         time.Duration
+	swuConnectBudget        time.Duration
+	swuConnectDeadline      <-chan time.Time
+	swuConnectJoinDeadline  <-chan time.Time
+	swuCandidate            epdgCandidate
+	outboundIPDetector      func(net.IP, int) (net.IP, error)
+	carrierBehaviorResolver func(string, string) policy.CarrierBehavior
 }
 
 type ModemAccess interface {
@@ -205,6 +238,7 @@ type Instance struct {
 	imsMNC          string
 	imsCellID       string
 	registerProfile voiceclient.RegisterProfile
+	carrierBehavior policy.CarrierBehavior
 	sipInstanceURN  string
 	registerExpiry  time.Duration
 	traceID         string
@@ -224,20 +258,11 @@ type Instance struct {
 	svc             messaging.Service
 	session         *runtimecore.SessionResult
 	transport       transport.DatagramTransport
-	swuCancel       context.CancelFunc
+	swuLease        *swuSessionLease
 	pipelineCancel  context.CancelFunc
-	swuMobike       func(oldIP, newIP string) error
 	watchDone       chan struct{}
 	stopCleanupDone chan struct{}
-}
-
-func (i *Instance) Service() messaging.Service {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.stopped {
-		return nil
-	}
-	return i.svc
+	stopCleanupErr  error
 }
 
 const messagingServiceCleanupTimeout = 5 * time.Second
@@ -312,32 +337,13 @@ func (i *Instance) installPipelineCancel(generation uint64, cancel context.Cance
 	return true
 }
 
-func (i *Instance) installSWUCancel(generation uint64, cancel context.CancelFunc) bool {
+func (i *Instance) installSWULease(generation uint64, lease *swuSessionLease) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.stopped || i.lifecycleGeneration != generation {
+	if lease == nil || i.stopped || i.lifecycleGeneration != generation || i.swuLease != nil {
 		return false
 	}
-	i.swuCancel = cancel
-	return true
-}
-
-func (i *Instance) currentSWUCancel(generation uint64) context.CancelFunc {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.stopped || i.lifecycleGeneration != generation {
-		return nil
-	}
-	return i.swuCancel
-}
-
-func (i *Instance) installMOBIKE(generation uint64, mobike func(oldIP, newIP string) error) bool {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.stopped || i.lifecycleGeneration != generation {
-		return false
-	}
-	i.swuMobike = mobike
+	i.swuLease = lease
 	return true
 }
 
@@ -351,10 +357,20 @@ func (i *Instance) updateStateForGeneration(generation uint64, mut func(*State))
 	return true
 }
 
+func markIMSReadyState(state *State, messagingReady bool, updatedAt time.Time) {
+	if state == nil {
+		return
+	}
+	state.IMSReady = true
+	state.SMSReady = messagingReady
+	state.LastReason = "ims_ready"
+	state.UpdatedAt = updatedAt
+}
+
 func (i *Instance) Status() string {
 	st := i.State()
 	switch {
-	case st.IMSReady && st.SMSReady:
+	case st.IMSReady:
 		return "running"
 	case st.TunnelReady:
 		return "tunnel_ready"
@@ -417,43 +433,46 @@ func (i *Instance) Stop(ctx context.Context) error {
 	if i.stopped {
 		cleanupDone := i.stopCleanupDone
 		i.mu.Unlock()
-		return waitForStopCleanup(ctx, cleanupDone)
+		return i.waitForStopCleanup(ctx, cleanupDone)
 	}
 	i.stopped = true
 	i.lifecycleGeneration++
 	pipelineCancel := i.pipelineCancel
-	cancel := i.swuCancel
+	lease := i.swuLease
+	if lease != nil {
+		lease.BeginStop()
+	}
 	done := i.watchDone
 	svc := i.svc
 	tp := i.transport
 	serviceIdle := i.serviceIdle
 	cleanupDone := make(chan struct{})
 	i.stopCleanupDone = cleanupDone
+	i.stopCleanupErr = nil
 	i.pipelineCancel = nil
-	i.swuCancel = nil
+	i.swuLease = nil
 	i.svc = nil
 	i.session = nil
 	i.transport = nil
-	i.swuMobike = nil
 	i.mu.Unlock()
 
 	if pipelineCancel != nil {
 		pipelineCancel()
 	}
-	if cancel != nil {
-		cancel()
-	}
-	go i.finishStopCleanup(ctx, done, serviceIdle, svc, tp, cleanupDone)
-	return waitForStopCleanup(ctx, cleanupDone)
+	go i.finishStopCleanup(ctx, done, serviceIdle, lease, svc, tp, cleanupDone)
+	return i.waitForStopCleanup(ctx, cleanupDone)
 }
 
-func waitForStopCleanup(ctx context.Context, cleanupDone <-chan struct{}) error {
+func (i *Instance) waitForStopCleanup(ctx context.Context, cleanupDone <-chan struct{}) error {
 	if cleanupDone == nil {
 		return nil
 	}
 	select {
 	case <-cleanupDone:
-		return nil
+		i.mu.Lock()
+		err := i.stopCleanupErr
+		i.mu.Unlock()
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -463,6 +482,7 @@ func (i *Instance) finishStopCleanup(
 	ctx context.Context,
 	done <-chan struct{},
 	serviceIdle <-chan struct{},
+	lease *swuSessionLease,
 	svc messaging.Service,
 	tp transport.DatagramTransport,
 	cleanupDone chan struct{},
@@ -473,11 +493,16 @@ func (i *Instance) finishStopCleanup(
 	if serviceIdle != nil {
 		<-serviceIdle
 	}
+	var leaseErr error
+	if lease != nil {
+		leaseErr = lease.CancelAndJoin()
+	}
 	closeMessagingService(ctx, svc)
 	if tp != nil {
 		_ = tp.Close()
 	}
 	i.mu.Lock()
+	i.stopCleanupErr = leaseErr
 	if done == nil || isClosed(done) {
 		i.watchDone = nil
 	}
@@ -508,12 +533,19 @@ func (i *Instance) SetSMSNotifier(fn func(string, string, string, time.Time)) {
 
 func (i *Instance) TriggerMOBIKE(oldIP, newIP string) error {
 	i.mu.Lock()
-	mobike := i.swuMobike
-	i.mu.Unlock()
-	if mobike == nil {
+	lease := i.swuLease
+	if i.stopped || lease == nil {
+		i.mu.Unlock()
 		return errors.New("runtimehost: active tunnel does not support MOBIKE")
 	}
-	return mobike(oldIP, newIP)
+	session, remoteIP, err := lease.acquireMOBIKE()
+	i.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer lease.releaseMOBIKE()
+	_ = oldIP
+	return session.UpdateAddresses(newIP, remoteIP)
 }
 
 func (i *Instance) GetSMSDeliveryStatus(messageID string) (*messaging.DeliveryStatus, error) {
@@ -531,6 +563,10 @@ func (i *Instance) SendSMS(ctx context.Context, peer, content string, parts []me
 	if i.stopped {
 		i.mu.Unlock()
 		return messaging.SendOutcome{}, errors.New("runtimehost: instance stopped")
+	}
+	if !i.state.SMSReady {
+		i.mu.Unlock()
+		return messaging.SendOutcome{}, errors.New("runtimehost: IMS messaging service not ready")
 	}
 	svc := i.svc
 	if svc == nil {
@@ -647,6 +683,11 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	}
 
 	registerProfile := req.RegisterProfile.Normalized()
+	resolveCarrierBehavior := req.carrierBehaviorResolver
+	if resolveCarrierBehavior == nil {
+		resolveCarrierBehavior = policy.ResolveCarrierBehavior
+	}
+	carrierBehavior := resolveCarrierBehavior(req.Profile.MCC, req.Profile.MNC)
 	imsPrivateID, imsPublicURI := resolveIMSRegisterIdentities(eapIdentity, imsi, req.Prepared, registerProfile)
 
 	session := runtimecore.BeginSession(toRuntimecoreSessionConfig(req))
@@ -667,6 +708,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		imsMNC:          strings.TrimSpace(req.Profile.MNC),
 		imsCellID:       strings.TrimSpace(req.CellID),
 		registerProfile: registerProfile,
+		carrierBehavior: carrierBehavior,
 		sipInstanceURN:  strings.TrimSpace(req.SIPInstanceURN),
 		registerExpiry:  req.RegisterExpiry,
 		traceID:         strings.TrimSpace(req.TraceID),
@@ -739,43 +781,23 @@ func (i *Instance) runStagedPipeline(ctx context.Context, req StartRequest, gene
 		return
 	}
 
-	resolvedIPs, err := net.LookupHost(epdgHost)
-	if err != nil || len(resolvedIPs) == 0 {
-		i.failStageForGeneration(ctx, generation, "tunnel", fmt.Sprintf("ePDG DNS failed: %s -> %v", epdgHost, err), "tunnel_dns_failed")
-		return
-	}
-	epdgIP := resolvedIPs[0]
-	if !i.updateStateForGeneration(generation, func(s *State) {
-		s.LastReason = fmt.Sprintf("tunnel_starting ePDG=%s:%s", epdgIP, epdgPort)
-		s.UpdatedAt = time.Now()
-	}) || !i.notifyObserversForGeneration(ctx, generation) {
-		return
-	}
-
-	tunnelCtx, cancel := context.WithCancel(context.Background())
-	if !i.installSWUCancel(generation, cancel) {
-		cancel()
-		return
-	}
-
-	snapshot, localIP, dataplane, mobike, err := i.startSWuSession(tunnelCtx, req, epdgIP, epdgPort)
+	lease, err := i.establishSWu(pipelineCtx, req, epdgHost, epdgPort, generation)
 	if err != nil {
 		reason := classifyTunnelFailure(err)
 		i.failStageForGeneration(ctx, generation, "tunnel", err.Error(), formatTunnelFailureReason(reason, err))
 		return
 	}
-
-	if !i.installMOBIKE(generation, mobike) {
-		cancel()
-		return
-	}
+	snapshot := lease.Snapshot()
+	localIP := lease.LocalIP()
+	dataplane := lease.Dataplane()
+	candidate := lease.Candidate()
 
 	pcscfCandidates := resolvePCSCFCandidates(snapshot, i.pcscfOverride, localIP)
 	pcscfAddr := ""
 	if len(pcscfCandidates) > 0 {
 		pcscfAddr = pcscfCandidates[0]
 	}
-	tunnelReason := fmt.Sprintf("tunnel_ready ePDG=%s", epdgIP)
+	tunnelReason := fmt.Sprintf("tunnel_ready family=%s candidate=%d/%d", candidate.Family, candidate.Index, candidate.Total)
 	if pcscfAddr != "" {
 		if len(pcscfCandidates) > 1 {
 			tunnelReason = fmt.Sprintf("%s pcscf=%s candidates=%d", tunnelReason, pcscfAddr, len(pcscfCandidates))
@@ -829,19 +851,17 @@ func (i *Instance) runStagedPipeline(ctx context.Context, req StartRequest, gene
 	if i.registerExpiry > 0 {
 		voiceCfg.RegisterExpiry = i.registerExpiry
 	}
-	imsTemplate := resolveIMSRegisterTemplate(i.imsMCC, i.imsMNC)
+	imsTemplate := i.carrierBehavior.RegisterTemplate
 	voiceCfg.RegisterProfile.UserAgent = resolveIMSUserAgent(imsTemplate, voiceCfg.RegisterProfile.UserAgent)
 	presetID := ""
 	if req.Prepared != nil {
 		presetID = strings.TrimSpace(req.Prepared.EffectiveCarrier.PresetID)
 	}
-	coreCfg := imscore.IMSConfigFromVoice(voiceCfg, imsTemplate, presetID)
+	coreCfg := imscore.IMSConfigFromVoice(voiceCfg, i.carrierBehavior, presetID)
 	network, err := imscore.NewUserspaceIMSNetwork(localIP, dataplane)
 	if err != nil {
 		i.failStageForGeneration(ctx, generation, "ims", fmt.Sprintf("IMS network setup failed: %v", err), formatStageFailureReason("ims_network_failed", err))
-		if cancel := i.currentSWUCancel(generation); cancel != nil {
-			cancel()
-		}
+		_ = lease.CancelAndJoin()
 		return
 	}
 	svc, err := imscore.StartSessionIMSCore(pipelineCtx, coreCfg, network, imscore.StartSessionInput{
@@ -860,9 +880,7 @@ func (i *Instance) runStagedPipeline(ctx context.Context, req StartRequest, gene
 	})
 	if err != nil {
 		i.failStageForGeneration(ctx, generation, "ims", fmt.Sprintf("IMS dial failed: %v", err), formatStageFailureReason("ims_dial_failed", err))
-		if cancel := i.currentSWUCancel(generation); cancel != nil {
-			cancel()
-		}
+		_ = lease.CancelAndJoin()
 		return
 	}
 
@@ -877,10 +895,7 @@ func (i *Instance) runStagedPipeline(ctx context.Context, req StartRequest, gene
 	}
 
 	if !i.updateStateForGeneration(generation, func(s *State) {
-		s.IMSReady = true
-		s.SMSReady = true
-		s.LastReason = fmt.Sprintf("ims_ready pcscf=%s", winningPCSCF)
-		s.UpdatedAt = time.Now()
+		markIMSReadyState(s, svc.MessagingReady(), time.Now())
 	}) {
 		return
 	}
@@ -944,10 +959,23 @@ func resolveIMSDomain(prepared *identity.PreparedSession) string {
 // resolveIMSRegisterIdentities chooses IMS Digest IMPI/IMPU.
 // Default (and all imsi_* shapes) use IMSI@home-domain per 3GPP 24.229.
 // Only an explicit private_id keeps the SWu EAP-AKA NAI as Digest username.
+//
+// Exception: a card with a fully-provisioned ISIM supplies its own IMPI, and a
+// provisioned ISIM identity takes priority over an IMSI-derived one (see this
+// package's identity doc comment, and EAPIdentity, which already prefers it for
+// IKE/EAP-AKA). Synthesising imsi@realm here would present the registrar an
+// identity it may not be able to resolve, while the same session authenticates
+// to the ePDG under the card's IMPI. Only an explicit non-empty shape may
+// override the card.
 func resolveIMSRegisterIdentities(eapIdentity, imsi string, prepared *identity.PreparedSession, registerProfile voiceclient.RegisterProfile) (privateID, publicURI string) {
 	privateID = strings.TrimSpace(eapIdentity)
 	publicURI = resolveIMSPublicURI(prepared, imsi)
 	shape := strings.TrimSpace(registerProfile.AuthorizationIdentity)
+	if shape == "" && prepared != nil &&
+		prepared.IMSIdentity.ActualSource == identity.IMSIdentitySourceISIM &&
+		strings.TrimSpace(prepared.IMSIdentity.IMPI) != "" {
+		return strings.TrimSpace(prepared.IMSIdentity.IMPI), publicURI
+	}
 	if shape == "" || voiceclient.UsesIMSIHomeDomainIdentity(registerProfile) {
 		if shape == "" {
 			shape = "imsi_home_domain"
@@ -965,10 +993,6 @@ func resolveIMSRegisterIdentities(eapIdentity, imsi string, prepared *identity.P
 		}
 	}
 	return privateID, publicURI
-}
-
-func resolveIMSRegisterTemplate(mcc, mnc string) policy.IMSRegisterTemplate {
-	return policy.ResolveIMSRegisterTemplate(mcc, mnc)
 }
 
 func resolveIMSUserAgent(template policy.IMSRegisterTemplate, fallback string) string {
@@ -1022,6 +1046,12 @@ func simAdminProfileKeyForPLMN(mcc, mnc string) string {
 func classifyTunnelFailure(err error) string {
 	if err == nil {
 		return "tunnel_swu_failed"
+	}
+	if errors.Is(err, errTunnelIKETimeout) {
+		return "tunnel_ike_timeout"
+	}
+	if errors.Is(err, errEPDGDNS) {
+		return "tunnel_dns_failed"
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
@@ -1128,14 +1158,14 @@ func NewReaderSIMAdapterWithIMSI(provider interface{}, imsi string) SIMAdapter {
 		if imsi != "" {
 			if liveIMSI, err := simProvider.GetIMSI(); err != nil || strings.TrimSpace(liveIMSI) == "" {
 				if p, ok := simProvider.(swusim.AKAProvider); ok {
-					return &providerOnlyAdapter{provider: p, imsi: imsi}
+					return newProviderOnlyAdapter(p, imsi)
 				}
 			}
 		}
 		return simProvider
 	}
 	if _, ok := provider.(swusim.AKAProvider); ok {
-		return &providerOnlyAdapter{provider: provider, imsi: strings.TrimSpace(imsi)}
+		return newProviderOnlyAdapter(provider, imsi)
 	}
 	return nil
 }

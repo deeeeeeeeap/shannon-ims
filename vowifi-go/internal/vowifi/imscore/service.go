@@ -26,9 +26,19 @@ type Service struct {
 	localAddr       string
 	started         bool
 
-	network          IMSNetwork
-	transportRuntime *transportRuntime
-	swu              voiceclient.SWUTCPDialer
+	network              IMSNetwork
+	transportRuntime     *transportRuntime
+	protectedRuntimes    *protectedRuntimeHolder
+	protectedPortRelease func()
+	swu                  voiceclient.SWUTCPDialer
+
+	// protectedPorts owns port_us, the rotating port_uc and the SA generation.
+	//
+	// It lives here rather than on registerSession because a session is created
+	// per attempt and per candidate: a session-scoped counter would restart
+	// several times inside one registration, and the generation's only job is to
+	// tell a current SA from a retired one. See protectedPortAllocator.
+	protectedPorts *protectedPortAllocator
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -49,6 +59,11 @@ func Dial(ctx context.Context, cfg Config) (*Service, error) {
 	}
 	if strings.TrimSpace(cfg.PrivateID) == "" || strings.TrimSpace(cfg.PublicURI) == "" {
 		return nil, fmt.Errorf("imscore: IMS identity is required")
+	}
+	// RFC 3310 section 4 requires a realm directive in the Digest AKA
+	// Authorization header; refuse to build one with realm="".
+	if strings.TrimSpace(cfg.Realm) == "" {
+		return nil, fmt.Errorf("imscore: Config.Realm is required")
 	}
 
 	voiceCfg := voiceclient.Config{
@@ -79,7 +94,7 @@ func Dial(ctx context.Context, cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	imsCfg := IMSConfigFromVoice(voiceCfg, cfg.Template, "")
+	imsCfg := IMSConfigFromVoice(voiceCfg, cfg.CarrierBehavior, "")
 	return StartSessionIMSCore(ctx, imsCfg, network, StartSessionInput{
 		TraceID:               cfg.TraceID,
 		LocalIP:               cfg.LocalIP,
@@ -100,6 +115,14 @@ func (s *Service) SendSMS(ctx context.Context, peer, content string, parts []mes
 		return messaging.SendOutcome{}, fmt.Errorf("IMS service not ready")
 	}
 	return s.inner.SendSMS(ctx, peer, content, parts)
+}
+
+// MessagingReady reports whether the registered IMS service has an attached
+// SIP messaging adapter. A protected TCP registration can be fully established
+// before the stream messaging adapter is available, so this capability must not
+// be inferred from registration success alone.
+func (s *Service) MessagingReady() bool {
+	return s != nil && s.inner != nil
 }
 
 func (s *Service) SendUSSD(ctx context.Context, command string) (*messaging.USSDResult, error) {
@@ -140,6 +163,13 @@ func (s *Service) Close(ctx context.Context) error {
 		innerErr = s.inner.Close(ctx)
 		s.inner = nil
 	}
+	if s.protectedRuntimes != nil {
+		s.protectedRuntimes.closeCurrent()
+	}
+	if s.protectedPortRelease != nil {
+		s.protectedPortRelease()
+		s.protectedPortRelease = nil
+	}
 	if us, ok := s.network.(*UserspaceIMSNetwork); ok {
 		_ = us.Close()
 	} else if s.swu != nil {
@@ -165,7 +195,7 @@ func (s *Service) Status() map[string]interface{} {
 		"signaling_ready":    s.registered,
 		"ipsec_installed":    s.ipsecInstalled,
 		"effective_security": securityModeLabel(s.ipsecInstalled),
-		"register_template":  s.imsCfg.IMSRegisterTemplate.ID,
+		"register_template":  s.imsCfg.CarrierBehavior.RegisterTemplate.ID,
 		"preset_id":          s.imsCfg.CarrierPresetID,
 		"verify":             s.verifyHeader,
 		"expires_seconds":    s.expiresSeconds,
@@ -180,7 +210,10 @@ func securityModeLabel(ipsec bool) string {
 }
 
 // ConfigFromVoice builds imscore.Config from an established runtimehost voiceclient.Config.
-func ConfigFromVoice(v voiceclient.Config, template policy.IMSRegisterTemplate) Config {
+func ConfigFromVoice(v voiceclient.Config, behavior policy.CarrierBehavior) Config {
+	if behavior.RegisterWireFormat == "" {
+		behavior = policy.Default3GPPBehavior()
+	}
 	return Config{
 		DeviceID:              v.DeviceID,
 		TraceID:               v.TraceID,
@@ -195,7 +228,7 @@ func ConfigFromVoice(v voiceclient.Config, template policy.IMSRegisterTemplate) 
 		IMSI:                  v.IMSI,
 		SMSC:                  v.SMSC,
 		AKA:                   v.AKA,
-		Template:              template,
+		CarrierBehavior:       behavior,
 		MCC:                   v.MCC,
 		MNC:                   v.MNC,
 		CellID:                v.CellID,

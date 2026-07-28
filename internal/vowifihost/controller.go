@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-
-	"github.com/1239t/vohive/pkg/logger"
 )
 
 type LifecycleCommandKind int
@@ -40,42 +38,37 @@ func (k LifecycleCommandKind) String() string {
 }
 
 type LifecycleCommand struct {
-	DeviceID           string
-	Kind               LifecycleCommandKind
-	Reason             string
-	OverrideEPDG       string
-	RestoreRadio       bool
-	AllowSwitch        bool
-	RuntimeInvalidated bool
-	Generation         uint64
+	DeviceID                 string
+	Kind                     LifecycleCommandKind
+	Reason                   string
+	OverrideEPDG             string
+	RestoreRadio             bool
+	AllowSwitch              bool
+	Generation               uint64
+	desiredRecoverGeneration uint64
 }
 
 type LifecycleControllerOptions struct {
-	IsActive func(deviceID string) bool
-	Run      func(context.Context, LifecycleCommand) error
+	Run func(context.Context, LifecycleCommand) error
 }
 
+// LifecycleController owns only per-device command serialization. RuntimeAttempt
+// admission, freshness and cancellation are owned by Store.
 type LifecycleController struct {
 	mu                sync.Mutex
 	devices           map[string]*deviceLifecycle
-	isActive          func(deviceID string) bool
 	run               func(context.Context, LifecycleCommand) error
 	TestRun           func(context.Context, LifecycleCommand) error
 	RecoverRunForTest func(context.Context, string, string, string) error
 }
 
 type deviceLifecycle struct {
-	runMu        sync.Mutex
-	generationMu sync.Mutex
-	generation   uint64
-	runCancel    context.CancelFunc
-	runCancelSeq uint64
+	runMu sync.Mutex
 }
 
 func NewLifecycleController(options ...LifecycleControllerOptions) *LifecycleController {
 	c := &LifecycleController{devices: make(map[string]*deviceLifecycle)}
 	if len(options) > 0 {
-		c.isActive = options[0].IsActive
 		c.run = options[0].Run
 	}
 	return c
@@ -111,69 +104,9 @@ func (c *LifecycleController) Submit(ctx context.Context, cmd LifecycleCommand) 
 	}
 
 	lifecycle := c.device(cmd.DeviceID)
-	if cmd.Kind == LifecycleCommandSwitchBegin || cmd.Kind == LifecycleCommandRestart {
-		return c.submitPreempting(ctx, lifecycle, cmd)
-	}
-
 	lifecycle.runMu.Lock()
 	defer lifecycle.runMu.Unlock()
-
-	if c.commandGenerationStale(lifecycle, cmd) {
-		currentGeneration := c.currentGeneration(lifecycle)
-		logger.Debug("忽略过期 VoWiFi lifecycle 命令",
-			"device", cmd.DeviceID,
-			"kind", cmd.Kind.String(),
-			"command_generation", cmd.Generation,
-			"current_generation", currentGeneration,
-			"reason", strings.TrimSpace(cmd.Reason))
-		return nil
-	}
-
-	if cmd.Kind == LifecycleCommandEnable && cmd.Generation == 0 && c.isActive != nil && c.isActive(cmd.DeviceID) {
-		logger.Debug("忽略重复 VoWiFi enable 命令",
-			"device", cmd.DeviceID,
-			"reason", strings.TrimSpace(cmd.Reason),
-			"current_generation", c.currentGeneration(lifecycle))
-		return nil
-	}
-
-	if cmd.Generation == 0 {
-		switch cmd.Kind {
-		case LifecycleCommandEnable,
-			LifecycleCommandDisable,
-			LifecycleCommandRestart,
-			LifecycleCommandRecover:
-			cmd.Generation = c.nextGeneration(lifecycle)
-		case LifecycleCommandSwitchEnd:
-			if cmd.RestoreRadio {
-				cmd.Generation = c.nextGeneration(lifecycle)
-			}
-		}
-	}
-
-	runCtx, clearRun := c.bindRunContext(ctx, lifecycle)
-	defer clearRun()
-	return c.runCommand(runCtx, cmd)
-}
-
-func (c *LifecycleController) submitPreempting(ctx context.Context, lifecycle *deviceLifecycle, cmd LifecycleCommand) error {
-	if c.commandGenerationStale(lifecycle, cmd) {
-		currentGeneration := c.currentGeneration(lifecycle)
-		logger.Debug("忽略过期 VoWiFi lifecycle 命令",
-			"device", cmd.DeviceID,
-			"kind", cmd.Kind.String(),
-			"command_generation", cmd.Generation,
-			"current_generation", currentGeneration,
-			"reason", strings.TrimSpace(cmd.Reason))
-		return nil
-	}
-	if cmd.Generation == 0 {
-		cmd.Generation = c.nextGeneration(lifecycle)
-	}
-	c.cancelActiveRun(lifecycle)
-	runCtx, clearRun := c.bindRunContext(ctx, lifecycle)
-	defer clearRun()
-	return c.runCommand(runCtx, cmd)
+	return c.runCommand(ctx, cmd)
 }
 
 func (c *LifecycleController) runCommand(ctx context.Context, cmd LifecycleCommand) error {
@@ -187,91 +120,6 @@ func (c *LifecycleController) runCommand(ctx context.Context, cmd LifecycleComma
 		return fmt.Errorf("vowifi lifecycle controller run callback is nil")
 	}
 	return c.run(ctx, cmd)
-}
-
-func (c *LifecycleController) NextGeneration(deviceID string) uint64 {
-	if c == nil {
-		return 0
-	}
-	trimmed := strings.TrimSpace(deviceID)
-	if trimmed == "" {
-		return 0
-	}
-	lifecycle := c.device(trimmed)
-	return c.nextGeneration(lifecycle)
-}
-
-func (c *LifecycleController) CurrentGeneration(deviceID string) uint64 {
-	if c == nil {
-		return 0
-	}
-	trimmed := strings.TrimSpace(deviceID)
-	if trimmed == "" {
-		return 0
-	}
-	lifecycle := c.device(trimmed)
-	return c.currentGeneration(lifecycle)
-}
-
-func (c *LifecycleController) nextGeneration(lifecycle *deviceLifecycle) uint64 {
-	if c == nil || lifecycle == nil {
-		return 0
-	}
-	lifecycle.generationMu.Lock()
-	defer lifecycle.generationMu.Unlock()
-	lifecycle.generation++
-	return lifecycle.generation
-}
-
-func (c *LifecycleController) currentGeneration(lifecycle *deviceLifecycle) uint64 {
-	if c == nil || lifecycle == nil {
-		return 0
-	}
-	lifecycle.generationMu.Lock()
-	defer lifecycle.generationMu.Unlock()
-	return lifecycle.generation
-}
-
-func (c *LifecycleController) bindRunContext(ctx context.Context, lifecycle *deviceLifecycle) (context.Context, func()) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if lifecycle == nil {
-		return ctx, func() {}
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	lifecycle.generationMu.Lock()
-	lifecycle.runCancelSeq++
-	seq := lifecycle.runCancelSeq
-	lifecycle.runCancel = cancel
-	lifecycle.generationMu.Unlock()
-	return runCtx, func() {
-		lifecycle.generationMu.Lock()
-		if lifecycle.runCancelSeq == seq {
-			lifecycle.runCancel = nil
-		}
-		lifecycle.generationMu.Unlock()
-	}
-}
-
-func (c *LifecycleController) cancelActiveRun(lifecycle *deviceLifecycle) {
-	if lifecycle == nil {
-		return
-	}
-	lifecycle.generationMu.Lock()
-	cancel := lifecycle.runCancel
-	lifecycle.generationMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
-func (c *LifecycleController) commandGenerationStale(lifecycle *deviceLifecycle, cmd LifecycleCommand) bool {
-	if c == nil || lifecycle == nil || cmd.Generation == 0 {
-		return false
-	}
-	current := c.currentGeneration(lifecycle)
-	return current != 0 && cmd.Generation != current
 }
 
 func (c *LifecycleController) device(deviceID string) *deviceLifecycle {

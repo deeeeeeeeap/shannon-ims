@@ -13,7 +13,7 @@ func TestBuildSecurityVerifyPreservesSecurityServerValueVerbatim(t *testing.T) {
 
 	res := sip.NewResponse(sip.StatusUnauthorized, "Unauthorized")
 	res.AppendHeader(sip.NewHeader("Security-Server", securityServer))
-	cfg := Config{Template: policy.ResolveIMSRegisterTemplate("234", "15")}
+	cfg := Config{CarrierBehavior: policy.ResolveCarrierBehavior("234", "15")}
 
 	verify, selected, err := buildSecurityVerifyFromChallenge(cfg, res)
 	if err != nil {

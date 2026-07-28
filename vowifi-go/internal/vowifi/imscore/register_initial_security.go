@@ -8,11 +8,11 @@ import (
 )
 
 type initialRegisterSecurityDecision struct {
-	accept           bool
-	requireIPSec     bool
-	plainOK          bool
-	reason           string
-	securityServer   bool
+	accept         bool
+	requireIPSec   bool
+	plainOK        bool
+	reason         string
+	securityServer bool
 }
 
 // decideInitialRegisterSuccessSecurity handles REGISTER 200 before auth challenge.
@@ -26,7 +26,7 @@ func decideInitialRegisterSuccessSecurity(cfg Config, res *sip.Response) (initia
 
 	secServer := res.GetHeader("Security-Server")
 	hasServer := secServer != nil && strings.TrimSpace(secServer.Value()) != ""
-	secAgree := secAgreeEnabled(cfg.Template)
+	secAgree := secAgreeEnabled(cfg.CarrierBehavior.RegisterTemplate)
 
 	switch {
 	case hasServer && secAgree:
@@ -45,9 +45,9 @@ func decideInitialRegisterSuccessSecurity(cfg Config, res *sip.Response) (initia
 		}, nil
 	case !hasServer && secAgree:
 		return initialRegisterSecurityDecision{
-			accept:   true,
-			plainOK:  true,
-			reason:   "initial_200_without_security_server_auto_plain",
+			accept:  true,
+			plainOK: true,
+			reason:  "initial_200_without_security_server_auto_plain",
 		}, nil
 	default:
 		return initialRegisterSecurityDecision{

@@ -13,6 +13,7 @@ import (
 	externalswu "github.com/1239t/swu-go/pkg/swu"
 	"github.com/1239t/vowifi-go/runtimehost/ikev2"
 	"github.com/1239t/vowifi-go/runtimehost/transport"
+	"go.uber.org/zap"
 )
 
 type swuDatagramTransport struct {
@@ -229,4 +230,44 @@ func buildSWuTransportFactory(proxy *ProxyConfig) func(string, string) (external
 		}
 		return newSWuDatagramTransport(tp, remoteAddr), nil
 	}
+}
+
+func buildObservedSWuTransportFactory(
+	proxy *ProxyConfig,
+	candidate epdgCandidate,
+	logger *zap.Logger,
+	baseFactory func(string, string) (externalswu.Transport, error),
+) func(string, string) (externalswu.Transport, error) {
+	if baseFactory == nil {
+		baseFactory = buildSWuTransportFactory(proxy)
+	}
+	if baseFactory == nil {
+		baseFactory = func(local, remote string) (externalswu.Transport, error) {
+			return externalipsec.NewSocketManager(local, remote, "")
+		}
+	}
+	return func(local, remote string) (externalswu.Transport, error) {
+		remote = canonicalSWURemote(remote, candidate)
+		inner, err := baseFactory(local, remote)
+		if err != nil {
+			return nil, err
+		}
+		return newObservedSWUTransport(inner, candidate, logger), nil
+	}
+}
+
+func canonicalSWURemote(remote string, candidate epdgCandidate) string {
+	if candidate.IP == nil {
+		return remote
+	}
+	_, port, err := net.SplitHostPort(remote)
+	if err != nil {
+		if separator := strings.LastIndex(remote, ":"); separator >= 0 && separator+1 < len(remote) {
+			port = remote[separator+1:]
+		}
+	}
+	if strings.TrimSpace(port) == "" {
+		return remote
+	}
+	return net.JoinHostPort(candidate.IP.String(), port)
 }

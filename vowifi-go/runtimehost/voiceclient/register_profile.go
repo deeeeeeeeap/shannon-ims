@@ -12,22 +12,22 @@ const imsMmtelICSIRef = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
 
 // RegisterProfile controls carrier-specific IMS REGISTER headers.
 type RegisterProfile struct {
-	ContactFeatures          string
-	IncludeAcceptContact     bool
-	IncludePPreferredID      bool
-	IncludePVisitedNetworkID bool
+	ContactFeatures           string
+	IncludeAcceptContact      bool
+	IncludePPreferredID       bool
+	IncludePVisitedNetworkID  bool
 	IncludePAccessNetworkInfo bool
-	IncludeRoute             bool
-	IncludeCellularNetwork   bool
-	IncludeSecurityClient    bool
-	IncludeRequireSecAgree   bool
-	InitialAuthorization     string
-	SecurityClientFormat     string
-	SupportedHeader          string
-	IncludePANIAuthenticated bool
-	UserAgent                string
-	ContactUserRandom        bool
-	RegisterExpirySeconds    int
+	IncludeRoute              bool
+	IncludeCellularNetwork    bool
+	IncludeSecurityClient     bool
+	IncludeRequireSecAgree    bool
+	InitialAuthorization      string
+	SecurityClientFormat      string
+	SupportedHeader           string
+	IncludePANIAuthenticated  bool
+	UserAgent                 string
+	ContactUserRandom         bool
+	RegisterExpirySeconds     int
 	// VariantSet enables multi-variant REGISTER retries (e.g. "simadmin_gb_ee").
 	VariantSet string
 	// AuthorizationIdentity selects the digest username shape for REGISTER.
@@ -378,7 +378,7 @@ func (c Config) buildContactHeader(profile RegisterProfile, sipInstance, contact
 	}
 	local := fmt.Sprintf("sip:%s@%s;transport=%s",
 		user,
-		netJoinHostPort(c.LocalIP.String(), c.localPort()),
+		netJoinHostPort(c.LocalIP.String(), c.contactPort()),
 		transport,
 	)
 	var b strings.Builder

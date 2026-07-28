@@ -17,6 +17,27 @@ import (
 // AttachSecureMessaging binds the messaging client to an already-authenticated
 // IMS ESP channel. It does not create another SWu netstack or repeat REGISTER.
 func AttachSecureMessaging(ctx context.Context, cfg Config, conn net.Conn) (*Client, error) {
+	return attachSecureMessaging(ctx, cfg, conn, "udp")
+}
+
+type secureStreamMessagingConn interface {
+	net.Conn
+	ReadSIPMessage() ([]byte, error)
+	WriteServerFlow([]byte) (int, error)
+}
+
+// AttachSecureStreamMessaging binds messaging to the already-authenticated
+// protected TCP flows. The connection supplies message framing because a TCP
+// Read is not a SIP message boundary, and supplies the terminating-flow writer
+// so responses return on the connection that carried the request.
+func AttachSecureStreamMessaging(ctx context.Context, cfg Config, conn net.Conn) (*Client, error) {
+	if _, ok := conn.(secureStreamMessagingConn); !ok {
+		return nil, errors.New("voiceclient: secure stream messaging requires framed dual-flow connection")
+	}
+	return attachSecureMessaging(ctx, cfg, conn, "tcp")
+}
+
+func attachSecureMessaging(ctx context.Context, cfg Config, conn net.Conn, transport string) (*Client, error) {
 	if conn == nil {
 		return nil, errors.New("voiceclient: secure messaging connection is required")
 	}
@@ -29,7 +50,7 @@ func AttachSecureMessaging(ctx context.Context, cfg Config, conn net.Conn) (*Cli
 	if strings.TrimSpace(cfg.PrivateID) == "" || strings.TrimSpace(cfg.PublicURI) == "" || strings.TrimSpace(cfg.HomeDomain) == "" {
 		return nil, errors.New("voiceclient: secure messaging IMS identity is required")
 	}
-	cfg.Transport = "udp"
+	cfg.Transport = transport
 	cfg.SkipRegister = true
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, fmt.Errorf("voiceclient: clear inherited secure messaging deadline: %w", err)
@@ -122,11 +143,15 @@ func (t *secureMessagingTransport) RoundTrip(ctx context.Context, req *sip.Reque
 		t.mu.Unlock()
 	}()
 
+	payload := []byte(req.String())
 	t.writeMu.Lock()
-	_, writeErr := t.conn.Write([]byte(req.String()))
+	n, writeErr := t.conn.Write(payload)
 	t.writeMu.Unlock()
 	if writeErr != nil {
 		return nil, writeErr
+	}
+	if n != len(payload) {
+		return nil, fmt.Errorf("voiceclient: short secure SIP write (%d of %d bytes)", n, len(payload))
 	}
 
 	select {
@@ -162,7 +187,12 @@ func (t *secureMessagingTransport) decorateRequest(req *sip.Request) error {
 	req.RemoveHeader("Call-ID")
 	req.RemoveHeader("CSeq")
 	viaHost := net.JoinHostPort(t.client.cfg.LocalIP.String(), fmt.Sprintf("%d", localPort))
-	req.PrependHeader(sip.NewHeader("Via", fmt.Sprintf("SIP/2.0/UDP %s;branch=%s;rport", viaHost, sip.GenerateBranchN(16))))
+	transport := strings.ToUpper(t.client.cfg.transportNetwork())
+	viaValue := fmt.Sprintf("SIP/2.0/%s %s;branch=%s", transport, viaHost, sip.GenerateBranchN(16))
+	if transport == "UDP" {
+		viaValue += ";rport"
+	}
+	req.PrependHeader(sip.NewHeader("Via", viaValue))
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.AppendHeader(sip.NewHeader("Call-ID", uuid.NewString()))
 	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d %s", t.cseq.Add(1), req.Method)))
@@ -172,7 +202,7 @@ func (t *secureMessagingTransport) decorateRequest(req *sip.Request) error {
 		appendHeaderToken(req, "Require", "sec-agree")
 		appendHeaderToken(req, "Proxy-Require", "sec-agree")
 	}
-	req.SetTransport("UDP")
+	req.SetTransport(transport)
 	req.SetDestination(t.client.cfg.PCSCFAddr)
 	return nil
 }
@@ -199,14 +229,24 @@ func (t *secureMessagingTransport) readLoop() {
 	defer t.signalDone()
 	buf := make([]byte, 64*1024)
 	for {
-		n, err := t.conn.Read(buf)
-		if err != nil {
-			return
+		var payload []byte
+		if stream, ok := t.conn.(interface{ ReadSIPMessage() ([]byte, error) }); ok {
+			message, err := stream.ReadSIPMessage()
+			if err != nil {
+				return
+			}
+			payload = message
+		} else {
+			n, err := t.conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			payload = append([]byte(nil), buf[:n]...)
 		}
-		if n == 0 {
-			continue
-		}
-		message, err := sip.NewParser().ParseSIP(append([]byte(nil), buf[:n]...))
+		message, err := sip.NewParser().ParseSIP(payload)
 		if err != nil {
 			continue
 		}

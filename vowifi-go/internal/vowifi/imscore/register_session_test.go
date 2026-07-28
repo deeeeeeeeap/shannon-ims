@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -504,8 +505,8 @@ func TestAUTSResyncFreshChallengeInstallsIPSecThenProtectedRegister(t *testing.T
 	aka := &resyncThenSuccessAKA{}
 	secureCh := make(chan registerSessionTestCapture, 1)
 	cfg := registerSessionTestConfig()
-	cfg.Template.RequireSecAgree = true
-	cfg.Template.ProxyRequireSecAgree = true
+	cfg.CarrierBehavior.RegisterTemplate.RequireSecAgree = true
+	cfg.CarrierBehavior.RegisterTemplate.ProxyRequireSecAgree = true
 	cfg.AKA = aka
 	dp := newRegisterSessionTestPacketDataplane()
 	baseSWU, err := voiceclient.NewSWUTCPDialer(cfg.LocalIP, dp)
@@ -940,6 +941,247 @@ func TestVodafoneUKKeepsSecAgreeWhenAdvancingAlgorithmAfter400(t *testing.T) {
 	}
 }
 
+func TestGenericRegisterBadRequestRetriesOnceWithoutRequiredSecAgreeOnSameSession(t *testing.T) {
+	captureCh := make(chan registerSessionTestCapture, 1)
+	network := &registerSessionTestNetwork{}
+	network.serve = func(peer net.Conn) {
+		defer peer.Close()
+		capture := registerSessionTestCapture{}
+		defer func() { captureCh <- capture }()
+
+		reader := bufio.NewReader(peer)
+		first, err := readRegisterSessionTestRequest(reader)
+		if err != nil {
+			capture.err = fmt.Errorf("read first REGISTER: %w", err)
+			return
+		}
+		capture.requests = append(capture.requests, first)
+		if err := writeRegisterSessionTestResponse(peer, first, sip.StatusBadRequest, "Bad Request", false); err != nil {
+			capture.err = fmt.Errorf("write 400: %w", err)
+			return
+		}
+
+		second, err := readRegisterSessionTestRequest(reader)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				capture.err = fmt.Errorf("read second REGISTER: %w", err)
+			}
+			return
+		}
+		capture.requests = append(capture.requests, second)
+		if err := writeRegisterSessionTestResponse(peer, second, sip.StatusForbidden, "Forbidden", false); err != nil {
+			capture.err = fmt.Errorf("write final response: %w", err)
+		}
+	}
+
+	cfg := registerSessionTestConfig()
+	cfg.CarrierBehavior = policy.Default3GPPBehavior()
+	cfg.UserAgent = "synthetic-ims-client"
+	session := newRegisterSession(cfg, nil, network, "udp", 0)
+	session.jitter = false
+	session.localPort = 41234
+	session.callID = "synthetic-call-id"
+	session.cseq = 10001
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := session.runInitialRegisterFlow(ctx); err == nil {
+		t.Fatal("runInitialRegisterFlow succeeded, want explicit final rejection")
+	}
+
+	capture := <-captureCh
+	if capture.err != nil {
+		t.Fatal(capture.err)
+	}
+	if network.dialCount != 1 {
+		t.Fatalf("REGISTER connection count = %d, want 1", network.dialCount)
+	}
+	if len(capture.requests) != 2 {
+		t.Fatalf("REGISTER request count = %d, want 2", len(capture.requests))
+	}
+
+	first, second := capture.requests[0], capture.requests[1]
+	for _, name := range []string{"From", "To", "Contact", "Call-ID", "Authorization", "Security-Client"} {
+		if got, want := registerSessionTestHeaderValue(second, name), registerSessionTestHeaderValue(first, name); got == "" || got != want {
+			t.Fatalf("REGISTER retry did not preserve %s", name)
+		}
+	}
+	if first.Recipient.String() != second.Recipient.String() {
+		t.Fatal("REGISTER retry changed Request-URI")
+	}
+	if got, want := registerSessionTestCSeq(t, second), registerSessionTestCSeq(t, first)+1; got != want {
+		t.Fatalf("REGISTER retry CSeq = %d, want %d", got, want)
+	}
+	for _, name := range []string{"Require", "Proxy-Require"} {
+		if first.GetHeader(name) == nil {
+			t.Fatalf("first REGISTER missing %s", name)
+		}
+		if second.GetHeader(name) != nil {
+			t.Fatalf("second REGISTER retained %s", name)
+		}
+	}
+}
+
+func TestGenericSecondVariantSecAgree421FailsClosedWithoutRepeatingRejectedVariant(t *testing.T) {
+	captureCh := make(chan registerSessionTestCapture, 1)
+	network := &registerSessionTestNetwork{}
+	network.serve = func(peer net.Conn) {
+		defer peer.Close()
+		capture := registerSessionTestCapture{}
+		defer func() { captureCh <- capture }()
+
+		reader := bufio.NewReader(peer)
+		first, err := readRegisterSessionTestRequest(reader)
+		if err != nil {
+			capture.err = fmt.Errorf("read first REGISTER: %w", err)
+			return
+		}
+		capture.requests = append(capture.requests, first)
+		if err := writeRegisterSessionTestResponse(peer, first, sip.StatusBadRequest, "Bad Request", false); err != nil {
+			capture.err = fmt.Errorf("write 400: %w", err)
+			return
+		}
+
+		second, err := readRegisterSessionTestRequest(reader)
+		if err != nil {
+			capture.err = fmt.Errorf("read second REGISTER: %w", err)
+			return
+		}
+		capture.requests = append(capture.requests, second)
+		if err := writeRegisterSessionTestResponse(peer, second, sip.StatusExtensionRequired, "Extension Required", true); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			capture.err = fmt.Errorf("write 421: %w", err)
+			return
+		}
+
+		if err := peer.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			capture.err = err
+			return
+		}
+		third, err := readRegisterSessionTestRequest(reader)
+		if err == nil {
+			capture.requests = append(capture.requests, third)
+			return
+		}
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
+			if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+				capture.err = fmt.Errorf("observe bounded REGISTER exit: %w", err)
+			}
+		}
+	}
+
+	cfg := registerSessionTestConfig()
+	cfg.CarrierBehavior = policy.Default3GPPBehavior()
+	cfg.UserAgent = "synthetic-ims-client"
+	session := newRegisterSession(cfg, nil, network, "udp", 0)
+	session.jitter = false
+	session.localPort = 41234
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := session.runInitialRegisterFlow(ctx)
+	var attemptErr *registrarAttemptError
+	if !errors.As(err, &attemptErr) {
+		t.Fatal("421 did not return a bounded registrar rejection")
+	}
+	if attemptErr.statusCode != sip.StatusExtensionRequired {
+		t.Fatal("421 rejection lost its status code")
+	}
+	if attemptErr.reason != "sec_agree_equivalent_variant_already_rejected" {
+		t.Fatal("421 sec-agree rejection was not safely classified")
+	}
+
+	capture := <-captureCh
+	if capture.err != nil {
+		t.Fatal(capture.err)
+	}
+	if network.dialCount != 1 {
+		t.Fatalf("REGISTER connection count = %d, want 1", network.dialCount)
+	}
+	if len(capture.requests) != 2 {
+		t.Fatalf("REGISTER request count = %d, want 2", len(capture.requests))
+	}
+}
+
+func TestGenericRegisterLateResponseCannotDriveSecondVariant(t *testing.T) {
+	captureCh := make(chan registerSessionTestCapture, 1)
+	network := &registerSessionTestNetwork{}
+	network.serve = func(peer net.Conn) {
+		defer peer.Close()
+		capture := registerSessionTestCapture{}
+		defer func() { captureCh <- capture }()
+
+		reader := bufio.NewReader(peer)
+		first, err := readRegisterSessionTestRequest(reader)
+		if err != nil {
+			capture.err = fmt.Errorf("read first REGISTER: %w", err)
+			return
+		}
+		capture.requests = append(capture.requests, first)
+		if err := writeRegisterSessionTestResponse(peer, first, sip.StatusBadRequest, "Bad Request", false); err != nil {
+			capture.err = fmt.Errorf("write 400: %w", err)
+			return
+		}
+
+		second, err := readRegisterSessionTestRequest(reader)
+		if err != nil {
+			capture.err = fmt.Errorf("read second REGISTER: %w", err)
+			return
+		}
+		capture.requests = append(capture.requests, second)
+		if err := writeRegisterSessionTestResponse(peer, first, sip.StatusExtensionRequired, "Extension Required", true); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			capture.err = fmt.Errorf("write late response: %w", err)
+			return
+		}
+
+		if err := peer.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			capture.err = err
+			return
+		}
+		third, err := readRegisterSessionTestRequest(reader)
+		if err == nil {
+			capture.requests = append(capture.requests, third)
+			return
+		}
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
+			if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+				capture.err = fmt.Errorf("observe bounded REGISTER exit: %w", err)
+			}
+		}
+	}
+
+	cfg := registerSessionTestConfig()
+	cfg.CarrierBehavior = policy.Default3GPPBehavior()
+	cfg.UserAgent = "synthetic-ims-client"
+	session := newRegisterSession(cfg, nil, network, "udp", 0)
+	session.jitter = false
+	session.localPort = 41234
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := session.runInitialRegisterFlow(ctx)
+	var attemptErr *registrarAttemptError
+	if !errors.As(err, &attemptErr) {
+		t.Fatal("late response did not fail closed")
+	}
+	if attemptErr.reason != "response_correlation_mismatch" {
+		t.Fatal("late response was treated as current variant feedback")
+	}
+
+	capture := <-captureCh
+	if capture.err != nil {
+		t.Fatal(capture.err)
+	}
+	if len(capture.requests) != 2 {
+		t.Fatalf("REGISTER request count = %d, want 2", len(capture.requests))
+	}
+}
+
 func registerSessionTestConfig() Config {
 	return Config{
 		HomeDomain:         "ims.mnc015.mcc234.3gppnetwork.org",
@@ -950,7 +1192,7 @@ func registerSessionTestConfig() Config {
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.VodafoneUKTemplate(),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 		UserAgent:          "Vodafone VOLTE Qualcomm",
 	}
 }

@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/1239t/swu-go/pkg/logger"
-
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 )
 
@@ -27,12 +25,20 @@ func SetupService(imsCfg IMSConfig, network IMSNetwork, in StartSessionInput) (*
 	if strings.TrimSpace(imsCfg.IMPI) == "" || strings.TrimSpace(imsCfg.IMPU) == "" {
 		return nil, fmt.Errorf("imscore: IMS identity is required")
 	}
-
-	template := imsCfg.IMSRegisterTemplate
-	if strings.TrimSpace(template.ID) == "" {
-		template = policy.DefaultGiffgaffTemplate()
+	// RFC 3310 section 4 requires a realm directive in the Digest AKA
+	// Authorization header. identity.PreparedSession.IMSRealm returns "" when
+	// the profile lacks a usable MCC/MNC, so reject it here instead of emitting
+	// an Authorization header with realm="".
+	if strings.TrimSpace(imsCfg.Realm) == "" {
+		return nil, fmt.Errorf("imscore: IMS realm is required")
 	}
-	imsCfg.IMSRegisterTemplate = template
+
+	behavior := imsCfg.CarrierBehavior
+	if behavior.RegisterWireFormat == "" {
+		behavior = policy.Default3GPPBehavior()
+	}
+	imsCfg.CarrierBehavior = behavior
+	template := behavior.RegisterTemplate
 	imsCfg.Registrar = registrar
 	if strings.TrimSpace(imsCfg.PCSCF) == "" {
 		imsCfg.PCSCF = registrar
@@ -67,22 +73,28 @@ func SetupService(imsCfg IMSConfig, network IMSNetwork, in StartSessionInput) (*
 	logIMSConfigResolved(imsCfg, internal, len(candidates))
 
 	return &Service{
-		imsCfg:  imsCfg,
-		cfg:     internal,
-		network: network,
+		imsCfg:            imsCfg,
+		cfg:               internal,
+		network:           network,
+		protectedRuntimes: newProtectedRuntimeHolder(),
 	}, nil
 }
 
 func logIMSConfigResolved(imsCfg IMSConfig, cfg Config, candidateCount int) {
-	logger.Info("IMS config resolved",
-		logger.String("device_id", strings.TrimSpace(imsCfg.DeviceID)),
-		logger.String("trace_id", strings.TrimSpace(cfg.TraceID)),
-		logger.String("registrar", strings.TrimSpace(imsCfg.Registrar)),
-		logger.String("preset_id", strings.TrimSpace(imsCfg.CarrierPresetID)),
-		logger.String("register_template", strings.TrimSpace(imsCfg.IMSRegisterTemplate.ID)),
-		logger.String("register_policy", registerPolicyID(imsCfg.IMSRegisterTemplate)),
-		logger.String("register_policy_source", strings.TrimSpace(imsCfg.IMSRegisterPolicySource)),
-		logger.Int("registrar_candidates", candidateCount),
-		logger.String("transport", strings.TrimSpace(imsCfg.Transport)),
-		logger.Bool("strict_security_server_offer", imsCfg.IMSRegisterTemplate.StrictSecurityServerOffer))
+	// realm_source distinguishes an ISIM-provisioned operator home domain from
+	// the TS 23.003 PLMN-derived fallback. Only the closed enum is logged; the
+	// realm and PLMN digits are not.
+	realm := strings.TrimSpace(cfg.Realm)
+	if realm == "" {
+		realm = strings.TrimSpace(imsCfg.Realm)
+	}
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:            "config_resolved",
+		result:           "none",
+		transport:        imsCfg.Transport,
+		addressFamily:    registerAddressFamily(imsCfg.Registrar),
+		candidateTotal:   candidateCount,
+		requiresSecAgree: imsCfg.CarrierBehavior.RegisterTemplate.RequireSecAgree || imsCfg.CarrierBehavior.RegisterTemplate.ProxyRequireSecAgree,
+		realmSource:      classifyRegisterRealmSource(realm, cfg.MCC, cfg.MNC),
+	})
 }

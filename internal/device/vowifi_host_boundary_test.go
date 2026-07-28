@@ -46,7 +46,7 @@ func TestPoolTeardownDelegatesRuntimeMutationToHost(t *testing.T) {
 	src := string(srcBytes)
 
 	requiredSnippets := []string{
-		".StopInstanceForTeardown(",
+		".TeardownSession(",
 		".TeardownForReconnect(",
 	}
 	for _, snippet := range requiredSnippets {
@@ -56,6 +56,7 @@ func TestPoolTeardownDelegatesRuntimeMutationToHost(t *testing.T) {
 	}
 
 	forbiddenSnippets := []string{
+		".StopInstanceForTeardown(",
 		".DeleteInstance(",
 		".Invalidate(",
 		".Stop(stopCtx)",

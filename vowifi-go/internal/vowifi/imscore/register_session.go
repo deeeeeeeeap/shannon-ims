@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/1239t/swu-go/pkg/logger"
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
 
@@ -47,14 +46,41 @@ type registerSession struct {
 	localPort int
 }
 
+// newRegisterSession builds a session with the legacy fixed protected ports.
+//
+// It is retained for callers that have no Service-owned allocation to hand in.
+// Prefer newRegisterSessionWithPorts: TS 33.203 clause 7.4 requires port_uc to
+// change on every authenticated re-registration, and a fixed pair cannot do
+// that. See protectedPortAllocator.
 func newRegisterSession(cfg Config, swu voiceclient.SWUTCPDialer, network IMSNetwork, transportMode string, attemptIndex int) *registerSession {
+	return newRegisterSessionWithPorts(cfg, swu, network, transportMode, attemptIndex,
+		legacyProtectedPortAllocation())
+}
+
+// newRegisterSessionWithPorts builds a session bound to one Service-owned
+// protected port allocation.
+//
+// The allocation decides port_uc, port_us and the SA generation. The session
+// must not invent any of them: it is created per attempt and per candidate, so
+// anything it mints is reset several times per registration and can never be
+// monotonic or stable in the way clause 7.4 requires.
+func newRegisterSessionWithPorts(
+	cfg Config,
+	swu voiceclient.SWUTCPDialer,
+	network IMSNetwork,
+	transportMode string,
+	attemptIndex int,
+	allocation protectedPortAllocation,
+) *registerSession {
 	spiC, spiS := randomConsecutiveSPIPair()
 	state := &registerState{
 		spiC:          spiC,
 		spiS:          spiS,
-		portC:         5062,
-		portS:         5063,
+		portC:         allocation.clientPort,
+		portS:         allocation.serverPort,
+		generation:    allocation.generation,
 		transportMode: canonicalRegisterTransport(transportMode),
+		fromTag:       sip.GenerateTagN(16),
 		sipInstance:   resolveStableSIPInstance(cfg),
 	}
 	localPort := registerAttemptLocalPort(cfg, attemptIndex)
@@ -137,13 +163,12 @@ func (s *registerSession) dialRegisterConn(ctx context.Context) (*connRegisterTr
 
 	installSIPTrace(s.cfg.TraceID, s.cfg.DeviceID)
 	s.conn = newConnRegisterTransport(rawConn, s.cfg.TraceID, s.cfg.DeviceID, transport)
-	logger.Info("IMS REGISTER transport connected",
-		logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-		logger.String("device_id", strings.TrimSpace(s.cfg.DeviceID)),
-		logger.String("transport_mode", s.transportMode),
-		logger.String("local", connLocalAddrString(s.conn.conn)),
-		logger.String("remote", connRemoteAddrString(s.conn.conn)),
-		logger.Int("local_port_hint", s.localPort))
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:         "transport_connected",
+		result:        "none",
+		transport:     s.transportMode,
+		addressFamily: registerAddressFamily(effectiveTransportAddr(s.cfg)),
+	})
 	return s.conn, nil
 }
 
@@ -156,28 +181,21 @@ func (s *registerSession) closeConn() {
 }
 
 func (s *registerSession) logFSM(event, reason string, variantIndex, variantTotal, mechanismCount int, variant initialRegisterVariant) {
-	alg := ""
-	ealg := ""
-	if variant.hasSecurityClientMechanism {
-		alg = strings.TrimSpace(variant.securityClientMechanism.Alg)
-		ealg = canonicalTemplateEAlg(variant.securityClientMechanism.EAlg)
+	requireSecAgree, proxyRequireSecAgree := initialVariantSecAgreeRequirements(s.cfg.CarrierBehavior.RegisterTemplate, variant)
+	if strings.TrimSpace(reason) == "" {
+		reason = "none"
 	}
-	logger.Info(fmt.Sprintf("FSM(reg): %s", event),
-		logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-		logger.String("device_id", strings.TrimSpace(s.cfg.DeviceID)),
-		logger.String("phase", string(s.phase)),
-		logger.String("registrar", strings.TrimSpace(s.cfg.PCSCFAddr)),
-		logger.String("reason", reason),
-		logger.Int("variant_index", variantIndex),
-		logger.Int("variant_total", variantTotal),
-		logger.String("variant_name", strings.TrimSpace(variant.name)),
-		logger.String("initial_auth_mode", variant.initialAuth),
-		logger.Bool("require_sec_agree", variant.requireSecAgree || s.cfg.Template.RequireSecAgree),
-		logger.Bool("proxy_require_sec_agree", variant.proxyRequireSecAgree || s.cfg.Template.ProxyRequireSecAgree),
-		logger.String("alg", alg),
-		logger.String("ealg", ealg),
-		logger.Int("security_client_mechanisms", mechanismCount),
-	)
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:            event,
+		result:           reason,
+		variant:          registerVariantDiagnosticName(variant),
+		variantIndex:     variantIndex,
+		variantTotal:     variantTotal,
+		transport:        s.transportMode,
+		addressFamily:    registerAddressFamily(effectiveTransportAddr(s.cfg)),
+		mechanismCount:   mechanismCount,
+		requiresSecAgree: requireSecAgree || proxyRequireSecAgree,
+	})
 }
 
 func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*registerResult, error) {
@@ -203,35 +221,44 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 			variant.requireSecAgree = true
 			variant.proxyRequireSecAgree = true
 		}
-		s.logFSM("initial_register_attempt", "", i+1, len(variants), securityClientMechanismCount(s.cfg.Template), variant)
+		s.logFSM("initial_attempt", "none", i+1, len(variants), securityClientMechanismCount(s.cfg.CarrierBehavior.RegisterTemplate), variant)
 
 		res, req, err := s.registerOnce(ctx, transport, true, variant)
 		if err != nil {
-			lastErr = err
-			i++
-			continue
+			return nil, err
 		}
 
-		logger.Info("IMS REGISTER initial response",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.String("pcscf", s.cfg.PCSCFAddr),
-			logger.String("variant_name", strings.TrimSpace(variant.name)),
-			logger.String("initial_auth_mode", variant.initialAuth),
-			logger.Bool("require_sec_agree", variant.requireSecAgree || s.cfg.Template.RequireSecAgree),
-			logger.Bool("proxy_require_sec_agree", variant.proxyRequireSecAgree || s.cfg.Template.ProxyRequireSecAgree),
-			logger.Bool("include_pani", variant.includePANI),
-			logger.Bool("include_cellular", variant.includeCellular),
-			logger.Int("status", res.StatusCode),
-			logger.String("reason", res.Reason))
-		logger.Info("IMS REGISTER response profile",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.Int("status", res.StatusCode),
-			logger.Int("header_count", len(res.Headers())),
-			logger.Bool("has_www_authenticate", res.GetHeader("WWW-Authenticate") != nil),
-			logger.Bool("has_proxy_authenticate", res.GetHeader("Proxy-Authenticate") != nil),
-			logger.Bool("has_security_server", res.GetHeader("Security-Server") != nil),
-			logger.Bool("has_path", res.GetHeader("Path") != nil),
-			logger.Bool("has_service_route", res.GetHeader("Service-Route") != nil))
+		requireSecAgree, proxyRequireSecAgree := initialVariantSecAgreeRequirements(s.cfg.CarrierBehavior.RegisterTemplate, variant)
+		// initial_response is the only stage that classifies a real Warning
+		// header. The metadata is de-identified and never influences the
+		// status-code state machine below.
+		warning := classifyRegisterWarning(res)
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:                "initial_response",
+			status:               res.StatusCode,
+			result:               registerStatusResult(res.StatusCode),
+			variant:              registerVariantDiagnosticName(variant),
+			variantIndex:         i + 1,
+			variantTotal:         len(variants),
+			transport:            s.transportMode,
+			addressFamily:        registerAddressFamily(effectiveTransportAddr(s.cfg)),
+			headerCount:          len(res.Headers()),
+			hasWarning:           res.GetHeader("Warning") != nil,
+			hasUnsupported:       res.GetHeader("Unsupported") != nil,
+			hasRequire:           res.GetHeader("Require") != nil,
+			requiresSecAgree:     requireSecAgree || proxyRequireSecAgree,
+			hasWWWAuthenticate:   res.GetHeader("WWW-Authenticate") != nil,
+			hasProxyAuthenticate: res.GetHeader("Proxy-Authenticate") != nil,
+			hasSecurityServer:    res.GetHeader("Security-Server") != nil,
+			hasPath:              res.GetHeader("Path") != nil,
+			hasServiceRoute:      res.GetHeader("Service-Route") != nil,
+			reachedAuth:          registerAttemptReachedAuthPhase(res.StatusCode),
+			warningPresent:       warning.present,
+			warningCount:         warning.count,
+			warningCode:          warning.code,
+			warningClass:         warning.class,
+			warningParseResult:   warning.parseResult,
+		})
 
 		switch res.StatusCode {
 		case sip.StatusOK:
@@ -239,7 +266,7 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 			if err != nil {
 				return nil, err
 			}
-			s.logFSM("initial_register_success", decision.reason, i+1, len(variants), securityClientMechanismCount(s.cfg.Template), variant)
+			s.logFSM("complete", "ok", i+1, len(variants), securityClientMechanismCount(s.cfg.CarrierBehavior.RegisterTemplate), variant)
 			if decision.requireIPSec {
 				if err := installIPSecFromChallenge(s.cfg, s.state, res); err != nil {
 					return nil, err
@@ -252,36 +279,36 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 			s.phase = registerPhaseAuth
 			return s.runAuthRegisterPhase(ctx, transport, req, res)
 		case sip.StatusExtensionRequired:
-			if shouldRetryInitialRegisterAfterSecAgreeChallenge(s.cfg, variant, res) {
+			decision := decideInitialRegisterSecAgreeChallenge(s.cfg, variant, i, res)
+			if decision.retry {
 				secAgreeRequiredByChallenge = true
-				s.logFSM("initial_register_sec_agree_retry", "421_sec_agree_required", i+1, len(variants), securityClientMechanismCount(s.cfg.Template), variant)
+				s.logFSM("sec_agree_retry", decision.reason, i+1, len(variants), securityClientMechanismCount(s.cfg.CarrierBehavior.RegisterTemplate), variant)
 				continue
 			}
 			lastErr = &registrarAttemptError{
 				pcscf:      s.cfg.PCSCFAddr,
 				statusCode: res.StatusCode,
-				reason:     res.Reason,
+				reason:     decision.reason,
 			}
 			return nil, lastErr
 		default:
+			outcome := decideRegisterFailureOutcome(s.cfg, res.StatusCode, res.Reason, i, len(variants), false)
 			lastErr = &registrarAttemptError{
 				pcscf:      s.cfg.PCSCFAddr,
 				statusCode: res.StatusCode,
-				reason:     res.Reason,
+				reason:     outcome.reason,
 			}
-			outcome := decideRegisterFailureOutcome(s.cfg, res.StatusCode, res.Reason, i, len(variants), false)
 			if outcome.retryVariant {
-				logger.Info("IMS REGISTER initial reject fallback",
-					logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-					logger.Int("status", res.StatusCode),
-					logger.String("reason", res.Reason),
-					logger.Int("variant_index", i+1),
-					logger.Int("variant_total", len(variants)),
-					logger.String("variant_name", strings.TrimSpace(variant.name)),
-					logger.String("next_variant_name", strings.TrimSpace(variants[i+1].name)),
-					logger.String("next_initial_auth_mode", variants[i+1].initialAuth),
-					logger.Bool("next_include_pani", variants[i+1].includePANI),
-					logger.Bool("next_include_cellular", variants[i+1].includeCellular))
+				logRegisterDiagnostic(registerDiagnostic{
+					stage:         "variant_retry",
+					status:        res.StatusCode,
+					result:        outcome.reason,
+					variant:       registerVariantDiagnosticName(variant),
+					variantIndex:  i + 1,
+					variantTotal:  len(variants),
+					transport:     s.transportMode,
+					addressFamily: registerAddressFamily(effectiveTransportAddr(s.cfg)),
+				})
 				i++
 				continue
 			}
@@ -295,23 +322,46 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 	return nil, fmt.Errorf("imscore: initial REGISTER variants exhausted")
 }
 
-func shouldRetryInitialRegisterAfterSecAgreeChallenge(cfg Config, variant initialRegisterVariant, res *sip.Response) bool {
-	if !cfg.Template.ProbeInitialSecurityClientOnBadRequest || res == nil || res.StatusCode != sip.StatusExtensionRequired {
-		return false
+type initialRegisterSecAgreeChallengeDecision struct {
+	retry  bool
+	reason string
+}
+
+func decideInitialRegisterSecAgreeChallenge(cfg Config, variant initialRegisterVariant, variantIndex int, res *sip.Response) initialRegisterSecAgreeChallengeDecision {
+	if res == nil || res.StatusCode != sip.StatusExtensionRequired {
+		return initialRegisterSecAgreeChallengeDecision{reason: "sec_agree_challenge_invalid"}
 	}
-	requireSecAgree := cfg.Template.RequireSecAgree || variant.requireSecAgree
-	proxyRequireSecAgree := cfg.Template.ProxyRequireSecAgree || variant.proxyRequireSecAgree
+	if !responseRequiresOnlySecAgree(res) {
+		return initialRegisterSecAgreeChallengeDecision{reason: "sec_agree_challenge_invalid"}
+	}
+	requireSecAgree, proxyRequireSecAgree := initialVariantSecAgreeRequirements(cfg.CarrierBehavior.RegisterTemplate, variant)
 	if requireSecAgree || proxyRequireSecAgree {
+		return initialRegisterSecAgreeChallengeDecision{reason: "sec_agree_already_requested"}
+	}
+	if cfg.CarrierBehavior.RegisterTemplate.RetryInitialWithoutRequiredSecAgreeOnBadRequest && variantIndex > 0 {
+		return initialRegisterSecAgreeChallengeDecision{reason: "sec_agree_equivalent_variant_already_rejected"}
+	}
+	if cfg.CarrierBehavior.RegisterTemplate.ProbeInitialSecurityClientOnBadRequest {
+		return initialRegisterSecAgreeChallengeDecision{retry: true, reason: "sec_agree_required"}
+	}
+	return initialRegisterSecAgreeChallengeDecision{reason: "sec_agree_challenge_unsupported"}
+}
+
+func responseRequiresOnlySecAgree(res *sip.Response) bool {
+	if res == nil {
 		return false
 	}
+	count := 0
 	for _, header := range res.GetHeaders("Require") {
 		for _, token := range strings.Split(header.Value(), ",") {
-			if strings.EqualFold(strings.TrimSpace(token), "sec-agree") {
-				return true
+			token = strings.TrimSpace(token)
+			if token == "" || !strings.EqualFold(token, "sec-agree") {
+				return false
 			}
+			count++
 		}
 	}
-	return false
+	return count == 1
 }
 
 func registerResponseHeaderNames(res *sip.Response) []string {
@@ -350,16 +400,17 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 		}
 		nonceFingerprint := akaChallengeNonceFingerprint(chal.Nonce)
 		if requireFreshChallenge && nonceFingerprint == previousNonceFingerprint {
-			return nil, fmt.Errorf(
-				"challenge round %d: repeated AKA challenge nonce (fingerprint=%s)",
-				round+1,
-				nonceFingerprint,
-			)
+			return nil, fmt.Errorf("challenge round %d: repeated AKA challenge nonce", round+1)
 		}
-		logger.Info("IMS REGISTER AKA challenge",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.Int("challenge_round", round+1),
-			logger.String("nonce_fingerprint", nonceFingerprint))
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:          "auth_challenge",
+			status:         lastRes.StatusCode,
+			result:         "challenge_received",
+			transport:      s.transportMode,
+			addressFamily:  registerAddressFamily(effectiveTransportAddr(s.cfg)),
+			challengeRound: round + 1,
+			reachedAuth:    true,
+		})
 		previousNonceFingerprint = nonceFingerprint
 
 		akaResult, authHeader, syncFailure, err := computeAKAAuth(s.cfg, chal, lastReq)
@@ -385,13 +436,16 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 			previousSyncFailureAUTS = append(previousSyncFailureAUTS[:0], akaResult.AUTS...)
 			requireFreshChallenge = true
 			// RFC 3310: AUTS resync stays unprotected; network should re-401.
-			logger.Info("IMS REGISTER AKA resync (AUTS) sent, awaiting fresh challenge",
-				logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-				logger.Int("challenge_round", round+1),
-				logger.Bool("sync_failure", true),
-				logger.Bool("auts_present", true),
-				logger.Int("auts_len", len(akaResult.AUTS)),
-				logger.String("nonce_fingerprint", nonceFingerprint))
+			logRegisterDiagnostic(registerDiagnostic{
+				stage:          "auth_resync",
+				status:         lastRes.StatusCode,
+				result:         "resync_sent",
+				transport:      s.transportMode,
+				addressFamily:  registerAddressFamily(effectiveTransportAddr(s.cfg)),
+				challengeRound: round + 1,
+				reachedAuth:    true,
+				syncFailure:    true,
+			})
 			res, err := s.sendResyncRegisterRequest(ctx, transport, newReq)
 			if err != nil {
 				return nil, fmt.Errorf("challenge round %d: %w", round+1, err)
@@ -406,18 +460,19 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 		if len(akaResult.CK) == 0 || len(akaResult.IK) == 0 {
 			return nil, fmt.Errorf("challenge round %d: AKA success without CK/IK", round+1)
 		}
-		logger.Info("IMS REGISTER AKA success",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.Int("challenge_round", round+1),
-			logger.Bool("sync_failure", false),
-			logger.Int("res_len", len(akaResult.RES)),
-			logger.Int("ck_len", len(akaResult.CK)),
-			logger.Int("ik_len", len(akaResult.IK)),
-			logger.String("nonce_fingerprint", nonceFingerprint))
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:          "auth_success",
+			status:         lastRes.StatusCode,
+			result:         "aka_complete",
+			transport:      s.transportMode,
+			addressFamily:  registerAddressFamily(effectiveTransportAddr(s.cfg)),
+			challengeRound: round + 1,
+			reachedAuth:    true,
+		})
 		s.state.ck, s.state.ik = akaResult.CK, akaResult.IK
 		decision, err := decideSecAgreeAfterChallenge(s.cfg, lastRes)
 		if err != nil {
-			return nil, err
+			return nil, newProtectedPhaseError(protectedPhaseStageIPSecInstall, err)
 		}
 		if !decision.installIPSec {
 			// No IPsec: fall back to unprotected authenticated REGISTER.
@@ -436,34 +491,57 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 			continue
 		}
 		if err := installIPSecFromChallenge(s.cfg, s.state, lastRes); err != nil {
-			return nil, fmt.Errorf("ipsec install: %w", err)
+			return nil, newProtectedPhaseError(
+				protectedPhaseStageIPSecInstall,
+				fmt.Errorf("ipsec install: %w", err),
+			)
 		}
-		logger.Info("IMS IPsec installed",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.Int("challenge_round", round+1),
-			logger.Bool("ipsec_installed", true),
-			logger.Bool("security_verify_present", strings.TrimSpace(s.state.verifyHeader) != ""))
-		logger.Info("IMS protected authenticated REGISTER sending",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.Int("challenge_round", round+1),
-			logger.Bool("protected", true),
-			logger.Bool("security_verify_present", strings.TrimSpace(s.state.verifyHeader) != ""))
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:          "ipsec_install",
+			result:         "installed",
+			transport:      s.transportMode,
+			addressFamily:  registerAddressFamily(effectiveTransportAddr(s.cfg)),
+			challengeRound: round + 1,
+			reachedAuth:    true,
+			ipsecInstalled: true,
+		})
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:          "protected_send",
+			result:         "sending",
+			transport:      s.transportMode,
+			addressFamily:  registerAddressFamily(effectiveTransportAddr(s.cfg)),
+			challengeRound: round + 1,
+			reachedAuth:    true,
+			protected:      true,
+			// The SA was installed immediately above; without this the log
+			// contradicted stage=ipsec_install on the previous line.
+			ipsecInstalled: true,
+		})
 		result, err := runSecureAuthenticatedRegister(ctx, s.cfg, s.swu, s.state, newReq, lastRes)
 		if err != nil {
 			return nil, err
 		}
-		logger.Info("IMS protected authenticated REGISTER accepted",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.Int("challenge_round", round+1),
-			logger.Int("status", sip.StatusOK),
-			logger.Bool("protected", true))
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:          "protected_accept",
+			status:         sip.StatusOK,
+			result:         "accepted",
+			transport:      s.transportMode,
+			addressFamily:  registerAddressFamily(effectiveTransportAddr(s.cfg)),
+			challengeRound: round + 1,
+			reachedAuth:    true,
+			protected:      true,
+		})
 		return result, nil
 	}
 
 	if lastRes.StatusCode == sip.StatusOK {
 		return finalizeRegisterSuccess(s.cfg, *s.state, lastRes)
 	}
-	return nil, fmt.Errorf("unexpected challenged REGISTER response: %d %s", lastRes.StatusCode, lastRes.Reason)
+	return nil, fmt.Errorf(
+		"unexpected challenged REGISTER response: status=%d result=%s",
+		lastRes.StatusCode,
+		registerStatusResult(lastRes.StatusCode),
+	)
 }
 
 func akaChallengeNonceFingerprint(nonce string) string {
@@ -487,7 +565,7 @@ func (s *registerSession) registerOnce(ctx context.Context, transport *connRegis
 	if err := s.decorateRegisterRequest(req); err != nil {
 		return nil, nil, err
 	}
-	if initial && strings.EqualFold(strings.TrimSpace(s.cfg.Template.ID), "vodafone_uk_23415") {
+	if initial && usesVodafoneRegisterWireFormat(s.cfg) {
 		payload, err := buildVodafoneInitialRegisterPayload(req)
 		if err != nil {
 			return nil, nil, err
@@ -495,13 +573,13 @@ func (s *registerSession) registerOnce(ctx context.Context, transport *connRegis
 		if err := transport.SendPayload(ctx, payload); err != nil {
 			return nil, nil, err
 		}
-		res, err := transport.ReadResponse(ctx)
+		res, err := s.readRegisterResponse(ctx, transport, req)
 		return res, req, err
 	}
 	if err := transport.Send(ctx, req); err != nil {
 		return nil, nil, err
 	}
-	res, err := transport.ReadResponse(ctx)
+	res, err := s.readRegisterResponse(ctx, transport, req)
 	return res, req, err
 }
 
@@ -550,11 +628,11 @@ func (s *registerSession) sendRegisterRequest(ctx context.Context, transport *co
 	if err := transport.Send(ctx, req); err != nil {
 		return nil, err
 	}
-	return transport.ReadResponse(ctx)
+	return s.readRegisterResponse(ctx, transport, req)
 }
 
 func (s *registerSession) sendResyncRegisterRequest(ctx context.Context, transport *connRegisterTransport, req *sip.Request) (*sip.Response, error) {
-	if strings.EqualFold(strings.TrimSpace(s.cfg.Template.ID), "vodafone_uk_23415") {
+	if usesVodafoneRegisterWireFormat(s.cfg) {
 		payload, err := buildVodafoneInitialRegisterPayload(req)
 		if err != nil {
 			return nil, err
@@ -562,9 +640,24 @@ func (s *registerSession) sendResyncRegisterRequest(ctx context.Context, transpo
 		if err := transport.SendPayload(ctx, payload); err != nil {
 			return nil, err
 		}
-		return transport.ReadResponse(ctx)
+		return s.readRegisterResponse(ctx, transport, req)
 	}
 	return s.sendRegisterRequest(ctx, transport, req)
+}
+
+func (s *registerSession) readRegisterResponse(ctx context.Context, transport *connRegisterTransport, req *sip.Request) (*sip.Response, error) {
+	res, err := transport.ReadResponse(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !registerResponseCorrelates(req, res) {
+		return nil, &registrarAttemptError{
+			pcscf:      s.cfg.PCSCFAddr,
+			statusCode: res.StatusCode,
+			reason:     "response_correlation_mismatch",
+		}
+	}
+	return res, nil
 }
 
 func (s *registerSession) decorateRegisterRequest(req *sip.Request) error {
@@ -588,7 +681,7 @@ func (s *registerSession) decorateRegisterRequest(req *sip.Request) error {
 	req.AppendHeader(sip.NewHeader("Call-ID", s.callID))
 	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d REGISTER", s.cseq)))
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
-	if s.phase == registerPhaseInitial && strings.EqualFold(strings.TrimSpace(s.cfg.Template.ID), "vodafone_uk_23415") {
+	if s.phase == registerPhaseInitial && usesVodafoneRegisterWireFormat(s.cfg) {
 		reorderVodafoneInitialRegisterHeaders(req)
 	}
 	s.cseq = nextRegisterTransportAttemptCSeq(s.cseq)

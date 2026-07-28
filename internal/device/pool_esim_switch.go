@@ -1302,7 +1302,7 @@ func (p *Pool) restorePostSwitchConnectivity(deviceID string, worker *Worker, sn
 				"reason", "post_switch_finalize",
 				"err", restoreGateErr)
 		} else {
-			p.clearDesiredVoWiFiRecoverState(deviceID)
+			p.voWiFiHost().ForgetDesiredRecover(deviceID)
 			if err := p.voWiFiHost().SwitchEnd(context.Background(), deviceID, true); err != nil {
 				p.markESIMSwitchPhase(deviceID, esim.SwitchPhaseDegraded)
 				logger.Error("切卡后恢复 VoWiFi 失败", "device", deviceID, "err", err)

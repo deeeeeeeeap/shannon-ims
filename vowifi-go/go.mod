@@ -4,12 +4,15 @@ go 1.26.3
 
 replace github.com/emiago/sipgo => ../third_party/sipgo
 
+replace github.com/1239t/swu-go => ../third_party/swu-go
+
 require (
 	github.com/1239t/swu-go v0.0.1
 	github.com/emiago/sipgo v1.4.0
 	github.com/google/uuid v1.6.0
 	github.com/icholy/digest v1.1.0
 	github.com/strongswan/govici v0.8.2
+	go.uber.org/zap v1.27.1
 	gvisor.dev/gvisor v0.0.0-20240521174809-5eedbf551134
 )
 
@@ -26,7 +29,6 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.1 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/time v0.5.0 // indirect

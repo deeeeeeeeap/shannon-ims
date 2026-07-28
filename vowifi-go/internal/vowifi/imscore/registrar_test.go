@@ -27,12 +27,12 @@ func TestShouldAdvanceRegistrarForNextRetry(t *testing.T) {
 		more   bool
 		want   bool
 	}{
-		{sip.StatusForbidden, "Service not allowed in this location", true, true},
-		{sip.StatusForbidden, "Forbidden", true, true},
+		{sip.StatusForbidden, "Service not allowed in this location", true, false},
+		{sip.StatusForbidden, "Forbidden", true, false},
 		{sip.StatusUnauthorized, "", true, false},
 		{sip.StatusProxyAuthRequired, "", true, false},
 		{sip.StatusForbidden, "Forbidden", false, false},
-		{sip.StatusServiceUnavailable, "", true, true},
+		{sip.StatusServiceUnavailable, "", true, false},
 	}
 	for _, tc := range cases {
 		if got := shouldAdvanceRegistrarForNextRetry(tc.status, tc.reason, tc.more); got != tc.want {

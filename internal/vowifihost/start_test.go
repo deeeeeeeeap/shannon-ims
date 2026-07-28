@@ -61,7 +61,11 @@ func TestManagerClaimStartedAcceptsCurrentAndRejectsStaleEpoch(t *testing.T) {
 		t.Fatal("stale claim should not activate runtime")
 	}
 
-	current := manager.CurrentEpoch(deviceID)
+	claim := manager.BeginStart(deviceID)
+	current := claim.Epoch
+	if !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 	inst := &runtimehost.Instance{}
 	if !manager.ClaimStarted(deviceID, current, inst) {
 		t.Fatal("ClaimStarted() = false for current epoch, want true")

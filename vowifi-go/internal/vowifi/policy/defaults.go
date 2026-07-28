@@ -15,6 +15,42 @@ func DefaultSecurityClientMechanisms() []IPSec3GPPSecurityMechanism {
 	}
 }
 
+// Default3GPPTemplate is the carrier-neutral REGISTER policy used when no
+// PLMN-specific behavior is known.
+func Default3GPPTemplate() IMSRegisterTemplate {
+	return IMSRegisterTemplate{
+		ID:                        "3gpp-default",
+		SecAgreeMode:              "on",
+		UsePlainDigestPlaceholder: true,
+		MinimalInitialHeaders:     true,
+		RequireSecAgree:           true,
+		ProxyRequireSecAgree:      true,
+		RetryInitialWithoutRequiredSecAgreeOnBadRequest: true,
+		StrictSecurityServerOffer:                       true,
+		SupportedHeader:                                 "path,sec-agree",
+		ContactParamOrder: []string{
+			"access_type",
+			"audio",
+			"smsip",
+			"icsi_ref",
+			"sip_instance",
+		},
+		SecurityClientMechanisms: DefaultSecurityClientMechanisms(),
+	}
+}
+
+// Default3GPPBehavior is the carrier-neutral IMS wire behavior used when no
+// PLMN-specific behavior is known.
+func Default3GPPBehavior() CarrierBehavior {
+	return CarrierBehavior{
+		RegisterTemplate:         Default3GPPTemplate(),
+		UnprotectedAutoTransport: UnprotectedRegisterUDPThenTCP,
+		ProtectedAutoTransport:   ProtectedRegisterSizeAware,
+		RegisterWireFormat:       RegisterWireStandard,
+		MessagingPresentation:    MessagingPresentationSimAdminGBEE,
+	}
+}
+
 // DefaultGiffgaffTemplate matches extracted preset giffgaff_23410.yaml and the
 // embedded author binary carrier registry.
 func DefaultGiffgaffTemplate() IMSRegisterTemplate {
@@ -36,18 +72,34 @@ func DefaultGiffgaffTemplate() IMSRegisterTemplate {
 	}
 }
 
-// ResolveIMSRegisterTemplate selects the IMS REGISTER behavior required by a
-// home PLMN while keeping the existing generic fallback for unknown carriers.
-func ResolveIMSRegisterTemplate(mcc, mnc string) IMSRegisterTemplate {
+// ResolveCarrierBehavior resolves all carrier-specific IMS wire policy once
+// from the normalized home PLMN.
+func ResolveCarrierBehavior(mcc, mnc string) CarrierBehavior {
 	mcc = strings.TrimSpace(mcc)
 	mnc = strings.TrimLeft(strings.TrimSpace(mnc), "0")
 	if mnc == "" {
 		mnc = "0"
 	}
-	if mcc == "234" && mnc == "15" {
-		return VodafoneUKTemplate()
+	switch {
+	case mcc == "234" && mnc == "10":
+		return CarrierBehavior{
+			RegisterTemplate:         DefaultGiffgaffTemplate(),
+			UnprotectedAutoTransport: UnprotectedRegisterTCPOnly,
+			ProtectedAutoTransport:   ProtectedRegisterUDPOnly,
+			RegisterWireFormat:       RegisterWireStandard,
+			MessagingPresentation:    MessagingPresentationSimAdminGBEE,
+		}
+	case mcc == "234" && mnc == "15":
+		return CarrierBehavior{
+			RegisterTemplate:         VodafoneUKTemplate(),
+			UnprotectedAutoTransport: UnprotectedRegisterUDPThenTCP,
+			ProtectedAutoTransport:   ProtectedRegisterUDPOnly,
+			RegisterWireFormat:       RegisterWireVodafoneUK,
+			MessagingPresentation:    MessagingPresentationSimAdminGBEE,
+		}
+	default:
+		return Default3GPPBehavior()
 	}
-	return DefaultGiffgaffTemplate()
 }
 
 // VodafoneUKTemplate matches Vodafone UK's Qualcomm IMS profile: the first

@@ -110,7 +110,7 @@ func (p *Pool) BeforeStart(deviceID string, modemIface runtimehost.Modem, proxyC
 }
 
 func (p *Pool) HandleStartupError(req vowifihost.StartupErrorRequest) error {
-	return p.handleVoWiFiStartupError(req.TraceID, req.DeviceID, req.RuntimeEPDGOverride, req.Generation, req.StartedAt, p.GetWorker(req.DeviceID), req.State, req.Err)
+	return p.handleVoWiFiStartupError(req.TraceID, req.DeviceID, req.RuntimeEPDGOverride, req.StartedAt, p.GetWorker(req.DeviceID), req.State, req.Err)
 }
 
 func (p *Pool) MarkRuntimeStarted(req vowifihost.RuntimeStartedRequest) {

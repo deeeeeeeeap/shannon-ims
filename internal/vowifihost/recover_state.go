@@ -2,33 +2,23 @@ package vowifihost
 
 import (
 	"strings"
-	"sync"
 	"time"
 )
-
-type DesiredRecoverStore struct {
-	mu     sync.Mutex
-	states map[string]*desiredRecoverState
-}
-
-type desiredRecoverState struct {
-	attempt  int
-	nextAt   time.Time
-	inFlight bool
-	lastErr  string
-}
 
 type DesiredRecoverSnapshot struct {
 	Attempt  int
 	NextAt   time.Time
 	InFlight bool
-	LastErr  string
 	Delay    time.Duration
 }
 
-func NewDesiredRecoverStore() *DesiredRecoverStore {
-	return &DesiredRecoverStore{states: make(map[string]*desiredRecoverState)}
-}
+type desiredRecoverResult uint8
+
+const (
+	desiredRecoverSucceeded desiredRecoverResult = iota + 1
+	desiredRecoverPolicyBlocked
+	desiredRecoverFailed
+)
 
 func DesiredRecoverDelay(attempt int) time.Duration {
 	if attempt <= 0 {
@@ -40,31 +30,28 @@ func DesiredRecoverDelay(attempt int) time.Duration {
 	return 2 * time.Minute
 }
 
-func (m *Manager) BeginDesiredRecover(deviceID string, now time.Time) bool {
-	return m.desiredRecoverStore().Begin(deviceID, now)
-}
-
-func (m *Manager) MarkDesiredRecoverFailed(deviceID string, now time.Time, err error) DesiredRecoverSnapshot {
-	return m.desiredRecoverStore().MarkFailed(deviceID, now, err)
-}
-
-func (m *Manager) ClearDesiredRecoverState(deviceID string) {
-	m.desiredRecoverStore().Clear(deviceID)
+func (m *Manager) ForgetDesiredRecover(deviceID string) {
+	if m != nil {
+		m.RuntimeStore().forgetDesiredRecover(deviceID)
+	}
 }
 
 func (m *Manager) HasDesiredRecoverState(deviceID string) bool {
-	_, ok := m.desiredRecoverStore().Snapshot(deviceID)
+	_, ok := m.DesiredRecoverState(deviceID)
 	return ok
 }
 
 func (m *Manager) DesiredRecoverState(deviceID string) (DesiredRecoverSnapshot, bool) {
-	return m.desiredRecoverStore().Snapshot(deviceID)
+	if m == nil {
+		return DesiredRecoverSnapshot{}, false
+	}
+	return m.RuntimeStore().desiredRecoverState(deviceID)
 }
 
-func (s *DesiredRecoverStore) Begin(deviceID string, now time.Time) bool {
+func (s *Store) beginDesiredRecover(deviceID string, now time.Time) (uint64, bool) {
 	deviceID = strings.TrimSpace(deviceID)
 	if s == nil || deviceID == "" {
-		return false
+		return 0, false
 	}
 	if now.IsZero() {
 		now = time.Now()
@@ -72,18 +59,24 @@ func (s *DesiredRecoverStore) Begin(deviceID string, now time.Time) bool {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := s.ensureLocked(deviceID)
-	if st.inFlight || now.Before(st.nextAt) {
-		return false
+	slot := s.ensureSlotLocked(deviceID)
+	if slot.instance != nil || slot.starting {
+		return 0, false
 	}
-	st.inFlight = true
-	return true
+	if slot.recoverScheduleDone != nil || slot.recoverInFlight || now.Before(slot.recoverNextAt) {
+		return 0, false
+	}
+	slot.recoverGeneration++
+	slot.recoverInFlight = true
+	slot.recoverPresent = true
+	slot.recoverDelay = 0
+	return slot.recoverGeneration, true
 }
 
-func (s *DesiredRecoverStore) MarkFailed(deviceID string, now time.Time, err error) DesiredRecoverSnapshot {
+func (s *Store) finishDesiredRecover(deviceID string, generation uint64, now time.Time, result desiredRecoverResult) (DesiredRecoverSnapshot, bool) {
 	deviceID = strings.TrimSpace(deviceID)
-	if s == nil || deviceID == "" {
-		return DesiredRecoverSnapshot{}
+	if s == nil || deviceID == "" || generation == 0 {
+		return DesiredRecoverSnapshot{}, false
 	}
 	if now.IsZero() {
 		now = time.Now()
@@ -91,62 +84,109 @@ func (s *DesiredRecoverStore) MarkFailed(deviceID string, now time.Time, err err
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := s.ensureLocked(deviceID)
-	delay := DesiredRecoverDelay(st.attempt)
-	st.attempt++
-	st.nextAt = now.Add(delay)
-	st.inFlight = false
-	if err != nil {
-		st.lastErr = err.Error()
+	slot := s.slots[deviceID]
+	if slot == nil || !slot.recoverInFlight || slot.recoverGeneration != generation {
+		return DesiredRecoverSnapshot{}, false
 	}
-	return snapshotFromRecoverState(st, delay)
+	switch result {
+	case desiredRecoverSucceeded, desiredRecoverPolicyBlocked:
+		resetDesiredRecoverLocked(slot)
+		return DesiredRecoverSnapshot{}, true
+	case desiredRecoverFailed:
+		delay := DesiredRecoverDelay(slot.recoverAttempt)
+		slot.recoverAttempt++
+		slot.recoverNextAt = now.Add(delay)
+		slot.recoverInFlight = false
+		slot.recoverPresent = true
+		slot.recoverDelay = delay
+		return desiredRecoverSnapshot(slot), true
+	default:
+		return DesiredRecoverSnapshot{}, false
+	}
 }
 
-func (s *DesiredRecoverStore) Clear(deviceID string) {
+func (s *Store) forgetDesiredRecover(deviceID string) {
 	deviceID = strings.TrimSpace(deviceID)
 	if s == nil || deviceID == "" {
 		return
 	}
+
 	s.mu.Lock()
-	delete(s.states, deviceID)
+	slot := s.slots[deviceID]
+	if slot == nil || (!slot.recoverPresent && !slot.recoverInFlight && slot.recoverScheduleDone == nil) {
+		s.mu.Unlock()
+		return
+	}
+	activeGeneration := slot.recoverGeneration
+	slot.recoverGeneration++
+	resetDesiredRecoverLocked(slot)
+	scheduleCancel := slot.recoverScheduleCancel
+	scheduleDone := slot.recoverScheduleDone
+	slot.recoverScheduleCancel = nil
+	slot.recoverScheduleDone = nil
+	var cancel func()
+	if slot.runKind == LifecycleCommandRecover && slot.runRecoverGeneration == activeGeneration {
+		cancel = slot.runCancel
+		slot.runCancel = nil
+		slot.runKind = 0
+		slot.runRecoverGeneration = 0
+	}
 	s.mu.Unlock()
+	if scheduleCancel != nil {
+		scheduleCancel()
+	}
+	if cancel != nil {
+		cancel()
+	}
+	if scheduleDone != nil {
+		<-scheduleDone
+	}
 }
 
-func (s *DesiredRecoverStore) Snapshot(deviceID string) (DesiredRecoverSnapshot, bool) {
+func (s *Store) desiredRecoverCurrent(deviceID string, generation uint64) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" || generation == 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	slot := s.slots[deviceID]
+	return slot != nil && slot.recoverPresent && slot.recoverInFlight && slot.recoverGeneration == generation
+}
+
+func (s *Store) desiredRecoverState(deviceID string) (DesiredRecoverSnapshot, bool) {
 	deviceID = strings.TrimSpace(deviceID)
 	if s == nil || deviceID == "" {
 		return DesiredRecoverSnapshot{}, false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st := s.states[deviceID]
-	if st == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	slot := s.slots[deviceID]
+	if slot == nil || !slot.recoverPresent {
 		return DesiredRecoverSnapshot{}, false
 	}
-	return snapshotFromRecoverState(st, 0), true
+	return desiredRecoverSnapshot(slot), true
 }
 
-func (s *DesiredRecoverStore) ensureLocked(deviceID string) *desiredRecoverState {
-	if s.states == nil {
-		s.states = make(map[string]*desiredRecoverState)
+func resetDesiredRecoverLocked(slot *runtimeSlot) {
+	if slot == nil {
+		return
 	}
-	st := s.states[deviceID]
-	if st == nil {
-		st = &desiredRecoverState{}
-		s.states[deviceID] = st
-	}
-	return st
+	slot.recoverAttempt = 0
+	slot.recoverNextAt = time.Time{}
+	slot.recoverInFlight = false
+	slot.recoverDelay = 0
+	slot.recoverPresent = false
 }
 
-func snapshotFromRecoverState(st *desiredRecoverState, delay time.Duration) DesiredRecoverSnapshot {
-	if st == nil {
+func desiredRecoverSnapshot(slot *runtimeSlot) DesiredRecoverSnapshot {
+	if slot == nil {
 		return DesiredRecoverSnapshot{}
 	}
 	return DesiredRecoverSnapshot{
-		Attempt:  st.attempt,
-		NextAt:   st.nextAt,
-		InFlight: st.inFlight,
-		LastErr:  st.lastErr,
-		Delay:    delay,
+		Attempt:  slot.recoverAttempt,
+		NextAt:   slot.recoverNextAt,
+		InFlight: slot.recoverInFlight,
+		Delay:    slot.recoverDelay,
 	}
 }

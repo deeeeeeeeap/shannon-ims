@@ -39,6 +39,7 @@ type ReplayStats struct {
 
 // TransportStats aggregates userspace ESP transform counters.
 type TransportStats struct {
+	PeerInboundPackets uint64
 	OutboundPackets    uint64
 	InboundPackets     uint64
 	PassthroughPackets uint64

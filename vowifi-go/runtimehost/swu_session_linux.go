@@ -9,14 +9,16 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/1239t/swu-go/pkg/logger"
 	externalsim "github.com/1239t/swu-go/pkg/sim"
 	externalswu "github.com/1239t/swu-go/pkg/swu"
 	swusim "github.com/1239t/vowifi-go/engine/sim"
+	"go.uber.org/zap"
 )
+
+var errSWuConnectTimeout = errors.New("SWu tunnel timed out waiting for Child SA")
 
 type externalSIMAdapter struct {
 	inner SIMAdapter
@@ -50,29 +52,28 @@ func (a externalSIMAdapter) Close() error {
 	return a.inner.Close()
 }
 
-type swuInnerDataplane interface {
-	SendInnerPacket([]byte) error
-	InnerPackets() <-chan []byte
-}
-
-func (i *Instance) startSWuSession(ctx context.Context, req StartRequest, epdgIP, epdgPort string) (swuSnapshot, net.IP, swuInnerDataplane, func(string, string) error, error) {
+func (i *Instance) startSWuSession(ctx context.Context, req StartRequest, epdgIP, epdgPort string) (*swuSessionLease, error) {
 	if req.SIM == nil {
-		return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu tunnel failed: SIM AKA provider unavailable")
+		return nil, fmt.Errorf("SWu tunnel failed: SIM AKA provider unavailable")
 	}
 
 	port, err := strconv.Atoi(strings.TrimSpace(epdgPort))
 	if err != nil || port <= 0 || port > 65535 {
-		return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu tunnel failed: invalid ePDG port %q", epdgPort)
+		return nil, fmt.Errorf("SWu tunnel failed: invalid ePDG port %q", epdgPort)
 	}
 	remoteIP := net.ParseIP(epdgIP)
 	if remoteIP == nil {
-		return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu tunnel failed: invalid ePDG IP %q", epdgIP)
+		return nil, fmt.Errorf("SWu tunnel failed: invalid ePDG IP %q", epdgIP)
 	}
 
 	localIPStr := ""
 	usingProxy := req.Proxy != nil && req.Proxy.Enabled && strings.TrimSpace(req.Proxy.Addr) != ""
 	if !usingProxy {
-		if outIP, err := detectOutboundIPv4(remoteIP, port); err == nil && outIP != nil {
+		detectOutbound := req.outboundIPDetector
+		if detectOutbound == nil {
+			detectOutbound = detectOutboundIPv4
+		}
+		if outIP, err := detectOutbound(remoteIP, port); err == nil && outIP != nil {
 			localIPStr = outIP.String()
 		}
 	}
@@ -95,14 +96,9 @@ func (i *Instance) startSWuSession(ctx context.Context, req StartRequest, epdgIP
 		LocalPort:     0,
 	}
 	applySimAdminSWuProfile(cfg, req.Profile.MCC, req.Profile.MNC)
-	readyCh := make(chan struct{})
-	var readyOnce sync.Once
-	cfg.OnReady = func() {
-		readyOnce.Do(func() { close(readyCh) })
-	}
-	if factory := buildSWuTransportFactory(req.Proxy); factory != nil {
-		cfg.TransportFactory = factory
-	}
+	lease := newSWUSessionLease(epdgIP, req.swuCandidate, req.swuConnectJoinDeadline)
+	cfg.OnReady = lease.markReady
+	cfg.TransportFactory = buildObservedSWuTransportFactory(req.Proxy, req.swuCandidate, logger.Get(), nil)
 	if usingProxy {
 		logger.Info("VoWiFi SWu 将通过前置代理建立标准 IKE/UDP 隧道",
 			logger.String("trace_id", strings.TrimSpace(req.TraceID)),
@@ -113,52 +109,154 @@ func (i *Instance) startSWuSession(ctx context.Context, req StartRequest, epdgIP
 			logger.String("udp_ports", "500->4500"))
 	}
 
-	session := externalswu.NewSession(cfg, nil)
-	errCh := make(chan error, 1)
-	go func() { errCh <- session.Connect(ctx) }()
+	sessionFactory := req.swuSessionFactory
+	if sessionFactory == nil {
+		sessionFactory = func(cfg *externalswu.Config) swuSession {
+			return newExternalSWUSession(cfg)
+		}
+	}
+	session := sessionFactory(cfg)
+	if err := lease.start(session); err != nil {
+		return nil, fmt.Errorf("SWu tunnel failed: %w", err)
+	}
 
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	deadline := time.NewTimer(90 * time.Second)
-	defer deadline.Stop()
+	connectBudget := req.swuConnectBudget
+	if connectBudget <= 0 {
+		connectBudget = defaultSWUTunnelBudget
+	}
+	deadlineC := req.swuConnectDeadline
+	var deadline *time.Timer
+	if deadlineC == nil {
+		deadline = time.NewTimer(connectBudget)
+		deadlineC = deadline.C
+		defer deadline.Stop()
+	}
 
 	var lastSnap swuSnapshot
-	mobike := func(oldIP, newIP string) error {
-		target := epdgIP
-		if strings.TrimSpace(oldIP) != "" {
-			_ = oldIP
-		}
-		return session.UpdateAddresses(newIP, target)
-	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return swuSnapshot{}, nil, nil, nil, fmt.Errorf("%w; last_snapshot=%s", ctx.Err(), formatSWuSnapshot(lastSnap))
-		case err := <-errCh:
+			if err := lease.CancelAndJoin(); err != nil {
+				return nil, fmt.Errorf("%w; connect_join=%w; last_snapshot=%s", ctx.Err(), err, formatSWuSnapshot(lastSnap))
+			}
+			return nil, fmt.Errorf("%w; last_snapshot=%s", ctx.Err(), formatSWuSnapshot(lastSnap))
+		case <-lease.connectDone:
+			err := lease.connectResult()
 			lastSnap = fromExternalSnapshot(session.Snapshot())
-			if err != nil {
-				if isDataplanePermissionError(err) {
-					return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu userspace dataplane failed: configuring TUN requires root/CAP_NET_ADMIN: %w; last_snapshot=%s", err, formatSWuSnapshot(lastSnap))
+			if joinErr := lease.CancelAndJoin(); joinErr != nil {
+				if err != nil {
+					return nil, fmt.Errorf("SWu tunnel failed: %w; connect_join=%w; last_snapshot=%s", err, joinErr, formatSWuSnapshot(lastSnap))
 				}
-				return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu tunnel failed: %w; last_snapshot=%s", err, formatSWuSnapshot(lastSnap))
+				return nil, fmt.Errorf("SWu tunnel failed: connect_join=%w; last_snapshot=%s", joinErr, formatSWuSnapshot(lastSnap))
+			}
+			if err != nil {
+				logSWUIKEAuthInitialFailure(err)
+				if isDataplanePermissionError(err) {
+					return nil, fmt.Errorf("SWu userspace dataplane failed: configuring TUN requires root/CAP_NET_ADMIN: %w; last_snapshot=%s", err, formatSWuSnapshot(lastSnap))
+				}
+				return nil, fmt.Errorf("SWu tunnel failed: %w; last_snapshot=%s", err, formatSWuSnapshot(lastSnap))
 			}
 			if !lastSnap.Established || !snapshotHasLocalIP(lastSnap) {
-				return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu tunnel finished without usable Child SA; last_snapshot=%s", formatSWuSnapshot(lastSnap))
+				return nil, fmt.Errorf("SWu tunnel finished without usable Child SA; last_snapshot=%s", formatSWuSnapshot(lastSnap))
 			}
-			return lastSnap, preferTunnelLocalIP(lastSnap), session, mobike, nil
-		case <-readyCh:
+			lease.setReadySnapshot(lastSnap)
+			return lease, nil
+		case <-lease.ready:
 			lastSnap = fromExternalSnapshot(session.Snapshot())
 			if !lastSnap.Established || !snapshotHasLocalIP(lastSnap) {
-				return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu dataplane reported ready without usable tunnel IP; last_snapshot=%s", formatSWuSnapshot(lastSnap))
+				if joinErr := lease.CancelAndJoin(); joinErr != nil {
+					return nil, fmt.Errorf("SWu dataplane reported ready without usable tunnel IP; connect_join=%w; last_snapshot=%s", joinErr, formatSWuSnapshot(lastSnap))
+				}
+				return nil, fmt.Errorf("SWu dataplane reported ready without usable tunnel IP; last_snapshot=%s", formatSWuSnapshot(lastSnap))
 			}
-			return lastSnap, preferTunnelLocalIP(lastSnap), session, mobike, nil
-		case <-deadline.C:
-			return swuSnapshot{}, nil, nil, nil, fmt.Errorf("SWu tunnel timed out waiting for Child SA; last_snapshot=%s", formatSWuSnapshot(lastSnap))
+			lease.setReadySnapshot(lastSnap)
+			return lease, nil
+		case <-deadlineC:
+			if err := lease.CancelAndJoin(); err != nil {
+				return nil, fmt.Errorf("%w; connect_join=%w; last_snapshot=%s", errSWuConnectTimeout, err, formatSWuSnapshot(lastSnap))
+			}
+			return nil, fmt.Errorf("%w; last_snapshot=%s", errSWuConnectTimeout, formatSWuSnapshot(lastSnap))
 		case <-ticker.C:
 			lastSnap = fromExternalSnapshot(session.Snapshot())
 		}
 	}
+}
+
+type ikeAuthInitialDiagnostic interface {
+	error
+	Stage() string
+	Result() string
+	NotifyType() string
+	ProtocolID() uint8
+	DataLen() int
+}
+
+func logSWUIKEAuthInitialFailure(err error) {
+	var diagnostic ikeAuthInitialDiagnostic
+	if !errors.As(err, &diagnostic) || diagnostic.Stage() != "ike_auth_initial" {
+		return
+	}
+	result := safeIKEAuthInitialResult(diagnostic.Result())
+	fields := []zap.Field{
+		logger.String("stage", "ike_auth_initial"),
+		logger.String("result", result),
+	}
+	if result == "error_notify" {
+		fields = append(fields,
+			logger.String("notify_type", safeIKEAuthNotifyType(diagnostic.NotifyType())),
+			logger.Int("protocol_id", int(diagnostic.ProtocolID())),
+			logger.Int("data_len", boundedIKEAuthDataLen(diagnostic.DataLen())))
+	}
+	logger.Warn("SWu IKE_AUTH initial failure", fields...)
+}
+
+func safeIKEAuthInitialResult(result string) string {
+	switch result {
+	case "decrypt_failed", "integrity_failed", "error_notify", "missing_eap", "malformed", "canceled":
+		return result
+	default:
+		return "malformed"
+	}
+}
+
+func safeIKEAuthNotifyType(notifyType string) string {
+	switch notifyType {
+	case "unsupported_critical_payload",
+		"invalid_ike_spi",
+		"invalid_major_version",
+		"invalid_syntax",
+		"invalid_message_id",
+		"invalid_spi",
+		"no_proposal_chosen",
+		"invalid_ke_payload",
+		"authentication_failed",
+		"single_pair_required",
+		"no_additional_sas",
+		"internal_address_failure",
+		"failed_cp_required",
+		"ts_unacceptable",
+		"invalid_selectors",
+		"temporary_failure",
+		"child_sa_not_found",
+		"other_error_notify":
+		return notifyType
+	default:
+		return "other_error_notify"
+	}
+}
+
+func boundedIKEAuthDataLen(dataLen int) int {
+	if dataLen < 0 {
+		return 0
+	}
+	const maxIKEPayloadLen = 65535
+	if dataLen > maxIKEPayloadLen {
+		return maxIKEPayloadLen
+	}
+	return dataLen
 }
 
 func externalDataplaneMode(mode string) string {
@@ -236,16 +334,6 @@ func ipListString(ips []net.IP) string {
 		}
 	}
 	return strings.Join(parts, ",")
-}
-
-func preferTunnelLocalIP(s swuSnapshot) net.IP {
-	if s.IPv4 != nil {
-		return s.IPv4
-	}
-	if s.IPv6 != nil {
-		return s.IPv6
-	}
-	return nil
 }
 
 func detectOutboundIPv4(remoteIP net.IP, remotePort int) (net.IP, error) {

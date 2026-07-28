@@ -3,10 +3,7 @@ package imscore
 import (
 	"context"
 	"math/rand"
-	"strings"
 	"time"
-
-	"github.com/1239t/swu-go/pkg/logger"
 )
 
 const maxInitialRegisterJitter = time.Second
@@ -20,10 +17,8 @@ func waitInitialRegisterJitter(ctx context.Context, cfg Config) error {
 	if delay <= 0 {
 		return nil
 	}
-	logger.Info("初始注册随机延迟 (Jitter)",
-		logger.String("trace_id", strings.TrimSpace(cfg.TraceID)),
-		logger.String("device_id", strings.TrimSpace(cfg.DeviceID)),
-		logger.String("duration", delay.String()))
+	_ = cfg
+	logRegisterDiagnostic(registerDiagnostic{stage: "initial_jitter", result: "none"})
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {

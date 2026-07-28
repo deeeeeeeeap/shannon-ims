@@ -12,7 +12,6 @@ import (
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/internal/vowifihost"
 	"github.com/1239t/vowifi-go/runtimehost"
-	"github.com/1239t/vowifi-go/runtimehost/carrier"
 )
 
 func newDesiredVoWiFiTestPool(t *testing.T, deviceID string, enabled bool, imsi string) *Pool {
@@ -209,21 +208,6 @@ func TestDesiredVoWiFiRecoverBacksOffAfterFailure(t *testing.T) {
 	_ = waitForRecoverCommand(t, commands)
 }
 
-func TestDesiredVoWiFiRecoverResetsAfterSuccess(t *testing.T) {
-	p := newDesiredVoWiFiTestPool(t, "dev-1", true, "001010000000001")
-	now := time.Now().Add(-time.Minute)
-	if !p.voWiFiHost().BeginDesiredRecover("dev-1", now) {
-		t.Fatal("expected recover state setup to begin")
-	}
-	p.voWiFiHost().MarkDesiredRecoverFailed("dev-1", now, errors.New("network down"))
-
-	p.markDesiredVoWiFiRecoverResult("dev-1", nil)
-
-	if p.voWiFiHost().HasDesiredRecoverState("dev-1") {
-		t.Fatal("recover state should be cleared after success")
-	}
-}
-
 func TestDesiredVoWiFiPolicyBlockedDoesNotRetryForever(t *testing.T) {
 	p := newDesiredVoWiFiTestPool(t, "dev-1", true, "460001234567890")
 	w := p.GetWorker("dev-1")
@@ -244,11 +228,6 @@ func TestDesiredVoWiFiPolicyBlockedDoesNotRetryForever(t *testing.T) {
 		t.Fatal("policy-blocked device should not keep recover state")
 	}
 
-	blockErr := carrier.NewVoWiFiBlockedMCCError("460")
-	p.markDesiredVoWiFiRecoverResult("dev-1", blockErr)
-	if p.voWiFiHost().HasDesiredRecoverState("dev-1") {
-		t.Fatal("policy-blocked failure should clear recover state")
-	}
 }
 
 func TestDesiredVoWiFiRecoverUsesCachedHomeMCCMNCForPolicy(t *testing.T) {
@@ -361,5 +340,51 @@ func TestVoWiFiDesiredRecoverDelayCapsAtTwoMinutes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("delays = %v, want %v", got, want)
+	}
+}
+
+func TestAPDUBusyStartsPendingShortRetrySchedule(t *testing.T) {
+	p := newDesiredVoWiFiTestPool(t, "dev-1", true, "001010000000001")
+	claim := p.voWiFiHost().BeginStart("dev-1")
+	if !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
+	p.voWiFiHost().SetLifecycleRunForTest(func(ctx context.Context, _ vowifihost.LifecycleCommand) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	defer p.voWiFiHost().ForgetDesiredRecover("dev-1")
+
+	p.scheduleVoWiFiAPDUBusyRecover("dev-1", "")
+
+	state, ok := p.voWiFiHost().DesiredRecoverState("dev-1")
+	if !ok {
+		t.Fatal("APDU busy short retry schedule is absent")
+	}
+	if state.InFlight || state.Attempt != 0 || state.Delay != 3*time.Second {
+		t.Fatalf("APDU busy state = %+v, want pending first opportunity after 3s with no immediate recover", state)
+	}
+}
+
+func TestAPDUBusyUsesSingleOwnerManagedShortRetrySchedule(t *testing.T) {
+	p := newDesiredVoWiFiTestPool(t, "dev-1", true, "001010000000001")
+	claim := p.voWiFiHost().BeginStart("dev-1")
+	if !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
+	defer p.voWiFiHost().ForgetDesiredRecover("dev-1")
+
+	p.scheduleVoWiFiAPDUBusyRecover("dev-1", "")
+	first, ok := p.voWiFiHost().DesiredRecoverState("dev-1")
+	if !ok {
+		t.Fatal("first APDU busy schedule is absent")
+	}
+	p.scheduleVoWiFiAPDUBusyRecover("dev-1", "")
+	second, ok := p.voWiFiHost().DesiredRecoverState("dev-1")
+	if !ok {
+		t.Fatal("duplicate APDU busy removed the pending schedule")
+	}
+	if !reflect.DeepEqual(second, first) {
+		t.Fatalf("duplicate APDU busy changed schedule: first=%+v second=%+v", first, second)
 	}
 }

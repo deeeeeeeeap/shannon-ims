@@ -77,7 +77,7 @@ func (p *Pool) resolveAndApplyPolicy(worker *Worker, reason string) policyApplyR
 	if pol.VoWiFiEnabled {
 		p.scheduleDesiredVoWiFiRecover(worker.ID, reason, time.Now())
 	} else {
-		p.clearDesiredVoWiFiRecoverState(worker.ID)
+		p.voWiFiHost().ForgetDesiredRecover(worker.ID)
 	}
 	return policyApplyResult{Applied: true, ICCID: iccid, Reason: reason}
 }

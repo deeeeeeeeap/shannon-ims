@@ -7,9 +7,6 @@ import (
 	"net"
 	"sort"
 	"strings"
-
-	"github.com/emiago/sipgo/sip"
-	"github.com/1239t/swu-go/pkg/logger"
 )
 
 type registrarCandidate struct {
@@ -24,7 +21,11 @@ type registrarAttemptError struct {
 }
 
 func (e *registrarAttemptError) Error() string {
-	return fmt.Sprintf("unexpected initial REGISTER response: %d %s", e.statusCode, e.reason)
+	return fmt.Sprintf(
+		"unexpected initial REGISTER response: status=%d result=%s",
+		e.statusCode,
+		canonicalRegisterDiagnosticResult(e.reason),
+	)
 }
 
 func registrarCandidates(cfg Config) []string {
@@ -191,7 +192,25 @@ func shouldAdvanceRegistrarForProbeError(err error, hasMore bool) bool {
 	if !hasMore || err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, errProtectedPortsExhausted) {
+		return false
+	}
+	// A failure at or after the challenge must never advance to another registrar.
+	// A new candidate means a new initial REGISTER and therefore a second AKA run
+	// on a second authentication vector, which TS 24.229 clause 5.1.1.5.1 does not
+	// ask for: it says the registration has FAILED and the temporary SAs must be
+	// deleted.
+	//
+	// This check has to precede the substring matching below, because that matching
+	// looks for "timeout" - and a protected read timeout contains exactly that
+	// word. Ordering is the whole fix here, not an optimisation.
+	if registerReachedAuthenticatedPhase(err) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
@@ -204,42 +223,37 @@ func shouldAdvanceRegistrarForProbeError(err error, hasMore bool) bool {
 }
 
 func shouldAdvanceRegistrarForNextRetry(statusCode int, reason string, hasMore bool) bool {
-	if !hasMore {
-		return false
-	}
-	switch statusCode {
-	case sip.StatusForbidden,
-		sip.StatusRequestTimeout,
-		sip.StatusInternalServerError,
-		sip.StatusBadGateway,
-		sip.StatusServiceUnavailable,
-		sip.StatusGatewayTimeout,
-		sip.StatusTemporarilyUnavailable:
-		return true
-	default:
-		_ = reason
-		return false
-	}
+	_ = statusCode
+	_ = reason
+	_ = hasMore
+	return false
 }
 
 func logRegistrarProbe(traceID, deviceID string, index, total int, pcscf string) {
-	logger.Info("IMS REGISTER probing registrar candidate",
-		logger.String("trace_id", strings.TrimSpace(traceID)),
-		logger.String("device_id", strings.TrimSpace(deviceID)),
-		logger.Int("candidate_index", index),
-		logger.Int("candidate_total", total),
-		logger.String("pcscf", pcscf))
+	_ = traceID
+	_ = deviceID
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:          "candidate_attempt",
+		result:         "none",
+		addressFamily:  registerAddressFamily(pcscf),
+		candidateIndex: index,
+		candidateTotal: total,
+	})
 }
 
 func logRegistrarRejected(traceID, deviceID, pcscf string, statusCode int, reason string, index, total int) {
-	logger.Warn("IMS REGISTER registrar rejected, trying next candidate",
-		logger.String("trace_id", strings.TrimSpace(traceID)),
-		logger.String("device_id", strings.TrimSpace(deviceID)),
-		logger.String("pcscf", pcscf),
-		logger.Int("status", statusCode),
-		logger.String("reason", reason),
-		logger.Int("candidate_index", index),
-		logger.Int("candidate_total", total))
+	_ = traceID
+	_ = deviceID
+	_ = reason
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:          "candidate_rejected",
+		status:         statusCode,
+		result:         registerStatusResult(statusCode),
+		addressFamily:  registerAddressFamily(pcscf),
+		candidateIndex: index,
+		candidateTotal: total,
+		hasWarning:     true,
+	})
 }
 
 func maxInt(a, b int) int {

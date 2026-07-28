@@ -4,19 +4,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 	"github.com/1239t/vowifi-go/runtimehost/identity"
 	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
 )
 
-func TestResolveIMSRegisterTemplateForVodafoneUK(t *testing.T) {
-	tmpl := resolveIMSRegisterTemplate("234", "015")
+func TestResolvedCarrierBehaviorForVodafoneUK(t *testing.T) {
+	tmpl := policy.ResolveCarrierBehavior("234", "015").RegisterTemplate
 	if tmpl.ID != "vodafone_uk_23415" {
 		t.Fatalf("template ID = %q, want vodafone_uk_23415", tmpl.ID)
 	}
 }
 
 func TestResolveIMSUserAgentForVodafoneUK(t *testing.T) {
-	tmpl := resolveIMSRegisterTemplate("234", "015")
+	tmpl := policy.ResolveCarrierBehavior("234", "015").RegisterTemplate
 	if got := resolveIMSUserAgent(tmpl, "SimAdmin VoWiFi"); got != "Vodafone VOLTE Qualcomm" {
 		t.Fatalf("User-Agent = %q, want Vodafone VOLTE Qualcomm", got)
 	}

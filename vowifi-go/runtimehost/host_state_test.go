@@ -138,7 +138,7 @@ func TestInstanceStopWaitsForInFlightSendSMS(t *testing.T) {
 		sendStarted: make(chan struct{}),
 		releaseSend: make(chan struct{}),
 	}
-	instance := &Instance{svc: service}
+	instance := &Instance{svc: service, state: State{SMSReady: true}}
 	sendDone := make(chan error, 1)
 	go func() {
 		_, err := instance.SendSMS(context.Background(), "sip:safe.invalid", "synthetic", nil)
@@ -190,7 +190,7 @@ func TestInstanceStopHonorsCanceledContextWhileSendSMSIsBlocked(t *testing.T) {
 		sendStarted: make(chan struct{}),
 		releaseSend: make(chan struct{}),
 	}
-	instance := &Instance{svc: service}
+	instance := &Instance{svc: service, state: State{SMSReady: true}}
 	sendDone := make(chan error, 1)
 	go func() {
 		_, err := instance.SendSMS(context.Background(), "sip:safe.invalid", "synthetic", nil)
@@ -264,7 +264,7 @@ func TestInstanceStopCleanupUsesIndependentBoundedContext(t *testing.T) {
 		sendStarted: make(chan struct{}),
 		releaseSend: make(chan struct{}),
 	}
-	instance := &Instance{svc: service}
+	instance := &Instance{svc: service, state: State{SMSReady: true}}
 	sendDone := make(chan error, 1)
 	go func() {
 		_, err := instance.SendSMS(context.Background(), "sip:safe.invalid", "synthetic", nil)
@@ -336,7 +336,10 @@ func TestInstanceRejectsStalePipelineServiceAfterStop(t *testing.T) {
 	if got := staleService.closeCalls.Load(); got != 1 {
 		t.Fatalf("stale service close calls=%d, want 1", got)
 	}
-	if instance.Service() != nil {
+	instance.mu.Lock()
+	retainedService := instance.svc != nil
+	instance.mu.Unlock()
+	if retainedService {
 		t.Fatal("Service() retained stale pipeline service")
 	}
 }
@@ -433,6 +436,63 @@ func TestInstanceStopClearsSessionBeforePipelineExit(t *testing.T) {
 		t.Fatalf("runtimecore after canceled Stop() = %v, want false before pipeline exit", got)
 	}
 	close(pipelineDone)
+}
+
+func TestInstanceStatusReportsRunningWhenIMSReadyWithoutSMS(t *testing.T) {
+	instance := &Instance{state: State{
+		SIMReady:    true,
+		AccessReady: true,
+		TunnelReady: true,
+		IMSReady:    true,
+		SMSReady:    false,
+	}}
+
+	if got := instance.Status(); got != "running" {
+		t.Fatalf("Status() = %q, want running for registered IMS with SMS unavailable", got)
+	}
+}
+
+func TestInstanceSendSMSRejectsWhenSMSNotReady(t *testing.T) {
+	service := &lifecycleMessagingService{}
+	instance := &Instance{
+		svc: service,
+		state: State{
+			IMSReady: true,
+			SMSReady: false,
+		},
+	}
+
+	if _, err := instance.SendSMS(context.Background(), "sip:safe.invalid", "synthetic", nil); err == nil {
+		t.Fatal("SendSMS() error=nil with SMSReady=false")
+	}
+	if got := service.sendCalls.Load(); got != 0 {
+		t.Fatalf("service SendSMS calls=%d with SMSReady=false, want 0", got)
+	}
+}
+
+func TestMarkIMSReadyStateDoesNotInventSMSCapability(t *testing.T) {
+	updatedAt := time.Unix(123, 0)
+	state := State{}
+
+	markIMSReadyState(&state, false, updatedAt)
+
+	if !state.IMSReady {
+		t.Fatal("IMSReady=false after successful IMS registration")
+	}
+	if state.SMSReady {
+		t.Fatal("SMSReady=true without an attached messaging adapter")
+	}
+	if state.LastReason != "ims_ready" || !state.UpdatedAt.Equal(updatedAt) {
+		t.Fatal("IMS readiness metadata was not published atomically")
+	}
+}
+
+func TestMarkIMSReadyStateDoesNotExposeNetworkAddress(t *testing.T) {
+	state := State{}
+	markIMSReadyState(&state, true, time.Unix(123, 0))
+	if state.LastReason != "ims_ready" {
+		t.Fatalf("LastReason = %q, want bounded ims_ready enum", state.LastReason)
+	}
 }
 
 func TestStalePipelineCannotUpdateStateOrNotifyAfterStop(t *testing.T) {

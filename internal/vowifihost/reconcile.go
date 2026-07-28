@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/1239t/vohive/pkg/logger"
+	"github.com/1239t/vowifi-go/runtimehost/carrier"
 )
 
 const defaultDesiredRecoverReason = "desired_reconcile"
@@ -14,9 +15,7 @@ type DesiredRecoverRequest struct {
 	DeviceID     string
 	Reason       string
 	OverrideEPDG string
-	Generation   uint64
 	Now          time.Time
-	OnResult     func(deviceID, reason string, err error)
 }
 
 func (m *Manager) DesiredRecoverable(deviceID string) bool {
@@ -47,26 +46,39 @@ func (m *Manager) ScheduleDesiredRecover(ctx context.Context, req DesiredRecover
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if !m.DesiredRecoverable(deviceID) {
-		return false
-	}
-	if !m.BeginDesiredRecover(deviceID, now) {
+	recoverGeneration, accepted := m.RuntimeStore().beginDesiredRecover(deviceID, now)
+	if !accepted {
 		return false
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	logger.Warn("VoWiFi 目标态恢复开始", "event", "VOWIFI_DESIRED_RECOVER", "device", deviceID, "reason", reason)
+	logger.Warn("VoWiFi desired recover started", "event", "VOWIFI_DESIRED_RECOVER", "device", deviceID, "reason", reason)
 	go func() {
-		err := m.Recover(ctx, LifecycleRecoverRequest{
+		err := m.recoverDesired(ctx, LifecycleRecoverRequest{
 			DeviceID:     deviceID,
 			Reason:       reason,
 			OverrideEPDG: req.OverrideEPDG,
-			Generation:   req.Generation,
-		})
-		if req.OnResult != nil {
-			req.OnResult(deviceID, reason, err)
+		}, recoverGeneration)
+		result := desiredRecoverSucceeded
+		if err != nil {
+			result = desiredRecoverFailed
+			if carrier.IsVoWiFiPolicyBlockedError(err) {
+				result = desiredRecoverPolicyBlocked
+			}
+		}
+		snapshot, current := m.RuntimeStore().finishDesiredRecover(deviceID, recoverGeneration, time.Now(), result)
+		if !current {
+			return
+		}
+		switch result {
+		case desiredRecoverSucceeded:
+			logger.Info("VoWiFi desired recover succeeded", "event", "VOWIFI_DESIRED_RECOVER_SUCCESS", "device", deviceID)
+		case desiredRecoverPolicyBlocked:
+			logger.Warn("VoWiFi desired recover stopped by policy", "event", "VOWIFI_DESIRED_RECOVER_SKIPPED_POLICY", "device", deviceID)
+		case desiredRecoverFailed:
+			logger.Warn("VoWiFi desired recover backed off", "event", "VOWIFI_DESIRED_RETRY_DELAY", "device", deviceID, "attempt", snapshot.Attempt, "delay", snapshot.Delay.String())
 		}
 	}()
 	return true

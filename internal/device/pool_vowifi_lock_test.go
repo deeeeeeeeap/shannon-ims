@@ -197,6 +197,9 @@ func TestGetVoWiFiRuntimeStateWithoutAppReturnsFalse(t *testing.T) {
 func TestGetVoWiFiRuntimeStateReturnsStartupStateBeforeAppIsActive(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-starting"
+	if claim := p.voWiFiHost().BeginStart(deviceID); !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 	want := runtimehost.State{
 		DeviceID:   deviceID,
 		LastReason: "正在检测 Modem 存活性...",
@@ -219,6 +222,9 @@ func TestGetVoWiFiRuntimeStateReturnsStartupStateBeforeAppIsActive(t *testing.T)
 func TestRecordVoWiFiStartupStateCachesAndBroadcastsWhileInactive(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-startup-broadcast"
+	if claim := p.voWiFiHost().BeginStart(deviceID); !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 	ch, unsub := p.SubscribeVoWiFiState(deviceID)
 	defer unsub()
 
@@ -268,6 +274,9 @@ func TestNewVoWiFiSIMReadyStartupStateUsesSIMPhase(t *testing.T) {
 func TestRecordVoWiFiStartupStateKeepsNewestState(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-startup-newest"
+	if claim := p.voWiFiHost().BeginStart(deviceID); !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 	ch, unsub := p.SubscribeVoWiFiState(deviceID)
 	defer unsub()
 	earlier := runtimehost.State{
@@ -306,6 +315,9 @@ func TestRecordVoWiFiStartupStateKeepsNewestState(t *testing.T) {
 func TestClearVoWiFiStartupStateKeepsActiveAppAuthoritative(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-startup-success"
+	if claim := p.voWiFiHost().BeginStart(deviceID); !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 	activeApp := &runtimehost.Instance{}
 
 	p.voWiFiRuntimeStore().RecordStartupState(deviceID, runtimehost.State{DeviceID: deviceID, LastReason: "starting", UpdatedAt: time.Now()})
@@ -327,6 +339,9 @@ func TestClearVoWiFiStartupStateKeepsActiveAppAuthoritative(t *testing.T) {
 func TestClearVoWiFiStartupStateRemovesFailedStartupState(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-startup-failure"
+	if claim := p.voWiFiHost().BeginStart(deviceID); !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 
 	p.voWiFiRuntimeStore().RecordStartupState(deviceID, runtimehost.State{DeviceID: deviceID, LastReason: "ePDG 隧道建立失败", UpdatedAt: time.Now()})
 
@@ -343,6 +358,9 @@ func TestClearVoWiFiStartupStateRemovesFailedStartupState(t *testing.T) {
 func TestClearVoWiFiStartupStateAndBroadcastNotifiesSubscribers(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-startup-failure-broadcast"
+	if claim := p.voWiFiHost().BeginStart(deviceID); !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 	ch, unsub := p.SubscribeVoWiFiState(deviceID)
 	defer unsub()
 

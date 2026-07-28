@@ -17,7 +17,10 @@ const (
 	swuRawIPMTU        = 1280
 )
 
-var swuRawIPv4FragmentID atomic.Uint32
+var (
+	swuRawIPv4FragmentID atomic.Uint32
+	swuRawIPv6FragmentID atomic.Uint32
+)
 
 type swuRawIPConn struct {
 	owner    *swuNetstack
@@ -148,7 +151,7 @@ func (c *swuRawIPConn) Write(p []byte) (int, error) {
 	if !ok || metadata.protocol != c.protocol || !metadata.src.Equal(c.localIP) || !metadata.dst.Equal(c.remoteIP) {
 		return 0, errors.New("voiceclient: raw IP packet does not match connection")
 	}
-	packets, err := fragmentRawIPv4Packet(p, swuRawIPMTU)
+	packets, err := fragmentRawIPPacket(p, swuRawIPMTU)
 	if err != nil {
 		return 0, err
 	}
@@ -158,6 +161,74 @@ func (c *swuRawIPConn) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+func fragmentRawIPPacket(packet []byte, mtu int) ([][]byte, error) {
+	if len(packet) == 0 || len(packet) <= mtu {
+		return [][]byte{append([]byte(nil), packet...)}, nil
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		return fragmentRawIPv4Packet(packet, mtu)
+	case 6:
+		return fragmentRawIPv6Packet(packet, mtu)
+	default:
+		return [][]byte{append([]byte(nil), packet...)}, nil
+	}
+}
+
+func fragmentRawIPv6Packet(packet []byte, mtu int) ([][]byte, error) {
+	const (
+		ipv6HeaderLen  = 40
+		fragmentHdrLen = 8
+		fragmentProto  = 44
+	)
+	if len(packet) <= mtu {
+		return [][]byte{append([]byte(nil), packet...)}, nil
+	}
+	if mtu < ipv6HeaderLen+fragmentHdrLen+8 || len(packet) < ipv6HeaderLen {
+		return nil, errors.New("voiceclient: invalid raw IPv6 fragmentation input")
+	}
+	payloadLen := int(binary.BigEndian.Uint16(packet[4:6]))
+	if payloadLen != len(packet)-ipv6HeaderLen {
+		return nil, errors.New("voiceclient: invalid raw IPv6 payload length")
+	}
+	originalNextHeader := packet[6]
+	if originalNextHeader == fragmentProto {
+		return nil, errors.New("voiceclient: raw IPv6 packet is already fragmented")
+	}
+	maxPayloadLen := ((mtu - ipv6HeaderLen - fragmentHdrLen) / 8) * 8
+	if maxPayloadLen <= 0 {
+		return nil, errors.New("voiceclient: raw IPv6 MTU leaves no fragment payload")
+	}
+	identification := swuRawIPv6FragmentID.Add(1)
+	if identification == 0 {
+		identification = swuRawIPv6FragmentID.Add(1)
+	}
+	payload := packet[ipv6HeaderLen:]
+	fragments := make([][]byte, 0, (len(payload)+maxPayloadLen-1)/maxPayloadLen)
+	for offset := 0; offset < len(payload); {
+		fragmentPayloadLen := len(payload) - offset
+		if fragmentPayloadLen > maxPayloadLen {
+			fragmentPayloadLen = maxPayloadLen
+		}
+		moreFragments := offset+fragmentPayloadLen < len(payload)
+		fragment := make([]byte, ipv6HeaderLen+fragmentHdrLen+fragmentPayloadLen)
+		copy(fragment[:ipv6HeaderLen], packet[:ipv6HeaderLen])
+		binary.BigEndian.PutUint16(fragment[4:6], uint16(fragmentHdrLen+fragmentPayloadLen))
+		fragment[6] = fragmentProto
+		fragment[ipv6HeaderLen] = originalNextHeader
+		fragmentOffset := uint16(offset/8) << 3
+		if moreFragments {
+			fragmentOffset |= 1
+		}
+		binary.BigEndian.PutUint16(fragment[ipv6HeaderLen+2:ipv6HeaderLen+4], fragmentOffset)
+		binary.BigEndian.PutUint32(fragment[ipv6HeaderLen+4:ipv6HeaderLen+8], identification)
+		copy(fragment[ipv6HeaderLen+fragmentHdrLen:], payload[offset:offset+fragmentPayloadLen])
+		fragments = append(fragments, fragment)
+		offset += fragmentPayloadLen
+	}
+	return fragments, nil
 }
 
 func fragmentRawIPv4Packet(packet []byte, mtu int) ([][]byte, error) {

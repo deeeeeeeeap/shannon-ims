@@ -21,6 +21,40 @@ type runtimeEnableRequest struct {
 	Reason       string
 }
 
+func (m *Manager) runAdmittedLifecycleCommand(ctx context.Context, cmd LifecycleCommand) error {
+	if m == nil {
+		return fmt.Errorf("vowifi host manager is nil")
+	}
+	if cmd.Generation == 0 {
+		return fmt.Errorf("vowifi lifecycle command has no RuntimeAttempt generation")
+	}
+
+	if cmd.desiredRecoverGeneration != 0 && !m.RuntimeStore().desiredRecoverCurrent(cmd.DeviceID, cmd.desiredRecoverGeneration) {
+		return nil
+	}
+	runCtx, release, current := m.RuntimeStore().bindLifecycleRun(ctx, cmd.DeviceID, cmd.Generation, cmd.Kind, cmd.desiredRecoverGeneration)
+	if !current {
+		logger.Debug("ignore stale VoWiFi lifecycle command",
+			"device", strings.TrimSpace(cmd.DeviceID),
+			"kind", cmd.Kind.String(),
+			"command_generation", cmd.Generation,
+			"current_generation", m.RuntimeStore().currentLifecycleGeneration(cmd.DeviceID))
+		return nil
+	}
+	defer release()
+
+	if m.lifecycleTest != nil {
+		return m.lifecycleTest(runCtx, cmd)
+	}
+	if cmd.Kind == LifecycleCommandRecover && m.recoverTest != nil {
+		return m.recoverTest(runCtx, cmd.DeviceID, cmd.Reason, cmd.OverrideEPDG)
+	}
+	if m.lifecycleRun != nil {
+		return m.lifecycleRun(runCtx, cmd)
+	}
+	return m.runLifecycleCommand(runCtx, cmd)
+}
+
 func (m *Manager) runLifecycleCommand(ctx context.Context, cmd LifecycleCommand) error {
 	if m == nil {
 		return fmt.Errorf("vowifi host manager is nil")
@@ -35,13 +69,13 @@ func (m *Manager) runLifecycleCommand(ctx context.Context, cmd LifecycleCommand)
 			Reason:       cmd.Reason,
 		})
 	case LifecycleCommandDisable:
-		return m.disableRuntime(ctx, cmd.DeviceID, cmd.Reason, cmd.RestoreRadio, cmd.RuntimeInvalidated)
+		return m.disableRuntime(ctx, cmd.DeviceID, cmd.Reason, cmd.RestoreRadio)
 	case LifecycleCommandRestart:
 		return m.restartRuntime(ctx, cmd.DeviceID, cmd.Generation)
 	case LifecycleCommandRecover:
 		return m.recoverRuntime(ctx, cmd.DeviceID, cmd.Reason, cmd.Generation, cmd.OverrideEPDG)
 	case LifecycleCommandSwitchBegin:
-		m.TeardownForSwitch(ctx, cmd.DeviceID)
+		m.teardownForSwitchAttempt(ctx, cmd.DeviceID)
 		return nil
 	case LifecycleCommandSwitchEnd:
 		if cmd.RestoreRadio {
@@ -98,7 +132,10 @@ func (m *Manager) enableRuntime(ctx context.Context, req runtimeEnableRequest) (
 	if err != nil {
 		return err
 	}
-	generation := m.ensureLifecycleGeneration(deviceID, req.Generation, req.Reason)
+	generation := req.Generation
+	if generation == 0 {
+		return fmt.Errorf("vowifi runtime attempt generation is missing")
+	}
 	modemIface := preparedStart.Modem
 	if modemIface == nil {
 		return fmt.Errorf("设备 %s 的 VoWiFi modem adapter 未准备", deviceID)
@@ -126,7 +163,6 @@ func (m *Manager) enableRuntime(ctx context.Context, req runtimeEnableRequest) (
 			TraceID:             traceID,
 			DeviceID:            deviceID,
 			RuntimeEPDGOverride: strings.TrimSpace(req.OverrideEPDG),
-			Generation:          generation,
 			StartedAt:           startedAt,
 			State:               state,
 			Err:                 err,
@@ -148,7 +184,6 @@ func (m *Manager) enableRuntime(ctx context.Context, req runtimeEnableRequest) (
 		activeCount = 1
 	}
 	startFinalized = true
-	m.ClearStartupStateAndBroadcast(deviceID)
 	adapter.MarkRuntimeStarted(RuntimeStartedRequest{
 		TraceID:     traceID,
 		DeviceID:    deviceID,
@@ -160,7 +195,7 @@ func (m *Manager) enableRuntime(ctx context.Context, req runtimeEnableRequest) (
 	return nil
 }
 
-func (m *Manager) disableRuntime(ctx context.Context, reasonDeviceID, reason string, restoreRadio, skipInvalidate bool) error {
+func (m *Manager) disableRuntime(ctx context.Context, reasonDeviceID, reason string, restoreRadio bool) error {
 	adapter := m.hostAdapter()
 	if adapter == nil {
 		return fmt.Errorf("vowifi host adapter is not configured")
@@ -183,7 +218,7 @@ func (m *Manager) disableRuntime(ctx context.Context, reasonDeviceID, reason str
 		stopped := m.TeardownSession(ctx, devID, TeardownOptions{
 			Reason:         reason,
 			RestoreSMS:     true,
-			SkipInvalidate: skipInvalidate,
+			SkipInvalidate: true,
 		})
 		if !stopped {
 			logger.Info("VoWiFi 实例不存在，执行强制恢复流程", "device", devID, "reason", reason, "restore_radio", restoreRadio)
@@ -213,7 +248,7 @@ func (m *Manager) restartRuntime(ctx context.Context, deviceID string, generatio
 	}
 
 	logger.Info("准备重启 VoWiFi 隧道...", "device", deviceID)
-	if err := m.disableRuntime(ctx, deviceID, "restart", true, false); err != nil {
+	if err := m.disableRuntime(ctx, deviceID, "restart", true); err != nil {
 		logger.Warn("停用旧 VoWiFi 隧道时发生错误", "device", deviceID, "err", err)
 	}
 	if err := m.enableWhenReady(ctx, deviceID, lifecycleReadyTimeout, "restart", "", generation); err != nil {
@@ -235,7 +270,7 @@ func (m *Manager) recoverRuntime(ctx context.Context, deviceID, reason string, g
 		logger.Debug("VoWiFi recover 跳过：运行态仍活跃或正在启动", "device", deviceID, "reason", reason)
 		return nil
 	}
-	_ = m.TeardownSession(ctx, deviceID, TeardownOptions{Reason: reason, RestoreSMS: true})
+	_ = m.TeardownSession(ctx, deviceID, TeardownOptions{Reason: reason, RestoreSMS: true, SkipInvalidate: true})
 	if err := m.enableWhenReady(ctx, deviceID, lifecycleReadyTimeout, reason, overrideEPDG, generation); err != nil {
 		return fmt.Errorf("恢复 VoWiFi 失败(%s): %w", reason, err)
 	}
@@ -246,9 +281,6 @@ func (m *Manager) enableWhenReady(ctx context.Context, deviceID string, timeout 
 	adapter := m.hostAdapter()
 	if adapter == nil {
 		return fmt.Errorf("vowifi host adapter is not configured")
-	}
-	if generation == 0 {
-		logger.Debug("VoWiFi ready-enable received zero generation; runtime fallback may allocate one", "device", strings.TrimSpace(deviceID), "reason", strings.TrimSpace(reason))
 	}
 	if err := adapter.WaitQMICoreReady(deviceID, timeout); err != nil {
 		return fmt.Errorf("等待设备 %s QMI Core 就绪失败(%s): %w", deviceID, reason, err)
@@ -262,15 +294,6 @@ func (m *Manager) enableWhenReady(ctx context.Context, deviceID string, timeout 
 		Generation:   generation,
 		Reason:       reason,
 	})
-}
-
-func (m *Manager) ensureLifecycleGeneration(deviceID string, generation uint64, reason string) uint64 {
-	if generation != 0 {
-		return generation
-	}
-	fallback := m.NextLifecycleGeneration(deviceID)
-	logger.Debug("VoWiFi 启动缺少 lifecycle generation，已使用 fallback generation", "device", strings.TrimSpace(deviceID), "reason", strings.TrimSpace(reason), "generation", fallback)
-	return fallback
 }
 
 func hostContext(ctx context.Context, adapter Adapter) context.Context {

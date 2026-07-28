@@ -1,6 +1,7 @@
 package vowifihost
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -8,36 +9,112 @@ import (
 	"github.com/1239t/vowifi-go/runtimehost"
 )
 
-type RuntimeStore interface {
-	BeginStart(deviceID string) StartClaim
-	ClaimStarted(deviceID string, epoch uint64, inst *runtimehost.Instance) bool
-	FailStart(deviceID string, epoch uint64, state runtimehost.State, err error)
-	RecordStartupState(deviceID string, state runtimehost.State) bool
-	ClearStartupState(deviceID string) bool
-	Invalidate(deviceID string) (uint64, bool)
-	CurrentEpoch(deviceID string) uint64
-	Active(deviceID string) bool
-	Starting(deviceID string) bool
-	Instance(deviceID string) *runtimehost.Instance
-	SetInstance(deviceID string, inst *runtimehost.Instance)
-	DeleteInstance(deviceID string, inst *runtimehost.Instance) bool
-	State(deviceID string) (runtimehost.State, bool)
-	Instances() map[string]*runtimehost.Instance
-	InstanceIDs() []string
-}
-
 type Store struct {
-	mu    sync.RWMutex
-	slots map[string]*runtimeSlot
+	mu               sync.RWMutex
+	slots            map[string]*runtimeSlot
+	nextSubscriberID uint64
+	subscribers      map[string]map[uint64]chan struct{}
 }
 
 type runtimeSlot struct {
-	instance  *runtimehost.Instance
-	starting  bool
-	epoch     uint64
-	state     runtimehost.State
-	lastErr   string
-	updatedAt time.Time
+	instance              *runtimehost.Instance
+	starting              bool
+	epoch                 uint64
+	lifecycleGeneration   uint64
+	runCancel             context.CancelFunc
+	runCancelSequence     uint64
+	runKind               LifecycleCommandKind
+	runRecoverGeneration  uint64
+	recoverGeneration     uint64
+	recoverAttempt        int
+	recoverNextAt         time.Time
+	recoverInFlight       bool
+	recoverDelay          time.Duration
+	recoverPresent        bool
+	recoverScheduleCancel context.CancelFunc
+	recoverScheduleDone   chan struct{}
+	state                 runtimehost.State
+	updatedAt             time.Time
+}
+
+func (s *Store) admitLifecycle(deviceID string, kind LifecycleCommandKind) (uint64, bool) {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot := s.ensureSlotLocked(deviceID)
+	if kind == LifecycleCommandEnable && (slot.instance != nil || slot.starting) {
+		return slot.lifecycleGeneration, false
+	}
+	slot.lifecycleGeneration++
+	return slot.lifecycleGeneration, true
+}
+
+func (s *Store) preemptLifecycle(deviceID string) (uint64, context.CancelFunc) {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" {
+		return 0, nil
+	}
+	s.mu.Lock()
+	slot := s.ensureSlotLocked(deviceID)
+	slot.lifecycleGeneration++
+	generation := slot.lifecycleGeneration
+	cancel := slot.runCancel
+	slot.runCancel = nil
+	slot.runKind = 0
+	slot.runRecoverGeneration = 0
+	s.mu.Unlock()
+	return generation, cancel
+}
+
+func (s *Store) currentLifecycleGeneration(deviceID string) uint64 {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if slot := s.slots[deviceID]; slot != nil {
+		return slot.lifecycleGeneration
+	}
+	return 0
+}
+
+func (s *Store) bindLifecycleRun(ctx context.Context, deviceID string, generation uint64, kind LifecycleCommandKind, recoverGeneration uint64) (context.Context, func(), bool) {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" || generation == 0 {
+		return ctx, func() {}, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+
+	s.mu.Lock()
+	slot := s.slots[deviceID]
+	if slot == nil || slot.lifecycleGeneration != generation {
+		s.mu.Unlock()
+		cancel()
+		return ctx, func() {}, false
+	}
+	slot.runCancelSequence++
+	sequence := slot.runCancelSequence
+	slot.runCancel = cancel
+	slot.runKind = kind
+	slot.runRecoverGeneration = recoverGeneration
+	s.mu.Unlock()
+
+	return runCtx, func() {
+		s.mu.Lock()
+		if slot := s.slots[deviceID]; slot != nil && slot.runCancelSequence == sequence {
+			slot.runCancel = nil
+			slot.runKind = 0
+			slot.runRecoverGeneration = 0
+		}
+		s.mu.Unlock()
+	}, true
 }
 
 type StartClaim struct {
@@ -48,7 +125,70 @@ type StartClaim struct {
 }
 
 func NewRuntimeStore() *Store {
-	return &Store{slots: make(map[string]*runtimeSlot)}
+	return &Store{
+		slots:       make(map[string]*runtimeSlot),
+		subscribers: make(map[string]map[uint64]chan struct{}),
+	}
+}
+
+func (s *Store) Subscribe(deviceID string) (<-chan struct{}, func()) {
+	deviceID = strings.TrimSpace(deviceID)
+	updates := make(chan struct{}, 1)
+	if s == nil || deviceID == "" {
+		return updates, func() {}
+	}
+
+	s.mu.Lock()
+	if s.subscribers == nil {
+		s.subscribers = make(map[string]map[uint64]chan struct{})
+	}
+	s.nextSubscriberID++
+	subscriberID := s.nextSubscriberID
+	if s.subscribers[deviceID] == nil {
+		s.subscribers[deviceID] = make(map[uint64]chan struct{})
+	}
+	s.subscribers[deviceID][subscriberID] = updates
+	s.mu.Unlock()
+
+	return updates, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if subscribers := s.subscribers[deviceID]; subscribers != nil {
+			delete(subscribers, subscriberID)
+			if len(subscribers) == 0 {
+				delete(s.subscribers, deviceID)
+			}
+		}
+	}
+}
+
+func (s *Store) SubscriberCount(deviceID string) int {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.subscribers[deviceID])
+}
+
+func (s *Store) Broadcast(deviceID string) {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notifyLocked(deviceID)
+}
+
+func (s *Store) notifyLocked(deviceID string) {
+	for _, updates := range s.subscribers[deviceID] {
+		select {
+		case updates <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Store) ensureSlotLocked(deviceID string) *runtimeSlot {
@@ -78,7 +218,6 @@ func (s *Store) BeginStart(deviceID string) StartClaim {
 		return StartClaim{Epoch: slot.epoch, Starting: true}
 	}
 	slot.starting = true
-	slot.lastErr = ""
 	slot.updatedAt = time.Now()
 	return StartClaim{Epoch: slot.epoch, Accepted: true}
 }
@@ -89,42 +228,55 @@ func (s *Store) ClaimStarted(deviceID string, epoch uint64, inst *runtimehost.In
 		return false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	slot := s.ensureSlotLocked(deviceID)
-	if slot.epoch != epoch {
+	if slot.epoch != epoch || !slot.starting {
+		s.mu.Unlock()
 		return false
 	}
 	if slot.instance != nil {
+		s.mu.Unlock()
 		return false
 	}
+	currentAPDUScheduleRun := slot.recoverScheduleDone != nil &&
+		slot.runKind == LifecycleCommandRecover &&
+		slot.runRecoverGeneration == slot.recoverGeneration
+	var scheduleCancel context.CancelFunc
 	slot.instance = inst
 	slot.starting = false
+	if (slot.recoverPresent || slot.recoverInFlight || slot.recoverScheduleDone != nil) && !currentAPDUScheduleRun {
+		scheduleCancel = slot.recoverScheduleCancel
+		slot.recoverGeneration++
+		resetDesiredRecoverLocked(slot)
+	}
 	slot.state = runtimehost.State{}
-	slot.lastErr = ""
 	slot.updatedAt = time.Now()
+	s.notifyLocked(deviceID)
+	s.mu.Unlock()
+	if scheduleCancel != nil {
+		scheduleCancel()
+	}
 	return true
 }
 
-func (s *Store) FailStart(deviceID string, epoch uint64, state runtimehost.State, err error) {
+func (s *Store) FailStart(deviceID string, epoch uint64, state runtimehost.State, _ error) bool {
 	deviceID = strings.TrimSpace(deviceID)
 	if s == nil || deviceID == "" {
-		return
+		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	slot := s.ensureSlotLocked(deviceID)
-	if slot.epoch != epoch {
-		return
+	if slot.epoch != epoch || !slot.starting {
+		return false
 	}
 	slot.starting = false
 	if state.UpdatedAt.IsZero() {
 		state.UpdatedAt = time.Now()
 	}
 	slot.state = state
-	if err != nil {
-		slot.lastErr = err.Error()
-	}
 	slot.updatedAt = time.Now()
+	s.notifyLocked(deviceID)
+	return true
 }
 
 func (s *Store) RecordStartupState(deviceID string, state runtimehost.State) bool {
@@ -138,7 +290,7 @@ func (s *Store) RecordStartupState(deviceID string, state runtimehost.State) boo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	slot := s.ensureSlotLocked(deviceID)
-	if slot.instance != nil {
+	if slot.instance != nil || !slot.starting {
 		return false
 	}
 	if !slot.state.UpdatedAt.IsZero() && state.UpdatedAt.Before(slot.state.UpdatedAt) {
@@ -146,6 +298,41 @@ func (s *Store) RecordStartupState(deviceID string, state runtimehost.State) boo
 	}
 	slot.state = state
 	slot.updatedAt = state.UpdatedAt
+	s.notifyLocked(deviceID)
+	return true
+}
+
+func (s *Store) publishRuntimeState(deviceID string, epoch uint64, inst *runtimehost.Instance, state runtimehost.State) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	if s == nil || deviceID == "" || inst == nil {
+		return false
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot := s.slots[deviceID]
+	if slot == nil || slot.epoch != epoch {
+		return false
+	}
+	if slot.instance != nil {
+		if slot.instance != inst {
+			return false
+		}
+		s.notifyLocked(deviceID)
+		return true
+	}
+	if !slot.starting {
+		return false
+	}
+	if !slot.state.UpdatedAt.IsZero() && state.UpdatedAt.Before(slot.state.UpdatedAt) {
+		return false
+	}
+	slot.state = state
+	slot.updatedAt = state.UpdatedAt
+	s.notifyLocked(deviceID)
 	return true
 }
 
@@ -160,9 +347,11 @@ func (s *Store) ClearStartupState(deviceID string) bool {
 	if slot == nil || slot.state.UpdatedAt.IsZero() {
 		return false
 	}
+	slot.starting = false
 	slot.state = runtimehost.State{}
 	slot.updatedAt = time.Now()
-	if slot.instance == nil && !slot.starting && slot.lastErr == "" {
+	s.notifyLocked(deviceID)
+	if slot.instance == nil && !slot.starting && slot.recoverGeneration == 0 {
 		delete(s.slots, deviceID)
 	}
 	return true
@@ -174,15 +363,25 @@ func (s *Store) Invalidate(deviceID string) (uint64, bool) {
 		return 0, false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	slot := s.ensureSlotLocked(deviceID)
+	cancel := slot.runCancel
+	slot.runCancel = nil
+	slot.runKind = 0
+	slot.runRecoverGeneration = 0
 	slot.epoch++
 	slot.starting = false
 	hadState := !slot.state.UpdatedAt.IsZero()
 	slot.state = runtimehost.State{}
-	slot.lastErr = ""
 	slot.updatedAt = time.Now()
-	return slot.epoch, hadState
+	if hadState {
+		s.notifyLocked(deviceID)
+	}
+	epoch := slot.epoch
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return epoch, hadState
 }
 
 func (s *Store) CurrentEpoch(deviceID string) uint64 {
@@ -238,9 +437,13 @@ func (s *Store) SetInstance(deviceID string, inst *runtimehost.Instance) {
 	slot := s.ensureSlotLocked(deviceID)
 	slot.instance = inst
 	slot.starting = false
+	if slot.recoverPresent || slot.recoverInFlight {
+		slot.recoverGeneration++
+		resetDesiredRecoverLocked(slot)
+	}
 	slot.state = runtimehost.State{}
-	slot.lastErr = ""
 	slot.updatedAt = time.Now()
+	s.notifyLocked(deviceID)
 }
 
 func (s *Store) DeleteInstance(deviceID string, inst *runtimehost.Instance) bool {
@@ -260,9 +463,9 @@ func (s *Store) DeleteInstance(deviceID string, inst *runtimehost.Instance) bool
 	slot.instance = nil
 	slot.starting = false
 	slot.state = runtimehost.State{}
-	slot.lastErr = ""
 	slot.updatedAt = time.Now()
-	if slot.epoch == 0 {
+	s.notifyLocked(deviceID)
+	if slot.epoch == 0 && slot.recoverGeneration == 0 {
 		delete(s.slots, deviceID)
 	}
 	return true

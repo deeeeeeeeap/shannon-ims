@@ -165,25 +165,25 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 	}
 
 	inst, err := m.runtimeStarter()(ctx, runtimehost.StartRequest{
-		Mode:          runtimehost.StartModeMain,
-		DeviceID:      deviceID,
-		TraceID:       traceID,
-		Profile:       profile,
-		Prepared:      &prepared,
-		NetworkMode:   networkMode,
-		VoiceGateway:  req.VoiceGateway,
-		SIM:           buildVoWiFiSIMAdapter(req.Prepared.SIM, req.Modem, prepared.Profile.IMSI),
-		Access:        runtimehost.NewModemAccessAdapter(req.Modem),
-		Dataplane:     req.Dataplane,
-		Proxy:         req.Prepared.Proxy,
+		Mode:            runtimehost.StartModeMain,
+		DeviceID:        deviceID,
+		TraceID:         traceID,
+		Profile:         profile,
+		Prepared:        &prepared,
+		NetworkMode:     networkMode,
+		VoiceGateway:    req.VoiceGateway,
+		SIM:             buildVoWiFiSIMAdapter(req.Prepared.SIM, req.Modem, prepared.Profile.IMSI),
+		Access:          runtimehost.NewModemAccessAdapter(req.Modem),
+		Dataplane:       req.Dataplane,
+		Proxy:           req.Prepared.Proxy,
 		PCSCFAddr:       req.Prepared.PCSCFAddr,
 		CellID:          req.Prepared.CellID,
 		RegisterProfile: req.Prepared.RegisterProfile,
 		SIPInstanceURN:  req.Prepared.SIPInstanceURN,
 		RegisterExpiry:  req.Prepared.RegisterExpiry,
 		DeliveryStore:   req.DeliveryStore,
-		Dispatch:      req.Dispatch,
-		BeforeStart:   req.BeforeStart,
+		Dispatch:        req.Dispatch,
+		BeforeStart:     req.BeforeStart,
 		ShouldRun: func() bool {
 			return ctx.Err() == nil && m.ShouldRun(deviceID, req.Epoch)
 		},
@@ -193,18 +193,13 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 	}
 
 	inst.AddObserver(runtimehost.ObserverFunc(func(_ context.Context, ev runtimehost.Event) {
-		if m.IsCurrentInstance(deviceID, inst) {
-			m.BroadcastState(deviceID)
-			return
-		}
-		m.RecordStartupState(deviceID, ev.State)
+		m.publishRuntimeState(deviceID, req.Epoch, inst, ev.State)
 	}))
 
 	if !m.ClaimStarted(deviceID, req.Epoch, inst) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = inst.Stop(stopCtx)
 		cancel()
-		m.ClearStartupStateAndBroadcast(deviceID)
 		return RuntimeStartResult{Instance: inst, Stale: true}, nil
 	}
 

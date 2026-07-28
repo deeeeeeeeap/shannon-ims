@@ -3,8 +3,6 @@ package imscore
 import (
 	"net"
 	"strings"
-
-	"github.com/1239t/swu-go/pkg/logger"
 )
 
 const (
@@ -137,10 +135,13 @@ func defaultRegistrarPort() string {
 }
 
 func reportRegistrarDiscoveryProgress(traceID, deviceID, registrar, source string, candidateCount int) {
-	logger.Info("IMS registrar discovery",
-		logger.String("trace_id", strings.TrimSpace(traceID)),
-		logger.String("device_id", strings.TrimSpace(deviceID)),
-		logger.String("registrar", strings.TrimSpace(registrar)),
-		logger.String("registrar_source", strings.TrimSpace(source)),
-		logger.Int("registrar_candidates", candidateCount))
+	_ = traceID
+	_ = deviceID
+	_ = source
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:          "discovery",
+		result:         "none",
+		addressFamily:  registerAddressFamily(registrar),
+		candidateTotal: candidateCount,
+	})
 }

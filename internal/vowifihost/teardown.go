@@ -45,7 +45,6 @@ func (m *Manager) StopInstanceForTeardown(ctx context.Context, deviceID, reason 
 		logger.Warn("VoWiFi teardown 失败", "device", deviceID, "reason", reason, "err", err)
 	}
 	m.RuntimeStore().DeleteInstance(deviceID, inst)
-	m.BroadcastState(deviceID)
 	return true
 }
 
@@ -93,6 +92,14 @@ func (m *Manager) TeardownForSwitch(ctx context.Context, deviceID string) bool {
 	return true
 }
 
+func (m *Manager) teardownForSwitchAttempt(ctx context.Context, deviceID string) bool {
+	if !m.TeardownSession(ctx, deviceID, TeardownOptions{Reason: "switch", RestoreSMS: true, SkipInvalidate: true}) {
+		return false
+	}
+	logger.Info("eSIM switch removed the previous VoWiFi runtime", "device", strings.TrimSpace(deviceID))
+	return true
+}
+
 func (m *Manager) InvalidateRuntime(deviceID, reason string) uint64 {
 	if m == nil {
 		return 0
@@ -105,10 +112,8 @@ func (m *Manager) InvalidateRuntime(deviceID, reason string) uint64 {
 	if reason == "" {
 		reason = "invalidate"
 	}
-	epoch, hadStartupState := m.RuntimeStore().Invalidate(deviceID)
+	m.ForgetDesiredRecover(deviceID)
+	epoch, _ := m.RuntimeStore().Invalidate(deviceID)
 	logger.Debug("VoWiFi runtime epoch invalidated", "device", deviceID, "reason", reason, "epoch", epoch)
-	if hadStartupState {
-		m.BroadcastState(deviceID)
-	}
 	return epoch
 }

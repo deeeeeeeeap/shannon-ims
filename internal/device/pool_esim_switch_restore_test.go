@@ -507,13 +507,22 @@ func TestHandleESIMSwitchAfterSubmitsSwitchEndThroughLifecycleController(t *test
 	}
 	p.workers["dev-1"] = w
 	withSwitchSnapshot(p, "dev-1", esimSwitchContext{})
-	p.voWiFiHost().MarkDesiredRecoverFailed("dev-1", time.Now(), errors.New("previous recover failed"))
 
 	var got []string
-	p.voWiFiHost().LifecycleControllerForTest().TestRun = func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {
+	recoverStarted := make(chan struct{})
+	p.voWiFiHost().SetLifecycleRunForTest(func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {
+		if cmd.Kind == vowifihost.LifecycleCommandRecover {
+			close(recoverStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}
 		got = append(got, cmd.Kind.String()+":"+cmd.DeviceID)
 		return nil
+	})
+	if !p.voWiFiHost().ScheduleDesiredRecover(p.ctx, vowifihost.DesiredRecoverRequest{DeviceID: "dev-1", Now: time.Now()}) {
+		t.Fatal("expected desired recover to be scheduled")
 	}
+	<-recoverStarted
 
 	p.handleESIMSwitchAfter("dev-1", 0)
 

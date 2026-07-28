@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,9 +21,7 @@ import (
 )
 
 func newVoWiFiLifecycleControllerForTest(p *Pool) *vowifihost.LifecycleController {
-	return vowifihost.NewLifecycleController(vowifihost.LifecycleControllerOptions{
-		IsActive: p.IsVoWiFiActive,
-	})
+	return vowifihost.NewLifecycleController()
 }
 
 func TestVoWiFiControllerSerializesCommandsPerDevice(t *testing.T) {
@@ -146,15 +143,18 @@ func TestVoWiFiControllerAllowsDifferentDevicesInParallel(t *testing.T) {
 func TestDuplicateEnableDoesNotInvalidateActiveVoWiFiLifecycleSink(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-active-enable"
-	generation := p.voWiFiHost().NextLifecycleGeneration(deviceID)
-
+	var runs int
+	p.voWiFiHost().SetLifecycleRunForTest(func(context.Context, vowifihost.LifecycleCommand) error {
+		runs++
+		return nil
+	})
 	p.voWiFiRuntimeStore().SetInstance(deviceID, &runtimehost.Instance{})
 
 	if err := p.EnableVoWiFi(deviceID); err != nil {
 		t.Fatalf("EnableVoWiFi() duplicate active error = %v", err)
 	}
-	if current := p.voWiFiHost().CurrentLifecycleGeneration(deviceID); current != generation {
-		t.Fatalf("current generation = %d, want unchanged active generation %d", current, generation)
+	if runs != 0 {
+		t.Fatalf("duplicate active enable ran %d lifecycle commands, want 0", runs)
 	}
 }
 
@@ -186,7 +186,7 @@ func TestHandleVoWiFiStartupErrorAPDUBusyStaysBelowWarn(t *testing.T) {
 	ch := logger.GlobalBroadcaster.Subscribe()
 	defer logger.GlobalBroadcaster.Unsubscribe(ch)
 
-	err := p.handleVoWiFiStartupError("trace-apdu-busy", "dev-1", "", 0, time.Now(), &Worker{ID: "dev-1"}, runtimehost.State{LastErrorClass: "aka"}, errBusy)
+	err := p.handleVoWiFiStartupError("trace-apdu-busy", "dev-1", "", time.Now(), &Worker{ID: "dev-1"}, runtimehost.State{LastErrorClass: "aka"}, errBusy)
 	if !errors.Is(err, apduarbiter.ErrAPDUBusy) {
 		t.Fatalf("handleVoWiFiStartupError() error = %v, want ErrAPDUBusy", err)
 	}
@@ -198,8 +198,8 @@ func TestHandleVoWiFiStartupErrorAPDUBusyStaysBelowWarn(t *testing.T) {
 	if countLogSuffix(entries, "error", "VoWiFi 启动失败") != 0 {
 		t.Fatalf("VoWiFi startup error emitted for APDU busy")
 	}
-	if countLogSuffix(entries, "debug", "VoWiFi 启动遇到 APDU busy，等待短退避恢复") != 1 {
-		t.Fatalf("APDU busy debug count = %d, want 1", countLogSuffix(entries, "debug", "VoWiFi 启动遇到 APDU busy，等待短退避恢复"))
+	if countLogSuffix(entries, "debug", "VoWiFi 启动遇到 APDU busy，进入统一目标态恢复队列") != 1 {
+		t.Fatalf("APDU busy debug count = %d, want 1", countLogSuffix(entries, "debug", "VoWiFi 启动遇到 APDU busy，进入统一目标态恢复队列"))
 	}
 }
 
@@ -301,118 +301,6 @@ func TestRecoverCommandRunsTeardownThenEnable(t *testing.T) {
 	}
 }
 
-func TestVoWiFiLifecycleControllerAssignsGenerationBeforeRunningSessionCommands(t *testing.T) {
-	p := NewPool(&config.Config{})
-	c := newVoWiFiLifecycleControllerForTest(p)
-	deviceID := "dev-generation"
-	seed := c.NextGeneration(deviceID)
-
-	tests := []struct {
-		name string
-		cmd  vowifihost.LifecycleCommand
-		want uint64
-	}{
-		{
-			name: "enable",
-			cmd:  vowifihost.LifecycleCommand{DeviceID: deviceID, Kind: vowifihost.LifecycleCommandEnable},
-			want: seed + 1,
-		},
-		{
-			name: "disable",
-			cmd:  vowifihost.LifecycleCommand{DeviceID: deviceID, Kind: vowifihost.LifecycleCommandDisable},
-			want: seed + 2,
-		},
-		{
-			name: "recover",
-			cmd:  vowifihost.LifecycleCommand{DeviceID: deviceID, Kind: vowifihost.LifecycleCommandRecover, Reason: "recover"},
-			want: seed + 3,
-		},
-		{
-			name: "restart",
-			cmd:  vowifihost.LifecycleCommand{DeviceID: deviceID, Kind: vowifihost.LifecycleCommandRestart},
-			want: seed + 4,
-		},
-		{
-			name: "switch begin",
-			cmd:  vowifihost.LifecycleCommand{DeviceID: deviceID, Kind: vowifihost.LifecycleCommandSwitchBegin},
-			want: seed + 5,
-		},
-		{
-			name: "switch end restore",
-			cmd:  vowifihost.LifecycleCommand{DeviceID: deviceID, Kind: vowifihost.LifecycleCommandSwitchEnd, RestoreRadio: true},
-			want: seed + 6,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			c.TestRun = func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {
-				if cmd.Generation != tc.want {
-					t.Fatalf("generation = %d, want %d", cmd.Generation, tc.want)
-				}
-				return nil
-			}
-
-			if err := c.Submit(context.Background(), tc.cmd); err != nil {
-				t.Fatalf("submit() error = %v", err)
-			}
-		})
-	}
-}
-
-func TestVoWiFiLifecycleControllerPreservesPresetGeneration(t *testing.T) {
-	p := NewPool(&config.Config{})
-	c := newVoWiFiLifecycleControllerForTest(p)
-	preset := uint64(42)
-
-	c.TestRun = func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {
-		if cmd.Generation != preset {
-			t.Fatalf("generation = %d, want %d", cmd.Generation, preset)
-		}
-		return nil
-	}
-
-	if err := c.Submit(context.Background(), vowifihost.LifecycleCommand{
-		DeviceID:   "dev-preset",
-		Kind:       vowifihost.LifecycleCommandEnable,
-		Generation: preset,
-	}); err != nil {
-		t.Fatalf("submit() error = %v", err)
-	}
-}
-
-func TestVoWiFiLifecycleControllerIgnoresStalePresetGeneration(t *testing.T) {
-	p := NewPool(&config.Config{})
-	c := newVoWiFiLifecycleControllerForTest(p)
-	deviceID := "dev-stale-preset"
-	stale := c.NextGeneration(deviceID)
-	current := c.NextGeneration(deviceID)
-	if current <= stale {
-		t.Fatalf("current generation = %d, want > %d", current, stale)
-	}
-
-	var ran atomic.Int32
-	c.TestRun = func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {
-		ran.Add(1)
-		return nil
-	}
-
-	if err := c.Submit(context.Background(), vowifihost.LifecycleCommand{
-		DeviceID:   deviceID,
-		Kind:       vowifihost.LifecycleCommandRecover,
-		Reason:     "apdu_busy",
-		Generation: stale,
-	}); err != nil {
-		t.Fatalf("submit() error = %v", err)
-	}
-	if got := ran.Load(); got != 0 {
-		t.Fatalf("stale command ran %d times, want 0", got)
-	}
-	if got := c.CurrentGeneration(deviceID); got != current {
-		t.Fatalf("current generation = %d, want unchanged %d", got, current)
-	}
-}
-
 // TestClaimStartedVoWiFiAppRejectsStaleRuntimeEpoch 测试当启动的 Epoch 过期时，claimStartedVoWiFiApp 应拒绝接管该 App
 func TestClaimStartedVoWiFiAppRejectsStaleRuntimeEpoch(t *testing.T) {
 	p := NewPool(&config.Config{})
@@ -437,7 +325,11 @@ func TestClaimStartedVoWiFiAppRejectsStaleRuntimeEpoch(t *testing.T) {
 func TestClaimStartedVoWiFiAppAcceptsCurrentRuntimeEpoch(t *testing.T) {
 	p := NewPool(&config.Config{})
 	deviceID := "dev-current-start"
-	current := p.currentVoWiFiRuntimeEpoch(deviceID)
+	claim := p.voWiFiHost().BeginStart(deviceID)
+	current := claim.Epoch
+	if !claim.Accepted {
+		t.Fatalf("BeginStart() = %+v, want accepted", claim)
+	}
 
 	app := &runtimehost.Instance{}
 	// 传入当前的 current epoch 应该接管成功
@@ -549,24 +441,5 @@ func TestDisableVoWiFiWithAirplaneIntentStaysInAirplane(t *testing.T) {
 	}
 	if w.Config.VoWiFiEnabled || !w.Config.AirplaneEnabled {
 		t.Fatalf("关 VoWiFi 后应回退到飞行: %+v", w.Config)
-	}
-}
-
-func TestVoWiFiLifecycleControllerAssignsNonZeroGenerationToRestart(t *testing.T) {
-	p := NewPool(&config.Config{})
-	c := newVoWiFiLifecycleControllerForTest(p)
-
-	c.TestRun = func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {
-		if cmd.Kind != vowifihost.LifecycleCommandRestart {
-			t.Fatalf("kind = %q, want %q", cmd.Kind.String(), vowifihost.LifecycleCommandRestart.String())
-		}
-		if cmd.Generation == 0 {
-			t.Fatal("generation = 0, want non-zero")
-		}
-		return nil
-	}
-
-	if err := c.Submit(context.Background(), vowifihost.LifecycleCommand{DeviceID: "dev-restart", Kind: vowifihost.LifecycleCommandRestart}); err != nil {
-		t.Fatalf("submit() error = %v", err)
 	}
 }

@@ -26,7 +26,7 @@ func TestManagerOwnsLifecycleController(t *testing.T) {
 	if got.DeviceID != "dev-1" || got.Kind != LifecycleCommandRestart || got.Generation == 0 {
 		t.Fatalf("submitted command = %+v, want device/kind with non-zero generation", got)
 	}
-	if current := manager.CurrentLifecycleGeneration("dev-1"); current != got.Generation {
+	if current := manager.RuntimeStore().currentLifecycleGeneration("dev-1"); current != got.Generation {
 		t.Fatalf("current generation = %d, want %d", current, got.Generation)
 	}
 }
@@ -78,12 +78,10 @@ func TestManagerLifecycleConvenienceMethodsSubmitExpectedCommands(t *testing.T) 
 	if err := manager.Restart(context.Background(), "dev-1"); err != nil {
 		t.Fatalf("Restart() error = %v", err)
 	}
-	currentGeneration := manager.CurrentLifecycleGeneration("dev-1")
 	if err := manager.Recover(context.Background(), LifecycleRecoverRequest{
 		DeviceID:     "dev-1",
 		Reason:       "apdu_busy",
 		OverrideEPDG: "epdg.example",
-		Generation:   currentGeneration,
 	}); err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
@@ -109,9 +107,15 @@ func TestManagerLifecycleConvenienceMethodsSubmitExpectedCommands(t *testing.T) 
 		if got[i].Kind != want {
 			t.Fatalf("command[%d].Kind = %s, want %s", i, got[i].Kind.String(), want.String())
 		}
+		if got[i].Generation == 0 {
+			t.Fatalf("command[%d].Generation = 0", i)
+		}
+		if i > 0 && got[i].Generation <= got[i-1].Generation {
+			t.Fatalf("command generations are not monotonic: %d then %d", got[i-1].Generation, got[i].Generation)
+		}
 	}
-	if got[3].Reason != "apdu_busy" || got[3].OverrideEPDG != "epdg.example" || got[3].Generation != currentGeneration {
-		t.Fatalf("recover command = %+v, want reason/override/generation preserved", got[3])
+	if got[3].Reason != "apdu_busy" || got[3].OverrideEPDG != "epdg.example" {
+		t.Fatalf("recover command = %+v, want reason/override preserved", got[3])
 	}
 	if !got[5].RestoreRadio {
 		t.Fatalf("switch end command = %+v, want RestoreRadio", got[5])

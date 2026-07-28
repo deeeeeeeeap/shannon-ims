@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 	"github.com/1239t/vohive/internal/backend"
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/internal/modem"
@@ -16,6 +15,7 @@ import (
 	"github.com/1239t/vohive/internal/vowifihost"
 	"github.com/1239t/vowifi-go/runtimehost"
 	"github.com/1239t/vowifi-go/runtimehost/identity"
+	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 )
 
 type workerStatusBackendStub struct {
@@ -526,9 +526,6 @@ func TestPoolConfirmSIMRemovedStopsVoWiFi(t *testing.T) {
 	w := &Worker{ID: "dev-1", Backend: backend}
 	p.workers["dev-1"] = w
 	p.voWiFiRuntimeStore().SetInstance("dev-1", &runtimehost.Instance{})
-	if !p.voWiFiHost().BeginDesiredRecover("dev-1", time.Now().Add(-time.Minute)) {
-		t.Fatal("expected desired recover state setup to begin")
-	}
 
 	var got vowifihost.LifecycleCommand
 	p.voWiFiHost().LifecycleControllerForTest().TestRun = func(ctx context.Context, cmd vowifihost.LifecycleCommand) error {

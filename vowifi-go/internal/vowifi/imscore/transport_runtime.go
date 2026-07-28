@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"sync"
 
 	"github.com/1239t/swu-go/pkg/logger"
@@ -46,12 +45,12 @@ func startTransportRuntime(parent context.Context, cfg Config, swu voiceclient.S
 
 	ctx, cancel := context.WithCancel(parent)
 	rt := &transportRuntime{
-		cfg:       cfg,
-		policy:    policy,
-		transport: transport,
-		portCConn: portCConn,
+		cfg:        cfg,
+		policy:     policy,
+		transport:  transport,
+		portCConn:  portCConn,
 		tcpWriteCh: make(chan sipWriteTask, 8),
-		cancel:    cancel,
+		cancel:     cancel,
 	}
 	rt.portSListener = newSingleConnListener(&net.TCPAddr{
 		IP:   cfg.LocalIP,
@@ -64,13 +63,7 @@ func startTransportRuntime(parent context.Context, cfg Config, swu voiceclient.S
 	rt.wg.Add(1)
 	go rt.runPortSListener(ctx, swu)
 
-	logger.Info("IMS transport runtime started",
-		logger.String("trace_id", strings.TrimSpace(cfg.TraceID)),
-		logger.String("device_id", strings.TrimSpace(cfg.DeviceID)),
-		logger.Int("port_c", policy.LocalPortC),
-		logger.Int("port_s", policy.LocalPortS),
-		logger.String("registrar", cfg.PCSCFAddr),
-		logger.String("transport_target", effectiveTransportAddr(cfg)))
+	logger.Info("IMS transport runtime started")
 	return rt, nil
 }
 
@@ -103,9 +96,7 @@ func (rt *transportRuntime) runTCPWriteChannel(ctx context.Context) {
 				close(task.done)
 			}
 			if err != nil {
-				logger.Warn("IMS port-c write failed",
-					logger.String("trace_id", strings.TrimSpace(rt.cfg.TraceID)),
-					logger.String("error", err.Error()))
+				logger.Warn("IMS port-c write failed")
 			}
 		}
 	}
@@ -124,17 +115,12 @@ func (rt *transportRuntime) runPortSListener(ctx context.Context, swu voiceclien
 	defer rt.wg.Done()
 	listener, err := swu.ListenContextTCP(ctx, rt.cfg.LocalIP, rt.policy.LocalPortS)
 	if err != nil {
-		logger.Warn("IMS port-s listen failed",
-			logger.String("trace_id", strings.TrimSpace(rt.cfg.TraceID)),
-			logger.Int("port_s", rt.policy.LocalPortS),
-			logger.String("error", err.Error()))
+		logger.Warn("IMS port-s listen failed")
 		return
 	}
 	defer listener.Close()
 
-	logger.Info(fmt.Sprintf("[%s] 准备启动 IMS TCP 入站监听", strings.TrimSpace(rt.cfg.DeviceID)),
-		logger.String("trace_id", strings.TrimSpace(rt.cfg.TraceID)),
-		logger.Int("port", rt.policy.LocalPortS))
+	logger.Info("IMS TCP inbound listener started")
 
 	for {
 		rawConn, err := listener.Accept()
@@ -143,17 +129,12 @@ func (rt *transportRuntime) runPortSListener(ctx context.Context, swu voiceclien
 			case <-ctx.Done():
 				return
 			default:
-				logger.Warn("IMS port-s accept failed",
-					logger.String("trace_id", strings.TrimSpace(rt.cfg.TraceID)),
-					logger.String("error", err.Error()))
+				logger.Warn("IMS port-s accept failed")
 				return
 			}
 		}
 		secure := ipsec3gpp.WrapSecureChannel(rawConn, rt.transport, rt.policy)
-		logger.Info("IMS port-s accepted inbound push",
-			logger.String("trace_id", strings.TrimSpace(rt.cfg.TraceID)),
-			logger.String("remote", rawConn.RemoteAddr().String()),
-			logger.String("local", rawConn.LocalAddr().String()))
+		logger.Info("IMS port-s accepted inbound push")
 		rt.portSListener.deliver(secure)
 		rt.wg.Add(1)
 		go rt.drainInboundPortS(ctx, secure)
@@ -173,9 +154,7 @@ func (rt *transportRuntime) drainInboundPortS(ctx context.Context, conn *ipsec3g
 		n, err := conn.Read(buf)
 		if err != nil {
 			if err != io.EOF {
-				logger.Warn("IMS port-s read ended",
-					logger.String("trace_id", strings.TrimSpace(rt.cfg.TraceID)),
-					logger.String("error", err.Error()))
+				logger.Warn("IMS port-s read ended")
 			}
 			return
 		}

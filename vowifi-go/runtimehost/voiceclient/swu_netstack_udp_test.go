@@ -212,6 +212,84 @@ func TestSWUNetstackRawIPConnFragmentsOversizedIPv4Packet(t *testing.T) {
 	}
 }
 
+func TestSWUNetstackRawIPConnFragmentsOversizedIPv6Packet(t *testing.T) {
+	dp := newRecordingPacketDataplane()
+	dp.sent = make(chan []byte, 8)
+	localIP := net.ParseIP("2001:db8::2")
+	remoteIP := net.ParseIP("2001:db8::3")
+	netstack, err := newSWUNetstack(localIP, dp)
+	if err != nil {
+		t.Fatalf("newSWUNetstack: %v", err)
+	}
+	defer netstack.Close()
+
+	raw, err := netstack.DialContextIP(context.Background(), localIP, remoteIP, 50)
+	if err != nil {
+		t.Fatalf("DialContextIP: %v", err)
+	}
+	defer raw.Close()
+
+	wantPayload := bytes.Repeat([]byte{0x5A}, 1400)
+	outbound := buildTestIPv6ProtocolPacket(localIP, remoteIP, 50, wantPayload)
+	if _, err := raw.Write(outbound); err != nil {
+		t.Fatalf("raw Write: %v", err)
+	}
+
+	fragments := make([][]byte, 0, 2)
+	reassembled := make([]byte, len(wantPayload))
+	reassembledBytes := 0
+	var identification uint32
+	for reassembledBytes < len(wantPayload) {
+		select {
+		case fragment := <-dp.sent:
+			if len(fragment) > 1280 {
+				t.Fatalf("IPv6 fragment length = %d, want <= 1280", len(fragment))
+			}
+			if len(fragment) < 48 || fragment[0]>>4 != 6 {
+				t.Fatal("invalid IPv6 fragment")
+			}
+			if fragment[6] != 44 || fragment[40] != 50 {
+				t.Fatalf("IPv6 next headers = base:%d fragment:%d, want 44/50", fragment[6], fragment[40])
+			}
+			fragmentID := binary.BigEndian.Uint32(fragment[44:48])
+			if len(fragments) == 0 {
+				identification = fragmentID
+			} else if fragmentID != identification {
+				t.Fatalf("fragment identification = %d, want %d", fragmentID, identification)
+			}
+			flagsOffset := binary.BigEndian.Uint16(fragment[42:44])
+			offset := int(flagsOffset>>3) * 8
+			fragmentPayload := fragment[48:]
+			if offset+len(fragmentPayload) > len(reassembled) {
+				t.Fatal("fragment payload exceeds original packet")
+			}
+			copy(reassembled[offset:], fragmentPayload)
+			reassembledBytes += len(fragmentPayload)
+			fragments = append(fragments, fragment)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for IPv6 fragments")
+		}
+	}
+	if len(fragments) < 2 {
+		t.Fatalf("fragment count = %d, want at least 2", len(fragments))
+	}
+	if !bytes.Equal(reassembled, wantPayload) {
+		t.Fatal("reassembled IPv6 payload differs from original")
+	}
+}
+
+func buildTestIPv6ProtocolPacket(srcIP, dstIP net.IP, protocol byte, payload []byte) []byte {
+	packet := make([]byte, 40+len(payload))
+	packet[0] = 0x60
+	binary.BigEndian.PutUint16(packet[4:6], uint16(len(payload)))
+	packet[6] = protocol
+	packet[7] = 64
+	copy(packet[8:24], srcIP.To16())
+	copy(packet[24:40], dstIP.To16())
+	copy(packet[40:], payload)
+	return packet
+}
+
 func buildTestIPv4ProtocolPacket(srcIP, dstIP net.IP, protocol byte, payload []byte) []byte {
 	packet := make([]byte, 20+len(payload))
 	packet[0] = 0x45

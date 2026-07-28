@@ -12,18 +12,18 @@ import (
 )
 
 type PreparedStart struct {
-	Profile      identity.Profile
-	Prepared     identity.PreparedSession
-	Modem        runtimehost.Modem
-	SIM          runtimehost.SIMAdapter // optional override; when nil, derived from Modem APDU
-	Proxy        *runtimehost.ProxyConfig
-	PCSCFAddr        string
-	CellID           string
-	RegisterProfile  voiceclient.RegisterProfile
-	SIPInstanceURN   string
-	RegisterExpiry   time.Duration
-	NetworkMode      string
-	StartupState runtimehost.State
+	Profile         identity.Profile
+	Prepared        identity.PreparedSession
+	Modem           runtimehost.Modem
+	SIM             runtimehost.SIMAdapter // optional override; when nil, derived from Modem APDU
+	Proxy           *runtimehost.ProxyConfig
+	PCSCFAddr       string
+	CellID          string
+	RegisterProfile voiceclient.RegisterProfile
+	SIPInstanceURN  string
+	RegisterExpiry  time.Duration
+	NetworkMode     string
+	StartupState    runtimehost.State
 }
 
 type Adapter interface {
@@ -44,7 +44,6 @@ type StartupErrorRequest struct {
 	TraceID             string
 	DeviceID            string
 	RuntimeEPDGOverride string
-	Generation          uint64
 	StartedAt           time.Time
 	State               runtimehost.State
 	Err                 error

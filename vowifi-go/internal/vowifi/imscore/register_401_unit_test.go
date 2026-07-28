@@ -82,13 +82,13 @@ func TestDecodeChallengeNonceRejectsInvalid(t *testing.T) {
 func TestComputeAKAAuthDigestURIMatchesRequestURI(t *testing.T) {
 	home := "ims.mnc015.mcc234.3gppnetwork.org"
 	cfg := Config{
-		HomeDomain: home,
-		Realm:      home,
-		PrivateID:  "fake.impi@ims.mnc015.mcc234.3gppnetwork.org",
-		PublicURI:  "sip:fake.impu@ims.mnc015.mcc234.3gppnetwork.org",
-		LocalIP:    net.ParseIP("10.0.0.2"),
-		PCSCFAddr:  "10.0.0.3:5060",
-		Template:   policy.VodafoneUKTemplate(),
+		HomeDomain:      home,
+		Realm:           home,
+		PrivateID:       "fake.impi@ims.mnc015.mcc234.3gppnetwork.org",
+		PublicURI:       "sip:fake.impu@ims.mnc015.mcc234.3gppnetwork.org",
+		LocalIP:         net.ParseIP("10.0.0.2"),
+		PCSCFAddr:       "10.0.0.3:5060",
+		CarrierBehavior: policy.ResolveCarrierBehavior("234", "15"),
 		AKA: fixedAKA{
 			res: bytesRepeat(0x11, 8),
 			ck:  bytesRepeat(0x22, 16),

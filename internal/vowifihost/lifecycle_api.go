@@ -9,7 +9,6 @@ type LifecycleRecoverRequest struct {
 	DeviceID     string
 	Reason       string
 	OverrideEPDG string
-	Generation   uint64
 }
 
 func (m *Manager) Enable(ctx context.Context, deviceID string) error {
@@ -30,11 +29,10 @@ func (m *Manager) Disable(ctx context.Context, deviceID, reason string, restoreR
 		m.InvalidateRuntime(deviceID, reason)
 	}
 	return m.SubmitLifecycle(ctx, LifecycleCommand{
-		DeviceID:           deviceID,
-		Kind:               LifecycleCommandDisable,
-		Reason:             reason,
-		RestoreRadio:       restoreRadio,
-		RuntimeInvalidated: deviceID != "",
+		DeviceID:     deviceID,
+		Kind:         LifecycleCommandDisable,
+		Reason:       reason,
+		RestoreRadio: restoreRadio,
 	})
 }
 
@@ -56,11 +54,24 @@ func (m *Manager) Recover(ctx context.Context, req LifecycleRecoverRequest) erro
 		Kind:         LifecycleCommandRecover,
 		Reason:       req.Reason,
 		OverrideEPDG: req.OverrideEPDG,
-		Generation:   req.Generation,
+	})
+}
+
+func (m *Manager) recoverDesired(ctx context.Context, req LifecycleRecoverRequest, recoverGeneration uint64) error {
+	return m.SubmitLifecycle(ctx, LifecycleCommand{
+		DeviceID:                 req.DeviceID,
+		Kind:                     LifecycleCommandRecover,
+		Reason:                   req.Reason,
+		OverrideEPDG:             req.OverrideEPDG,
+		desiredRecoverGeneration: recoverGeneration,
 	})
 }
 
 func (m *Manager) SwitchBegin(ctx context.Context, deviceID string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID != "" {
+		m.InvalidateRuntime(deviceID, "switch")
+	}
 	return m.SubmitLifecycle(ctx, LifecycleCommand{
 		DeviceID: deviceID,
 		Kind:     LifecycleCommandSwitchBegin,

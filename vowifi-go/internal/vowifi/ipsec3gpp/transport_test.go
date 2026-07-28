@@ -367,6 +367,62 @@ func TestTransportInvalidHighSequenceDoesNotAdvanceReplayWindow(t *testing.T) {
 	}
 }
 
+func TestTransportCountsPeerPacketBeforeESPProcessing(t *testing.T) {
+	policy := secureChannelUDPTestPolicy(t, net.ParseIP("192.0.2.2"), net.ParseIP("192.0.2.1"))
+	transport, err := NewTransport(policy)
+	if err != nil {
+		t.Fatalf("NewTransport() error=%v", err)
+	}
+
+	peerNonESP := buildIPv4Packet(policy.RemoteIP, policy.LocalIP, ipProtoUDP, make([]byte, 8))
+	if _, err := transport.TransformInbound(peerNonESP); err != nil {
+		t.Fatalf("TransformInbound(peer non-ESP) error=%v", err)
+	}
+	if got := transport.Stats().PeerInboundPackets; got != 1 {
+		t.Fatalf("peer inbound packets after non-ESP = %d, want 1", got)
+	}
+
+	peerBadESP := buildIPv4Packet(policy.RemoteIP, policy.LocalIP, ipProtoESP, []byte{1, 2, 3, 4})
+	if _, err := transport.TransformInbound(peerBadESP); err == nil {
+		t.Fatal("TransformInbound(peer malformed ESP) error=nil, want rejection")
+	}
+	stats := transport.Stats()
+	if stats.PeerInboundPackets != 2 {
+		t.Fatalf("peer inbound packets after malformed ESP = %d, want 2", stats.PeerInboundPackets)
+	}
+	if stats.TransformErrors != 1 {
+		t.Fatalf("transform errors = %d, want 1", stats.TransformErrors)
+	}
+}
+
+func TestTransportDoesNotCountNonPeerOrMalformedPacket(t *testing.T) {
+	policy := secureChannelUDPTestPolicy(t, net.ParseIP("192.0.2.2"), net.ParseIP("192.0.2.1"))
+	transport, err := NewTransport(policy)
+	if err != nil {
+		t.Fatalf("NewTransport() error=%v", err)
+	}
+
+	nonPeer := buildIPv4Packet(net.ParseIP("192.0.2.99").To4(), policy.LocalIP, ipProtoUDP, make([]byte, 8))
+	if _, err := transport.TransformInbound(nonPeer); err != nil {
+		t.Fatalf("TransformInbound(non-peer) error=%v", err)
+	}
+	wrongDestination := buildIPv4Packet(policy.RemoteIP, net.ParseIP("192.0.2.99").To4(), ipProtoUDP, make([]byte, 8))
+	if _, err := transport.TransformInbound(wrongDestination); err != nil {
+		t.Fatalf("TransformInbound(wrong destination) error=%v", err)
+	}
+	if _, err := transport.TransformInbound([]byte{0x45}); err == nil {
+		t.Fatal("TransformInbound(malformed) error=nil, want rejection")
+	}
+
+	stats := transport.Stats()
+	if stats.PeerInboundPackets != 0 {
+		t.Fatalf("peer inbound packets = %d, want 0", stats.PeerInboundPackets)
+	}
+	if stats.TransformErrors != 1 {
+		t.Fatalf("transform errors = %d, want 1", stats.TransformErrors)
+	}
+}
+
 func TestTransportConcurrentBidirectionalTransforms(t *testing.T) {
 	ck := bytes.Repeat([]byte{0x01}, 16)
 	ik := bytes.Repeat([]byte{0x02}, 16)
@@ -478,5 +534,8 @@ func TestTransportConcurrentBidirectionalTransforms(t *testing.T) {
 	stats := transport.Stats()
 	if stats.OutboundPackets != packetCount || stats.InboundPackets != packetCount {
 		t.Fatalf("packet stats = outbound:%d inbound:%d, want %d/%d", stats.OutboundPackets, stats.InboundPackets, packetCount, packetCount)
+	}
+	if stats.PeerInboundPackets != packetCount {
+		t.Fatalf("peer inbound packets = %d, want %d", stats.PeerInboundPackets, packetCount)
 	}
 }

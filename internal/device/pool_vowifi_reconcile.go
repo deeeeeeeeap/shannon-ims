@@ -65,6 +65,10 @@ func (p *Pool) shouldReconcileVoWiFi(w *Worker) bool {
 }
 
 func (p *Pool) shouldReconcileVoWiFiForReason(w *Worker, reason string) bool {
+	return p.desiredVoWiFiEligibility(w, reason, true)
+}
+
+func (p *Pool) desiredVoWiFiEligibility(w *Worker, reason string, requireIdleRuntime bool) bool {
 	if p == nil || w == nil {
 		return false
 	}
@@ -79,7 +83,7 @@ func (p *Pool) shouldReconcileVoWiFiForReason(w *Worker, reason string) bool {
 		return false
 	}
 
-	if !p.voWiFiHost().DesiredRecoverable(deviceID) {
+	if requireIdleRuntime && !p.voWiFiHost().DesiredRecoverable(deviceID) {
 		return false
 	}
 
@@ -102,7 +106,7 @@ func (p *Pool) shouldReconcileVoWiFiForReason(w *Worker, reason string) bool {
 	}
 	mcc, _, _ := vowifiProfileMCCMNC(status)
 	if mcc != "" && carrier.IsVoWiFiBlockedMCC(mcc) {
-		p.clearDesiredVoWiFiRecoverState(deviceID)
+		p.voWiFiHost().ForgetDesiredRecover(deviceID)
 		logger.Warn("VoWiFi 目标态恢复跳过：MCC 策略禁止", "event", "VOWIFI_DESIRED_RECOVER_SKIPPED_POLICY", "device", deviceID, "mcc", formatVoWiFiPLMN3(mcc), "imsi", imsi)
 		return false
 	}
@@ -134,7 +138,7 @@ func (p *Pool) currentCardPolicyAllowsVoWiFi(w *Worker, statusICCID, reason stri
 	}
 	if iccid == "" {
 		if deviceID != "" {
-			p.clearDesiredVoWiFiRecoverState(deviceID)
+			p.voWiFiHost().ForgetDesiredRecover(deviceID)
 		}
 		logger.Warn("VoWiFi 目标态恢复跳过：ICCID 未就绪，无法解析卡策略",
 			"event", "VOWIFI_DESIRED_RECOVER_SKIPPED_CARD_POLICY",
@@ -146,7 +150,7 @@ func (p *Pool) currentCardPolicyAllowsVoWiFi(w *Worker, statusICCID, reason stri
 	resolver := p.policyResolver
 	p.mu.RUnlock()
 	if resolver == nil {
-		p.clearDesiredVoWiFiRecoverState(deviceID)
+		p.voWiFiHost().ForgetDesiredRecover(deviceID)
 		logger.Warn("VoWiFi 目标态恢复跳过：卡策略解析器未配置",
 			"event", "VOWIFI_DESIRED_RECOVER_SKIPPED_CARD_POLICY",
 			"device", deviceID,
@@ -156,7 +160,7 @@ func (p *Pool) currentCardPolicyAllowsVoWiFi(w *Worker, statusICCID, reason stri
 	}
 	pol, err := resolver.Resolve(iccid)
 	if err != nil {
-		p.clearDesiredVoWiFiRecoverState(deviceID)
+		p.voWiFiHost().ForgetDesiredRecover(deviceID)
 		logger.Warn("VoWiFi 目标态恢复跳过：解析卡策略失败",
 			"event", "VOWIFI_DESIRED_RECOVER_SKIPPED_CARD_POLICY",
 			"device", deviceID,
@@ -166,7 +170,7 @@ func (p *Pool) currentCardPolicyAllowsVoWiFi(w *Worker, statusICCID, reason stri
 		return false
 	}
 	if !pol.VoWiFiEnabled {
-		p.clearDesiredVoWiFiRecoverState(deviceID)
+		p.voWiFiHost().ForgetDesiredRecover(deviceID)
 		// logger.Info("VoWiFi 目标态恢复跳过：当前卡策略未开启 VoWiFi",
 		// 	"event", "VOWIFI_DESIRED_RECOVER_SKIPPED_CARD_POLICY",
 		// 	"device", deviceID,
@@ -197,44 +201,5 @@ func (p *Pool) scheduleDesiredVoWiFiRecover(deviceID, reason string, now time.Ti
 		DeviceID: deviceID,
 		Reason:   reason,
 		Now:      now,
-		OnResult: func(deviceID, _ string, err error) {
-			p.markDesiredVoWiFiRecoverResult(deviceID, err)
-		},
 	})
-}
-
-// markDesiredVoWiFiRecoverResult 根据恢复结果清理状态或安排下一次低频重试。
-func (p *Pool) markDesiredVoWiFiRecoverResult(deviceID string, err error) {
-	if p == nil {
-		return
-	}
-	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" {
-		return
-	}
-	if err == nil {
-		p.clearDesiredVoWiFiRecoverState(deviceID)
-		logger.Info("VoWiFi 目标态恢复成功", "event", "VOWIFI_DESIRED_RECOVER_SUCCESS", "device", deviceID)
-		return
-	}
-	if carrier.IsVoWiFiPolicyBlockedError(err) {
-		p.clearDesiredVoWiFiRecoverState(deviceID)
-		logger.Warn("VoWiFi 目标态恢复跳过：策略禁止", "event", "VOWIFI_DESIRED_RECOVER_SKIPPED_POLICY", "device", deviceID, "err", err)
-		return
-	}
-	snapshot := p.voWiFiHost().MarkDesiredRecoverFailed(deviceID, time.Now(), err)
-
-	logger.Warn("VoWiFi 目标态恢复失败，等待低频重试", "event", "VOWIFI_DESIRED_RETRY_DELAY", "device", deviceID, "attempt", snapshot.Attempt, "delay", snapshot.Delay.String(), "err", err)
-}
-
-// clearDesiredVoWiFiRecoverState 清除设备的目标态恢复退避状态。
-func (p *Pool) clearDesiredVoWiFiRecoverState(deviceID string) {
-	if p == nil {
-		return
-	}
-	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" {
-		return
-	}
-	p.voWiFiHost().ClearDesiredRecoverState(deviceID)
 }

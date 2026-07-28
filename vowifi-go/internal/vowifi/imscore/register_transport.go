@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/1239t/swu-go/pkg/logger"
+	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 	"github.com/emiago/sipgo/sip"
 )
 
@@ -42,7 +42,24 @@ func (s *Service) registerRawWithCandidate(ctx context.Context, candidate regist
 		attemptCfg.TransportPCSCFAddr = attemptCfg.PCSCFAddr
 	}
 
-	session := newRegisterSession(attemptCfg, s.swu, s.network, transportMode, attemptIndex)
+	// The protected ports and the SA generation come from the Service, never from
+	// the session: this function runs once per candidate and once per transport
+	// mode, so a session-minted value would repeat inside one registration.
+	// TS 33.203 clause 7.4 requires port_uc to change per authenticated
+	// re-registration while port_us stays fixed; only a Service-scoped allocator
+	// can honour both.
+	allocation, err := s.allocateProtectedPorts()
+	if err != nil {
+		return registerTransportAttemptResult{err: err}
+	}
+	releasePending := true
+	defer func() {
+		if releasePending && s.protectedPorts != nil {
+			s.protectedPorts.release(allocation.generation)
+		}
+	}()
+	session := newRegisterSessionWithPorts(
+		attemptCfg, s.swu, s.network, transportMode, attemptIndex, allocation)
 	attemptCtx, cancel := context.WithTimeout(ctx, registerCandidateTimeout)
 	defer cancel()
 
@@ -52,12 +69,23 @@ func (s *Service) registerRawWithCandidate(ctx context.Context, candidate regist
 		var attemptErr *registrarAttemptError
 		if errors.As(err, &attemptErr) {
 			return registerTransportAttemptResult{
-				err:        err,
-				statusCode: attemptErr.statusCode,
-				reason:     attemptErr.reason,
+				err:         err,
+				statusCode:  attemptErr.statusCode,
+				reason:      attemptErr.reason,
+				reachedAuth: registerAttemptReachedAuthPhase(attemptErr.statusCode),
 			}
 		}
-		return registerTransportAttemptResult{err: err}
+		return registerTransportAttemptResult{
+			err:         err,
+			reachedAuth: registerErrorReachedAuthPhase(err),
+		}
+	}
+	if res != nil && res.protectedTCP != nil {
+		res.protectedTCP.BindPortRelease(s.protectedPorts, allocation.generation)
+		releasePending = false
+	} else if res != nil && res.secureConn != nil {
+		res.portRelease = func() { s.protectedPorts.release(allocation.generation) }
+		releasePending = false
 	}
 	return registerTransportAttemptResult{result: res}
 }
@@ -71,6 +99,9 @@ func (s *Service) attemptRegisterMode(ctx context.Context, transportMode string,
 		logRegisterTransportAttempt(s.cfg, transportMode, i+1, len(candidates), candidate)
 		attempt := s.registerRawWithCandidate(ctx, candidate, transportMode, i)
 		last = attempt
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if attempt.result != nil {
 			return attempt.result, nil
 		}
@@ -112,18 +143,22 @@ func (s *Service) registerWithTransportCandidates(ctx context.Context) (*registe
 		if len(candidates) == 0 {
 			continue
 		}
-		logger.Info("IMS REGISTER transport",
-			logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-			logger.String("device_id", strings.TrimSpace(s.cfg.DeviceID)),
-			logger.String("transport_mode", mode),
-			logger.Int("candidate_total", len(candidates)),
-			logger.String("configured_sec_agree_mode", strings.TrimSpace(s.cfg.Template.SecAgreeMode)))
+		logRegisterDiagnostic(registerDiagnostic{
+			stage:            "transport_start",
+			result:           "none",
+			transport:        mode,
+			candidateTotal:   len(candidates),
+			requiresSecAgree: secAgreeEnabled(s.cfg.CarrierBehavior.RegisterTemplate),
+		})
 
 		res, err := s.attemptRegisterMode(ctx, mode, candidates)
 		if err == nil {
 			return res, nil
 		}
 		lastErr = err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 
 		var attemptErr *registrarAttemptError
 		if errors.As(err, &attemptErr) {
@@ -136,13 +171,13 @@ func (s *Service) registerWithTransportCandidates(ctx context.Context) (*registe
 
 		fallbackReason := classifySecurityFallbackReason(s.cfg, lastStatus, lastReason, reachedAuth)
 		if shouldRetryNextRegisterTransport(lastStatus, err, modeIndex, len(modes), reachedAuth) {
-			logger.Info("IMS REGISTER transport retry",
-				logger.String("trace_id", strings.TrimSpace(s.cfg.TraceID)),
-				logger.String("device_id", strings.TrimSpace(s.cfg.DeviceID)),
-				logger.String("transport_mode", mode),
-				logger.String("security_fallback_reason", fallbackReason),
-				logger.Int("status", lastStatus),
-				logger.String("reason", lastReason))
+			logRegisterDiagnostic(registerDiagnostic{
+				stage:      "transport_retry",
+				status:     lastStatus,
+				result:     fallbackReason,
+				transport:  mode,
+				hasWarning: true,
+			})
 			continue
 		}
 		return nil, err
@@ -170,7 +205,7 @@ func classifySecurityFallbackReason(cfg Config, statusCode int, reason string, r
 		return "temporary_sip_failure"
 	}
 	if strings.TrimSpace(reason) != "" {
-		return strings.TrimSpace(reason)
+		return "register_failed"
 	}
 	return "register_transport_failed"
 }
@@ -179,10 +214,14 @@ func registerTransportCandidates(cfg Config, transport string) []string {
 	mode := strings.ToLower(strings.TrimSpace(transport))
 	switch mode {
 	case "", "auto":
-		if strings.EqualFold(strings.TrimSpace(cfg.Template.ID), "vodafone_uk_23415") {
+		switch cfg.CarrierBehavior.UnprotectedAutoTransport {
+		case "", policy.UnprotectedRegisterUDPThenTCP:
 			return []string{"udp", "tcp"}
+		case policy.UnprotectedRegisterTCPOnly:
+			return []string{"tcp"}
+		default:
+			return nil
 		}
-		return []string{"tcp"}
 	case "tcp":
 		return []string{"tcp"}
 	default:
@@ -214,6 +253,18 @@ func selectRegisterAttemptRegistrar(cfg Config, candidate string) string {
 }
 
 func shouldRetryNextRegisterTransport(statusCode int, err error, modeIndex, modeTotal int, reachedAuth bool) bool {
+	if errors.Is(err, errProtectedPortsExhausted) {
+		return false
+	}
+	// The typed check comes first and is the authoritative one. The three
+	// conditions below it all failed to see the authenticated phase in the
+	// 2026-07-27 21:48 run: a protected read timeout carries statusCode=0, is not
+	// a *registrarAttemptError so reachedAuth stays false, and its message matches
+	// none of registerErrorReachedAuthPhase's substrings. The result was a second
+	// initial REGISTER and a second AKA run on the next transport.
+	if registerReachedAuthenticatedPhase(err) {
+		return false
+	}
 	if reachedAuth || registerAttemptReachedAuthPhase(statusCode) || registerErrorReachedAuthPhase(err) {
 		return false
 	}
@@ -223,22 +274,14 @@ func shouldRetryNextRegisterTransport(statusCode int, err error, modeIndex, mode
 	// Prefer SIP status classification when a response was received.
 	// Only fall back to err-based transport retry for true no-response/connect failures.
 	if statusCode != 0 {
-		switch statusCode {
-		case sip.StatusForbidden,
-			sip.StatusRequestTimeout,
-			sip.StatusInternalServerError,
-			sip.StatusBadGateway,
-			sip.StatusServiceUnavailable,
-			sip.StatusGatewayTimeout,
-			sip.StatusTemporarilyUnavailable:
-			return true
-		default:
-			return false
-		}
+		return false
 	}
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) {
 			return false
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return true
 		}
 		return true
 	}
@@ -280,12 +323,17 @@ func nextRegisterTransportAttemptCSeq(previous uint32) uint32 {
 }
 
 func logRegisterTransportAttempt(cfg Config, transportMode string, index, total int, candidate registerAttemptCandidate) {
-	logger.Info("IMS REGISTER probing registrar candidate",
-		logger.String("trace_id", strings.TrimSpace(cfg.TraceID)),
-		logger.String("device_id", strings.TrimSpace(cfg.DeviceID)),
-		logger.String("transport_mode", transportMode),
-		logger.Int("registrar_index", index),
-		logger.Int("candidate_total", total),
-		logger.String("pcscf", candidate.Registrar),
-		logger.String("transport_target", candidate.Gateway))
+	_ = cfg
+	address := candidate.Gateway
+	if strings.TrimSpace(address) == "" {
+		address = candidate.Registrar
+	}
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:          "candidate_attempt",
+		result:         "none",
+		transport:      transportMode,
+		addressFamily:  registerAddressFamily(address),
+		candidateIndex: index,
+		candidateTotal: total,
+	})
 }

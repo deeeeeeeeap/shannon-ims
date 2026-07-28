@@ -22,7 +22,7 @@ func decideSecAgreeAfterChallenge(cfg Config, res *sip.Response) (secAgreeDecisi
 	if res == nil {
 		return secAgreeDecision{}, fmt.Errorf("missing challenge response")
 	}
-	secAgree := secAgreeEnabled(cfg.Template)
+	secAgree := secAgreeEnabled(cfg.CarrierBehavior.RegisterTemplate)
 	secServer := res.GetHeader("Security-Server")
 	hasServer := secServer != nil && strings.TrimSpace(secServer.Value()) != ""
 
@@ -42,7 +42,7 @@ func decideSecAgreeAfterChallenge(cfg Config, res *sip.Response) (secAgreeDecisi
 		}, nil
 	}
 
-	if securityClientMechanismCount(cfg.Template) == 0 {
+	if securityClientMechanismCount(cfg.CarrierBehavior.RegisterTemplate) == 0 {
 		return secAgreeDecision{
 			missingSecClient: true,
 			reason:           "missing_security_client_when_sec_agree_enabled",
@@ -67,8 +67,8 @@ func buildSecurityVerifyFromChallenge(cfg Config, res *sip.Response) (string, *i
 	}
 	selected, err := imsheaders.SelectSecurityServerOffer(
 		offers,
-		cfg.Template.SecurityClientMechanisms,
-		cfg.Template.StrictSecurityServerOffer,
+		cfg.CarrierBehavior.RegisterTemplate.SecurityClientMechanisms,
+		cfg.CarrierBehavior.RegisterTemplate.StrictSecurityServerOffer,
 	)
 	if err != nil {
 		return "", nil, err

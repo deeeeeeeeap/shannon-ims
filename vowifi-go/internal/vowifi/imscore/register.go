@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/1239t/swu-go/pkg/logger"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
@@ -40,6 +39,14 @@ type registerState struct {
 	portC         int
 	portS         int
 	transportMode string
+	fromTag       string
+
+	// generation identifies the SA this state will install, as allocated by the
+	// Service. It is the token that tells a current SA from a retired one during
+	// a re-registration, so it must come from the Service-owned allocator and
+	// never be minted per attempt. Zero means "no generation", which the
+	// protected TCP activation gate treats as never ready.
+	generation uint64
 
 	ck []byte
 	ik []byte
@@ -62,6 +69,18 @@ type registerResult struct {
 	secureConn     *ipsec3gpp.SecureChannelConn
 	ipsecPolicy    ipsec3gpp.Policy
 	transport      *ipsec3gpp.Transport
+	portRelease    func()
+
+	// protectedTCP is the runtime a protected-TCP registration built, waiting to
+	// be handed to the Service.
+	//
+	// It is mutually exclusive with secureConn. service_lifecycle keys the legacy
+	// transport runtime off secureConn != nil, so a result that carried both would
+	// start two readers on one ESP carrier - and swuNetstack.dispatchRawIPPacket
+	// delivers a COPY to every matching raw connection, so each packet would be
+	// processed twice by two independent replay windows.
+	protectedTCP        *protectedTCPRuntime
+	protectedClientConn net.Conn
 }
 
 type initialRegisterVariant struct {
@@ -71,12 +90,14 @@ type initialRegisterVariant struct {
 	includeCellular            bool
 	requireSecAgree            bool
 	proxyRequireSecAgree       bool
+	omitRequireSecAgree        bool
+	omitProxyRequireSecAgree   bool
 	securityClientMechanism    policy.IPSec3GPPSecurityMechanism
 	hasSecurityClientMechanism bool
 }
 
 func initialRejectFallbackEnabled(cfg Config) bool {
-	if cfg.Template.EnableInitialRejectFallback {
+	if cfg.CarrierBehavior.RegisterTemplate.EnableInitialRejectFallback {
 		return true
 	}
 	return strings.TrimSpace(os.Getenv("VOHIVE_IMS_INITIAL_REJECT_FALLBACK")) == "1"
@@ -85,11 +106,11 @@ func initialRejectFallbackEnabled(cfg Config) bool {
 func initialRegisterVariants(cfg Config) []initialRegisterVariant {
 	base := initialRegisterVariant{
 		initialAuth:     "",
-		includePANI:     templateIncludesPANI(cfg.Template),
+		includePANI:     templateIncludesPANI(cfg.CarrierBehavior.RegisterTemplate),
 		includeCellular: true,
 	}
-	if cfg.Template.ProbeInitialSecurityClientOnBadRequest {
-		mechanisms := initialSecurityClientProbeMechanisms(cfg.Template)
+	if cfg.CarrierBehavior.RegisterTemplate.ProbeInitialSecurityClientOnBadRequest {
+		mechanisms := initialSecurityClientProbeMechanisms(cfg.CarrierBehavior.RegisterTemplate)
 		variants := make([]initialRegisterVariant, 0, len(mechanisms))
 		for _, mechanism := range mechanisms {
 			variant := base
@@ -101,6 +122,15 @@ func initialRegisterVariants(cfg Config) []initialRegisterVariant {
 		if len(variants) > 0 {
 			return variants
 		}
+	}
+	if cfg.CarrierBehavior.RegisterTemplate.RetryInitialWithoutRequiredSecAgreeOnBadRequest {
+		withRequiredSecAgree := base
+		withRequiredSecAgree.name = "with_required_sec_agree"
+		withoutRequiredSecAgree := base
+		withoutRequiredSecAgree.name = "without_required_sec_agree"
+		withoutRequiredSecAgree.omitRequireSecAgree = true
+		withoutRequiredSecAgree.omitProxyRequireSecAgree = true
+		return []initialRegisterVariant{withRequiredSecAgree, withoutRequiredSecAgree}
 	}
 	if !initialRejectFallbackEnabled(cfg) {
 		return []initialRegisterVariant{base}
@@ -115,7 +145,10 @@ func initialRegisterVariants(cfg Config) []initialRegisterVariant {
 }
 
 func shouldRetryInitialRegisterForStatus(cfg Config, statusCode int) bool {
-	if cfg.Template.ProbeInitialSecurityClientOnBadRequest {
+	if cfg.CarrierBehavior.RegisterTemplate.ProbeInitialSecurityClientOnBadRequest {
+		return statusCode == sip.StatusBadRequest
+	}
+	if cfg.CarrierBehavior.RegisterTemplate.RetryInitialWithoutRequiredSecAgreeOnBadRequest {
 		return statusCode == sip.StatusBadRequest
 	}
 	if !initialRejectFallbackEnabled(cfg) {
@@ -124,7 +157,7 @@ func shouldRetryInitialRegisterForStatus(cfg Config, statusCode int) bool {
 	if statusCode == sip.StatusForbidden {
 		return true
 	}
-	for _, code := range cfg.Template.RegisterPolicy.InitialRejectFallbackStatusCodes {
+	for _, code := range cfg.CarrierBehavior.RegisterTemplate.RegisterPolicy.InitialRejectFallbackStatusCodes {
 		if code == statusCode {
 			return true
 		}
@@ -133,6 +166,32 @@ func shouldRetryInitialRegisterForStatus(cfg Config, statusCode int) bool {
 }
 
 func runSecureAuthenticatedRegister(ctx context.Context, cfg Config, swuTCP voiceclient.SWUTCPDialer, state *registerState, lastReq *sip.Request, lastRes *sip.Response) (*registerResult, error) {
+	// The protected transport is decided here, before anything is dialled or
+	// serialized, and separately from the transport of the unprotected phase.
+	//
+	// The branch is taken only when the gate is on AND the decision resolved to
+	// TCP. Everything else - a fitting request, an opted-out template, an explicit
+	// udp configuration - falls through to the UDP path below, which runs exactly
+	// as it did before Phase C: same order, same helpers, same bytes.
+	//
+	// handled=true means the outcome belongs to the TCP path, success or failure.
+	// It must not be retried on UDP: the plan said TCP precisely because the
+	// request does not fit UDP, so a downgrade would put a fragmenting request on
+	// the wire.
+	if protectedTCPClientProductionEnabled {
+		result, handled, err := runProtectedTCPAuthenticatedRegister(
+			ctx, cfg, swuTCP, state, lastReq, lastRes)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			// A TCP decision is final. It must not fall back to UDP: the plan says
+			// TCP precisely because the request does not fit UDP, so a downgrade
+			// would send a request that fragments.
+			return result, nil
+		}
+	}
+
 	secureConn, err := dialSecureRegisterConn(ctx, cfg, swuTCP, *state)
 	if err != nil {
 		return nil, fmt.Errorf("secure channel dial: %w", err)
@@ -148,9 +207,16 @@ func runSecureAuthenticatedRegister(ctx context.Context, cfg Config, swuTCP voic
 		return nil, err
 	}
 
+	// The protected REGISTER is the only REGISTER sent over UDP unconditionally
+	// (dialSecureRegisterConn rejects anything else). Record its serialized
+	// length so an RFC 3261 §18.1.1 violation is visible instead of inferred:
+	// a request past that threshold on UDP may legitimately be dropped without
+	// any ICMP or SIP error. Length and a bool only, never the message.
+	logProtectedRegisterMessageSize(len(authRes.String()))
+
 	secureTransport := newConnRegisterTransport(secureConn, cfg.TraceID, cfg.DeviceID, "udp")
 	var sendErr error
-	if strings.EqualFold(strings.TrimSpace(cfg.Template.ID), "vodafone_uk_23415") {
+	if usesVodafoneRegisterWireFormat(cfg) {
 		payload, err := buildVodafoneProtectedRegisterPayload(authRes)
 		if err != nil {
 			_ = secureTransport.Close()
@@ -166,17 +232,55 @@ func runSecureAuthenticatedRegister(ctx context.Context, cfg Config, swuTCP voic
 	}
 	finalRes, err := secureTransport.ReadResponse(ctx)
 	if err != nil {
+		// No SIP response arrived on the protected channel. Emit the bounded
+		// ESP counters so a silent transform/replay drop can be told apart
+		// from nothing ever coming back.
+		logProtectedRegisterReadFailure(state)
 		_ = secureTransport.Close()
 		return nil, fmt.Errorf("authenticated REGISTER: %w", err)
 	}
+	if !registerResponseCorrelates(authRes, finalRes) {
+		_ = secureTransport.Close()
+		return nil, fmt.Errorf("authenticated REGISTER response correlation mismatch")
+	}
 	if finalRes.StatusCode != sip.StatusOK {
 		_ = secureTransport.Close()
-		return nil, fmt.Errorf("authenticated REGISTER failed: %d %s", finalRes.StatusCode, finalRes.Reason)
+		return nil, fmt.Errorf(
+			"authenticated REGISTER failed: status=%d result=%s",
+			finalRes.StatusCode,
+			registerStatusResult(finalRes.StatusCode),
+		)
 	}
 	_ = secureTransport.ReleaseConn()
 
 	state.secureConn = secureConn
 	return finalizeRegisterSuccess(cfg, *state, finalRes)
+}
+
+func usesVodafoneRegisterWireFormat(cfg Config) bool {
+	return cfg.CarrierBehavior.RegisterWireFormat == policy.RegisterWireVodafoneUK
+}
+
+func registerResponseCorrelates(req *sip.Request, res *sip.Response) bool {
+	if req == nil || res == nil {
+		return false
+	}
+	reqCallID := req.GetHeader("Call-ID")
+	resCallID := res.GetHeader("Call-ID")
+	if reqCallID == nil || resCallID == nil || strings.TrimSpace(reqCallID.Value()) == "" || strings.TrimSpace(reqCallID.Value()) != strings.TrimSpace(resCallID.Value()) {
+		return false
+	}
+	reqCSeq := req.GetHeader("CSeq")
+	resCSeq := res.GetHeader("CSeq")
+	if reqCSeq == nil || resCSeq == nil {
+		return false
+	}
+	reqFields := strings.Fields(reqCSeq.Value())
+	resFields := strings.Fields(resCSeq.Value())
+	if len(reqFields) != 2 || len(resFields) != 2 {
+		return false
+	}
+	return reqFields[0] == resFields[0] && strings.EqualFold(reqFields[1], resFields[1])
 }
 func installIPSecFromChallenge(cfg Config, state *registerState, res *sip.Response) error {
 	secServer := res.GetHeader("Security-Server")
@@ -299,6 +403,108 @@ func buildAuthenticatedRegister(cfg Config, state registerState, prevReq *sip.Re
 	return req, prevReq, nil
 }
 
+// registerProtectedInnerMTU mirrors voiceclient.swuRawIPMTU, the largest inner
+// IP packet the SWu raw IP connection forwards without fragmenting it.
+const registerProtectedInnerMTU = 1280
+
+// ESP transport-mode framing added by ipsec3gpp.encapsulateTransport for
+// AES-CBC + HMAC-SHA-1-96: SPI(4) + sequence(4), a 16-byte IV, the ciphertext
+// (block-aligned), and a 96-bit ICV. The trailer inside the ciphertext is
+// pad-length(1) + next-header(1).
+const (
+	registerProtectedESPHeaderLen  = 8
+	registerProtectedESPIVLen      = 16
+	registerProtectedESPICVLen     = 12
+	registerProtectedESPBlockLen   = 16
+	registerProtectedESPTrailerLen = 2
+	registerProtectedIPv6HeaderLen = 40
+	registerProtectedUDPHeaderLen  = 8
+)
+
+// registerProtectedInnerPacketLen reports the inner IPv6 packet length produced
+// by a protected REGISTER of sipLen bytes.
+//
+// The ESP ciphertext is block-aligned, so this is not a plain sum: a naive
+// subtraction from the MTU overstates the usable SIP budget by up to a block.
+func registerProtectedInnerPacketLen(sipLen int) int {
+	if sipLen < 0 {
+		sipLen = 0
+	}
+	plaintext := registerProtectedUDPHeaderLen + sipLen + registerProtectedESPTrailerLen
+	blocks := (plaintext + registerProtectedESPBlockLen - 1) / registerProtectedESPBlockLen
+	ciphertext := blocks * registerProtectedESPBlockLen
+	return registerProtectedIPv6HeaderLen +
+		registerProtectedESPHeaderLen +
+		registerProtectedESPIVLen +
+		ciphertext +
+		registerProtectedESPICVLen
+}
+
+// protectedRegisterMaxUnfragmentedSIPLen is the largest serialized protected
+// REGISTER whose inner packet still fits registerProtectedInnerMTU. Derived
+// from the framing above rather than assumed: the ciphertext can only grow in
+// 16-byte steps, so the last usable step is 1200 bytes and the SIP message must
+// leave room for the UDP header and the ESP trailer.
+const protectedRegisterMaxUnfragmentedSIPLen = registerProtectedInnerMTU -
+	registerProtectedIPv6HeaderLen -
+	registerProtectedESPHeaderLen -
+	registerProtectedESPIVLen -
+	registerProtectedESPICVLen -
+	((registerProtectedInnerMTU -
+		registerProtectedIPv6HeaderLen -
+		registerProtectedESPHeaderLen -
+		registerProtectedESPIVLen -
+		registerProtectedESPICVLen) % registerProtectedESPBlockLen) -
+	registerProtectedUDPHeaderLen -
+	registerProtectedESPTrailerLen
+
+// registerProtectedIPv6FragmentHeaderLen is the RFC 8200 Fragment Header that
+// voiceclient.fragmentRawIPv6Packet inserts into every fragment.
+const registerProtectedIPv6FragmentHeaderLen = 8
+
+// registerProtectedRawIPPacketCount reports how many SWu raw IP packets an
+// inner packet of innerLen bytes becomes.
+//
+// The name says "packet count", not "fragment count", on purpose: a count of 1
+// is ambiguous when read as fragments (one fragment produced, or one whole
+// packet?). Callers pair this with registerProtectedInnerIsFragmented so both
+// facts are unambiguous.
+//
+// This mirrors voiceclient.fragmentRawIPv6Packet: each fragment carries the
+// IPv6 header plus a Fragment Header, and every fragment payload except the last
+// is a multiple of 8.
+func registerProtectedRawIPPacketCount(innerLen int) int {
+	if innerLen <= 0 {
+		return 0
+	}
+	if innerLen <= registerProtectedInnerMTU {
+		return 1
+	}
+	maxPayload := ((registerProtectedInnerMTU -
+		registerProtectedIPv6HeaderLen -
+		registerProtectedIPv6FragmentHeaderLen) / 8) * 8
+	if maxPayload <= 0 {
+		return 0
+	}
+	payload := innerLen - registerProtectedIPv6HeaderLen
+	return (payload + maxPayload - 1) / maxPayload
+}
+
+// registerProtectedInnerIsFragmented reports whether the inner packet has to be
+// fragmented to cross the SWu tunnel. This is the fact the acceptance criteria
+// are stated in terms of; raw_ip_packet_count alone cannot express it without
+// the reader knowing the MTU.
+func registerProtectedInnerIsFragmented(innerLen int) bool {
+	return innerLen > registerProtectedInnerMTU
+}
+
+// Header stripping was attempted here and reverted. The protected REGISTER is a
+// clone of the INITIAL request, which 3gpp-default already builds with
+// MinimalInitialHeaders, so Allow and Accept-Contact are never present to
+// remove: on device the change saved 0 bytes. See
+// register_production_chain_composition_test.go for the measurement that
+// replaces the earlier, wrongly-based one.
+
 func prepareProtectedRegisterRequest(cfg Config, state registerState, req *sip.Request) error {
 	if req == nil {
 		return fmt.Errorf("missing protected REGISTER request")
@@ -352,7 +558,11 @@ func buildRegisterRequest(cfg Config, state registerState, initial bool, variant
 		return nil, err
 	}
 	req := sip.NewRequest(sip.REGISTER, recipient)
-	req.AppendHeader(sip.NewHeader("From", "<"+cfg.PublicURI+">;tag="+sip.GenerateTagN(16)))
+	fromTag := strings.TrimSpace(state.fromTag)
+	if fromTag == "" {
+		fromTag = sip.GenerateTagN(16)
+	}
+	req.AppendHeader(sip.NewHeader("From", "<"+cfg.PublicURI+">;tag="+fromTag))
 	req.AppendHeader(sip.NewHeader("To", "<"+cfg.PublicURI+">"))
 	req.AppendHeader(sip.NewHeader("Contact", buildIMSCoreContact(cfg, state, registerSIPLocalPort(cfg))))
 	if initial {
@@ -360,7 +570,7 @@ func buildRegisterRequest(cfg Config, state registerState, initial bool, variant
 			req.AppendHeader(sip.NewHeader("Authorization", auth))
 		}
 	}
-	if !cfg.Template.OmitRoute {
+	if !cfg.CarrierBehavior.RegisterTemplate.OmitRoute {
 		req.AppendHeader(sip.NewHeader("Route", "<sip:"+effectiveRouteAddr(cfg)+";lr>"))
 	}
 	expires := cfg.RegisterExpirySeconds
@@ -368,16 +578,15 @@ func buildRegisterRequest(cfg Config, state registerState, initial bool, variant
 		expires = 3600
 	}
 	req.AppendHeader(sip.NewHeader("Expires", strconv.Itoa(expires)))
-	supported := strings.TrimSpace(cfg.Template.SupportedHeader)
+	supported := strings.TrimSpace(cfg.CarrierBehavior.RegisterTemplate.SupportedHeader)
 	if supported == "" {
 		supported = "path,sec-agree,gruu"
 	}
 	req.AppendHeader(sip.NewHeader("Supported", supported))
-	requireSecAgree := cfg.Template.RequireSecAgree
-	proxyRequireSecAgree := cfg.Template.ProxyRequireSecAgree
+	requireSecAgree := cfg.CarrierBehavior.RegisterTemplate.RequireSecAgree
+	proxyRequireSecAgree := cfg.CarrierBehavior.RegisterTemplate.ProxyRequireSecAgree
 	if initial {
-		requireSecAgree = requireSecAgree || variant.requireSecAgree
-		proxyRequireSecAgree = proxyRequireSecAgree || variant.proxyRequireSecAgree
+		requireSecAgree, proxyRequireSecAgree = initialVariantSecAgreeRequirements(cfg.CarrierBehavior.RegisterTemplate, variant)
 	}
 	if requireSecAgree {
 		req.AppendHeader(sip.NewHeader("Require", "sec-agree"))
@@ -385,20 +594,20 @@ func buildRegisterRequest(cfg Config, state registerState, initial bool, variant
 	if proxyRequireSecAgree {
 		req.AppendHeader(sip.NewHeader("Proxy-Require", "sec-agree"))
 	}
-	minimalInitialHeaders := initial && cfg.Template.MinimalInitialHeaders
+	minimalInitialHeaders := initial && cfg.CarrierBehavior.RegisterTemplate.MinimalInitialHeaders
 	if !minimalInitialHeaders {
 		req.AppendHeader(sip.NewHeader("Allow", "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"))
 		req.AppendHeader(sip.NewHeader("P-Preferred-Identity", "<"+cfg.PublicURI+">"))
 		req.AppendHeader(sip.NewHeader("P-Visited-Network-ID", "\""+cfg.HomeDomain+"\""))
 	}
-	includePANI := templateIncludesPANI(cfg.Template)
+	includePANI := templateIncludesPANI(cfg.CarrierBehavior.RegisterTemplate)
 	includeCellular := true
 	if initial {
 		includePANI = variant.includePANI
 		includeCellular = variant.includeCellular
 	}
 	if includePANI {
-		req.AppendHeader(sip.NewHeader("P-Access-Network-Info", templatePANIValue(cfg.Template)))
+		req.AppendHeader(sip.NewHeader("P-Access-Network-Info", templatePANIValue(cfg.CarrierBehavior.RegisterTemplate)))
 	}
 	if includeCellular && !minimalInitialHeaders {
 		req.AppendHeader(sip.NewHeader("Cellular-Network-Info", buildCellularNetworkInfo(cfg)))
@@ -409,11 +618,11 @@ func buildRegisterRequest(cfg Config, state registerState, initial bool, variant
 	}
 	var secClient string
 	if initial {
-		secClient = buildInitialSecurityClient(cfg.Template, variant, state.spiC, state.spiS, state.portC, state.portS)
+		secClient = buildInitialSecurityClient(cfg.CarrierBehavior.RegisterTemplate, variant, state.spiC, state.spiS, state.portC, state.portS)
 	} else if state.verifyHeader != "" {
-		secClient = buildFullSecurityClient(cfg.Template, state.spiC, state.spiS, state.portC, state.portS)
+		secClient = buildFullSecurityClient(cfg.CarrierBehavior.RegisterTemplate, state.spiC, state.spiS, state.portC, state.portS)
 	} else {
-		secClient = buildTemplateSecurityClient(cfg.Template, state.spiC, state.spiS, state.portC, state.portS)
+		secClient = buildTemplateSecurityClient(cfg.CarrierBehavior.RegisterTemplate, state.spiC, state.spiS, state.portC, state.portS)
 	}
 	req.AppendHeader(sip.NewHeader("Security-Client", secClient))
 	req.AppendHeader(sip.NewHeader("User-Agent", cfg.UserAgent))
@@ -421,6 +630,22 @@ func buildRegisterRequest(cfg Config, state registerState, initial bool, variant
 	req.SetDestination(effectiveTransportAddr(cfg))
 	req.SetTransport("TCP")
 	return req, nil
+}
+
+func initialVariantSecAgreeRequirements(template policy.IMSRegisterTemplate, variant initialRegisterVariant) (bool, bool) {
+	requireSecAgree := template.RequireSecAgree
+	if variant.omitRequireSecAgree {
+		requireSecAgree = false
+	} else {
+		requireSecAgree = requireSecAgree || variant.requireSecAgree
+	}
+	proxyRequireSecAgree := template.ProxyRequireSecAgree
+	if variant.omitProxyRequireSecAgree {
+		proxyRequireSecAgree = false
+	} else {
+		proxyRequireSecAgree = proxyRequireSecAgree || variant.proxyRequireSecAgree
+	}
+	return requireSecAgree, proxyRequireSecAgree
 }
 
 func templateIncludesPANI(template policy.IMSRegisterTemplate) bool {
@@ -442,13 +667,14 @@ func finalizeRegisterSuccess(cfg Config, state registerState, res *sip.Response)
 			expires = v
 		}
 	}
-	logger.Info(fmt.Sprintf("[%s] IMS REGISTER 成功", strings.TrimSpace(cfg.DeviceID)),
-		logger.String("trace_id", strings.TrimSpace(cfg.TraceID)),
-		logger.Int("code", res.StatusCode),
-		logger.Int("expires_seconds", expires),
-		logger.String("sip_security_mode", "ipsec3gpp"),
-		logger.Bool("security_verify_present", strings.TrimSpace(state.verifyHeader) != ""),
-		logger.Int("security_verify_len", len(strings.TrimSpace(state.verifyHeader))))
+	logRegisterDiagnostic(registerDiagnostic{
+		stage:          "complete",
+		status:         res.StatusCode,
+		result:         "ok",
+		addressFamily:  registerAddressFamily(cfg.PCSCFAddr),
+		expiresSeconds: expires,
+		protected:      strings.TrimSpace(state.verifyHeader) != "",
+	})
 	serviceRoutes := make([]string, 0)
 	for _, header := range res.GetHeaders("Service-Route") {
 		if header != nil && strings.TrimSpace(header.Value()) != "" {
@@ -490,9 +716,9 @@ func doRegisterTransaction(ctx context.Context, client *sipgo.Client, req *sip.R
 func buildInitialAuthorization(cfg Config, mode string) string {
 	authMode := strings.ToLower(strings.TrimSpace(mode))
 	if authMode == "" {
-		if strings.EqualFold(strings.TrimSpace(cfg.Template.SecAgreeMode), "auto") {
+		if strings.EqualFold(strings.TrimSpace(cfg.CarrierBehavior.RegisterTemplate.SecAgreeMode), "auto") {
 			authMode = "aka_empty_uri_first"
-		} else if !cfg.Template.UsePlainDigestPlaceholder {
+		} else if !cfg.CarrierBehavior.RegisterTemplate.UsePlainDigestPlaceholder {
 			authMode = "none"
 		} else {
 			authMode = "aka_empty_uri_first"
@@ -554,7 +780,7 @@ func buildIMSCoreContactForTransport(cfg Config, state registerState, localPort 
 	if sipInstance == "" {
 		sipInstance = voiceclient.NewSIPInstanceURN()
 	}
-	return policy.BuildIMSContactHeader(cfg.Template, policy.ContactBuildInput{
+	return policy.BuildIMSContactHeader(cfg.CarrierBehavior.RegisterTemplate, policy.ContactBuildInput{
 		IMSI:               cfg.IMSI,
 		PublicURI:          cfg.PublicURI,
 		LocalIP:            cfg.LocalIP,

@@ -27,14 +27,13 @@ func logVoWiFiFailureSummary(traceID, deviceID, stage, errorClass, reason string
 		"next_retry", nextRetry.String())
 }
 
-func (p *Pool) handleVoWiFiStartupError(traceID, deviceID, runtimeEPDGOverride string, generation uint64, enableStart time.Time, w *Worker, state runtimehost.State, err error) error {
-	defer p.clearVoWiFiStartupStateAndBroadcast(deviceID)
+func (p *Pool) handleVoWiFiStartupError(traceID, deviceID, runtimeEPDGOverride string, enableStart time.Time, w *Worker, state runtimehost.State, err error) error {
 	if errors.Is(err, apduarbiter.ErrAPDUBusy) {
-		logger.Debug("VoWiFi 启动遇到 APDU busy，等待短退避恢复",
+		logger.Debug("VoWiFi 启动遇到 APDU busy，进入统一目标态恢复队列",
 			"trace_id", traceID,
 			"device", deviceID,
 			"err", err)
-		p.scheduleVoWiFiAPDUBusyRecover(deviceID, runtimeEPDGOverride, generation)
+		p.scheduleVoWiFiAPDUBusyRecover(deviceID, runtimeEPDGOverride)
 		p.restoreNetworkAfterVoWiFiStartupFailure(traceID, deviceID, w)
 		logger.Debug("EnableVoWiFi 结束（APDU busy）", "trace_id", traceID, "device", deviceID, "cost_ms", time.Since(enableStart).Milliseconds())
 		return err
@@ -79,7 +78,7 @@ func shouldRetryVoWiFiAutoStart(err error) bool {
 	return !carrier.IsVoWiFiPolicyBlockedError(err)
 }
 
-func (p *Pool) scheduleVoWiFiAPDUBusyRecover(deviceID, overrideEPDG string, generation uint64) {
+func (p *Pool) scheduleVoWiFiAPDUBusyRecover(deviceID, overrideEPDG string) {
 	if p == nil {
 		return
 	}
@@ -87,27 +86,11 @@ func (p *Pool) scheduleVoWiFiAPDUBusyRecover(deviceID, overrideEPDG string, gene
 	if deviceID == "" {
 		return
 	}
-	for _, delay := range []time.Duration{3 * time.Second, 5 * time.Second, 10 * time.Second} {
-		delay := delay
-		go func() {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-p.ctx.Done():
-				return
-			case <-timer.C:
-			}
-			if p.IsVoWiFiActive(deviceID) {
-				return
-			}
-			if err := p.voWiFiHost().Recover(p.ctx, vowifihost.LifecycleRecoverRequest{
-				DeviceID:     deviceID,
-				Reason:       "apdu_busy",
-				OverrideEPDG: strings.TrimSpace(overrideEPDG),
-				Generation:   generation,
-			}); err != nil {
-				logger.Debug("VoWiFi APDU busy 短退避恢复提交失败", "device", deviceID, "delay", delay.String(), "err", err)
-			}
-		}()
+	if !p.desiredVoWiFiEligibility(p.GetWorker(deviceID), "apdu_busy", false) {
+		return
 	}
+	p.voWiFiHost().ScheduleAPDUBusyRecover(p.ctx, vowifihost.APDUBusyRecoverRequest{
+		DeviceID:     deviceID,
+		OverrideEPDG: strings.TrimSpace(overrideEPDG),
+	})
 }

@@ -39,11 +39,42 @@ func (*recordingIMSNetwork) ResolveIP(context.Context, string, bool) ([]byte, er
 }
 
 func TestVodafoneUKAutoRegisterTransportPrefersUDPThenTCP(t *testing.T) {
-	cfg := Config{Template: policy.VodafoneUKTemplate()}
+	cfg := Config{CarrierBehavior: policy.ResolveCarrierBehavior("234", "15")}
 	want := []string{"udp", "tcp"}
 
 	if got := registerTransportCandidates(cfg, "auto"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("register transports = %v, want %v", got, want)
+	}
+}
+
+func TestGeneric3GPPAutoRegisterTransportPrefersUDPThenTCP(t *testing.T) {
+	cfg := Config{CarrierBehavior: policy.Default3GPPBehavior()}
+	want := []string{"udp", "tcp"}
+
+	if got := registerTransportCandidates(cfg, "auto"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("register transports = %v, want %v", got, want)
+	}
+}
+
+func TestRegisterTransportExplicitModesAndGiffgaffRemainUnchanged(t *testing.T) {
+	tests := []struct {
+		name      string
+		behavior  policy.CarrierBehavior
+		transport string
+		want      []string
+	}{
+		{name: "explicit UDP", behavior: policy.Default3GPPBehavior(), transport: "udp", want: []string{"udp"}},
+		{name: "explicit TCP", behavior: policy.Default3GPPBehavior(), transport: "tcp", want: []string{"tcp"}},
+		{name: "Giffgaff auto", behavior: policy.ResolveCarrierBehavior("234", "10"), transport: "auto", want: []string{"tcp"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{CarrierBehavior: tt.behavior}
+			if got := registerTransportCandidates(cfg, tt.transport); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("register transports = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -57,7 +88,7 @@ func TestUDPRegisterUsesSessionPortInViaAndContact(t *testing.T) {
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.VodafoneUKTemplate(),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 		UserAgent:          "Vodafone VOLTE Qualcomm",
 	}
 	session := newRegisterSession(cfg, nil, nil, "udp", 1)
@@ -96,7 +127,7 @@ func TestUDPRegisterDialsUDPAddress(t *testing.T) {
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.4:5060",
-		Template:           policy.VodafoneUKTemplate(),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 	network := &recordingIMSNetwork{}
 	session := newRegisterSession(cfg, nil, network, "udp", 0)

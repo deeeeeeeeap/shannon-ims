@@ -25,6 +25,22 @@ type Config struct {
 	// REGISTER probing when the first node returns a location/forbidden reject.
 	RegistrarCandidates []string
 
+	// ProtectedTransport is the operator's intent for the ipsec-3gpp protected
+	// REGISTER only: "udp", "tcp", or "" / "auto" to derive it from the request
+	// size.
+	//
+	// It is deliberately separate from the transport of the UNPROTECTED phase.
+	// The unprotected transport is chosen per attempt by
+	// registerTransportCandidates, and reusing that decision here would mean
+	// re-sending the initial REGISTER to switch the protected one - abandoning the
+	// session that already answered 401 and risking a second AKA vector, a second
+	// CSeq and a different candidate.
+	//
+	// An explicit "tcp" expresses transport intent only. It is not permission to
+	// register without a server flow: authorizeProtectedTCPActivation still
+	// requires a ready port_us listener for the current SA generation.
+	ProtectedTransport string
+
 	Realm      string
 	PrivateID  string
 	PublicURI  string
@@ -34,7 +50,7 @@ type Config struct {
 
 	AKA sim.AKAProvider
 
-	Template policy.IMSRegisterTemplate
+	CarrierBehavior policy.CarrierBehavior
 
 	MCC    string
 	MNC    string

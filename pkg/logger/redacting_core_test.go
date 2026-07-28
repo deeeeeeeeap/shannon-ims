@@ -10,6 +10,22 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
+func TestRedactingCorePreservesSafePeerCounter(t *testing.T) {
+	core, observed := observer.New(zap.DebugLevel)
+	logger := zap.New(newRedactingCore(core))
+
+	logger.Info("diagnostic", zap.Int("peer_ip_inbound_count", 2))
+
+	entries := observed.All()
+	if len(entries) != 1 {
+		t.Fatalf("entry count = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if got, ok := fields["peer_ip_inbound_count"]; !ok || got != int64(2) {
+		t.Fatalf("peer_ip_inbound_count = %#v, want int64(2)", got)
+	}
+}
+
 func TestRedactingCoreRemovesSensitiveMessagesAndFields(t *testing.T) {
 	core, observed := observer.New(zap.DebugLevel)
 	log := zap.New(newRedactingCore(core))

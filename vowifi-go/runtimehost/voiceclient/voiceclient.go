@@ -65,6 +65,11 @@ type Config struct {
 	// LocalPort is the port to listen on at LocalIP. 0 defaults to 5060.
 	LocalPort int
 
+	// ContactPort is the stable terminating port advertised in Contact when it
+	// differs from the client connection's LocalPort (ipsec-3gpp TCP port_us vs
+	// port_uc). Zero preserves the legacy single-port behavior.
+	ContactPort int
+
 	// PCSCFAddr is the P-CSCF ("host:port") to REGISTER against and route
 	// MESSAGE through. See the package doc comment: required because
 	// discovery isn't wired up yet.
@@ -147,7 +152,7 @@ func (c Config) contactURI() string {
 	if user == "" {
 		user = "anonymous"
 	}
-	return fmt.Sprintf("sip:%s@%s;transport=%s", user, net.JoinHostPort(c.LocalIP.String(), strconv.Itoa(c.localPort())), transport)
+	return fmt.Sprintf("sip:%s@%s;transport=%s", user, net.JoinHostPort(c.LocalIP.String(), strconv.Itoa(c.contactPort())), transport)
 }
 
 func (c Config) contactUser() string {
@@ -178,6 +183,13 @@ func (c Config) localPort() int {
 		return c.LocalPort
 	}
 	return 5060
+}
+
+func (c Config) contactPort() int {
+	if c.ContactPort > 0 {
+		return c.ContactPort
+	}
+	return c.localPort()
 }
 
 func (c Config) registerExpiry() time.Duration {

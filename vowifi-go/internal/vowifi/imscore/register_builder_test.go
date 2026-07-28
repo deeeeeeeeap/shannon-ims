@@ -25,6 +25,75 @@ func TestBuildTemplateSecurityClientSingleMechanism(t *testing.T) {
 	}
 }
 
+func TestGeneric3GPPInitialRegisterUsesConservativeWireProfile(t *testing.T) {
+	cfg := registerSessionTestConfig()
+	cfg.CarrierBehavior = policy.Default3GPPBehavior()
+	cfg.UserAgent = "synthetic-ims-client"
+	session := newRegisterSession(cfg, nil, nil, "udp", 0)
+	session.localPort = 41234
+	session.callID = "synthetic-call-id"
+	session.cseq = 10001
+
+	req, err := buildRegisterRequest(cfg, *session.state, true, initialRegisterVariants(cfg)[0])
+	if err != nil {
+		t.Fatalf("build generic REGISTER: %v", err)
+	}
+	if err := session.decorateRegisterRequest(req); err != nil {
+		t.Fatalf("decorate generic REGISTER: %v", err)
+	}
+
+	raw := req.String()
+	withoutCRLF := strings.ReplaceAll(raw, "\r\n", "")
+	if strings.ContainsAny(withoutCRLF, "\r\n") {
+		t.Fatal("generic REGISTER contains non-CRLF line endings")
+	}
+	if !strings.HasSuffix(raw, "\r\n\r\n") {
+		t.Fatal("generic REGISTER must end with one empty line")
+	}
+	if strings.Count(raw, "\r\nContent-Length: 0\r\n") != 1 {
+		t.Fatal("generic REGISTER must contain exactly one Content-Length: 0 header")
+	}
+
+	allowed := map[string]bool{
+		"Via": true, "Max-Forwards": true, "From": true, "To": true,
+		"Call-ID": true, "CSeq": true, "Contact": true, "Route": true,
+		"Expires": true, "Supported": true, "Require": true,
+		"Proxy-Require": true, "Authorization": true, "Security-Client": true,
+		"User-Agent": true, "Content-Length": true,
+	}
+	for _, header := range req.Headers() {
+		if header != nil && !allowed[header.Name()] {
+			t.Fatalf("generic REGISTER contains unsupported header %q", header.Name())
+		}
+	}
+	for name := range allowed {
+		if req.GetHeader(name) == nil {
+			t.Fatalf("generic REGISTER missing required header %q", name)
+		}
+	}
+	wantAuthorization := `Digest uri="sip:ims.mnc015.mcc234.3gppnetwork.org",username="subscriber@ims.mnc015.mcc234.3gppnetwork.org",algorithm=AKAv1-MD5,response="",realm="ims.mnc015.mcc234.3gppnetwork.org",nonce=""`
+	if got := strings.TrimSpace(req.GetHeader("Authorization").Value()); got != wantAuthorization {
+		t.Fatal("generic initial REGISTER empty AKA Authorization mismatch")
+	}
+	if got := strings.TrimSpace(req.GetHeader("Supported").Value()); got != "path,sec-agree" {
+		t.Fatalf("generic REGISTER Supported profile is not conservative")
+	}
+	for _, name := range []string{"Require", "Proxy-Require"} {
+		if got := strings.TrimSpace(req.GetHeader(name).Value()); !strings.EqualFold(got, "sec-agree") {
+			t.Fatalf("generic REGISTER %s must be sec-agree", name)
+		}
+	}
+	securityClient := req.GetHeader("Security-Client").Value()
+	if strings.Count(securityClient, "ipsec-3gpp") != 1 {
+		t.Fatal("generic REGISTER must advertise exactly one Security-Client mechanism")
+	}
+	for _, token := range []string{"alg=hmac-sha-1-96", "ealg=aes-cbc", "prot=esp", "mod=trans"} {
+		if !strings.Contains(securityClient, token) {
+			t.Fatalf("generic REGISTER Security-Client missing %q", token)
+		}
+	}
+}
+
 func TestResolveStableSIPInstanceUsesConfig(t *testing.T) {
 	cfg := Config{SIPInstanceURN: "urn:uuid:fixed-id"}
 	if got := resolveStableSIPInstance(cfg); got != "urn:uuid:fixed-id" {
@@ -34,10 +103,10 @@ func TestResolveStableSIPInstanceUsesConfig(t *testing.T) {
 
 func TestVodafoneUKInitialRegisterIncludesAKAEmptyAuthorization(t *testing.T) {
 	cfg := Config{
-		HomeDomain: "ims.mnc015.mcc234.3gppnetwork.org",
-		Realm:      "ims.mnc015.mcc234.3gppnetwork.org",
-		PrivateID:  "subscriber@ims.mnc015.mcc234.3gppnetwork.org",
-		Template:   policy.ResolveIMSRegisterTemplate("234", "15"),
+		HomeDomain:      "ims.mnc015.mcc234.3gppnetwork.org",
+		Realm:           "ims.mnc015.mcc234.3gppnetwork.org",
+		PrivateID:       "subscriber@ims.mnc015.mcc234.3gppnetwork.org",
+		CarrierBehavior: policy.ResolveCarrierBehavior("234", "15"),
 	}
 
 	want := `Digest uri="sip:ims.mnc015.mcc234.3gppnetwork.org",username="subscriber@ims.mnc015.mcc234.3gppnetwork.org",algorithm=AKAv1-MD5,response="",realm="ims.mnc015.mcc234.3gppnetwork.org",nonce=""`
@@ -56,7 +125,7 @@ func TestVodafoneUKInitialRegisterOmitsRoute(t *testing.T) {
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 	state := registerState{spiC: 1, spiS: 2, portC: 5064, portS: 5063, sipInstance: "urn:uuid:test"}
 
@@ -79,7 +148,7 @@ func TestVodafoneUKInitialRegisterIncludesSIPInstanceWithoutGRUUSupported(t *tes
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 	state := registerState{spiC: 1, spiS: 2, portC: 5064, portS: 5063, sipInstance: "urn:uuid:test"}
 
@@ -109,7 +178,7 @@ func TestVodafoneUKInitialRegisterUsesMinimalHeaderSet(t *testing.T) {
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 		UserAgent:          "Vodafone VOLTE Qualcomm",
 	}
 	state := registerState{spiC: 1, spiS: 2, portC: 5064, portS: 5063}
@@ -173,7 +242,7 @@ func TestVodafoneUKInitialRegisterStartsServerInitiatedSecurityAgreement(t *test
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 
 	req, err := buildRegisterRequest(cfg, registerState{spiC: 1, spiS: 2, portC: 5064, portS: 5063}, true, initialRegisterVariants(cfg)[0])
@@ -202,7 +271,7 @@ func TestVodafoneUKInitialRegisterIncludesSecurityClientProtocolAndMode(t *testi
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 
 	req, err := buildRegisterRequest(cfg, registerState{spiC: 10, spiS: 11, portC: 5062, portS: 5063}, true, initialRegisterVariants(cfg)[0])
@@ -242,7 +311,7 @@ func TestVodafoneUKInitialRegisterOmitsPANI(t *testing.T) {
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 
 	req, err := buildRegisterRequest(cfg, registerState{spiC: 1, spiS: 2, portC: 5064, portS: 5063}, true, initialRegisterVariants(cfg)[0])
@@ -262,7 +331,7 @@ func TestVodafoneUKInitialRegisterProbesSingleSecurityMechanismsInOrder(t *testi
 		LocalIP:            net.ParseIP("10.0.0.2"),
 		PCSCFAddr:          "10.0.0.3:5060",
 		TransportPCSCFAddr: "10.0.0.3:5060",
-		Template:           policy.ResolveIMSRegisterTemplate("234", "15"),
+		CarrierBehavior:    policy.ResolveCarrierBehavior("234", "15"),
 	}
 	state := registerState{spiC: 1, spiS: 2, portC: 5064, portS: 5063}
 	want := []struct {

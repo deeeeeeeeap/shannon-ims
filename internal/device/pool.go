@@ -996,7 +996,7 @@ func (p *Pool) confirmSIMRemovedAndStopVoWiFi(deviceID, source string) {
 	}
 
 	_ = w.RefreshRuntime(ctx, "sim_removed")
-	p.clearDesiredVoWiFiRecoverState(deviceID)
+	p.voWiFiHost().ForgetDesiredRecover(deviceID)
 	if !p.IsVoWiFiActive(deviceID) {
 		return
 	}
@@ -1101,8 +1101,6 @@ func (p *Pool) RemoveWorker(deviceID string) error {
 	})
 	<-esimOperationsIdle
 
-	// 移除 Worker 时，使当前设备的 VoWiFi 运行态失效，防止未完成的旧启动例程回写状态
-	p.voWiFiHost().InvalidateRuntime(deviceID, "remove_worker")
 	if p.stopVoWiFiAppForTeardown(p.ctx, deviceID, "remove") {
 		logger.Info("设备移除时强制关闭并清理残留的 VoWiFi 实例", "device", deviceID)
 	}
@@ -2275,8 +2273,7 @@ func (p *Pool) RebuildWorker(deviceID string) error {
 		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage())
 	}
 
-	// 先停止 VoWiFi（如有），并让任何正在启动中的旧实例失效。
-	p.voWiFiHost().InvalidateRuntime(deviceID, "rebuild_worker")
+	// 先通过 RuntimeAttempt owner 停止 VoWiFi（如有）并使旧启动失效。
 	if err := p.DisableVoWiFi(deviceID); err != nil {
 		logger.Warn("RebuildWorker 停止旧 VoWiFi 失败", "device", deviceID, "err", err)
 	}

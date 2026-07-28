@@ -21,7 +21,7 @@ type IMSConfig struct {
 	IMPI                       string
 	IMPU                       string
 	CarrierPresetID            string
-	IMSRegisterTemplate        policy.IMSRegisterTemplate
+	CarrierBehavior            policy.CarrierBehavior
 	IMSRegisterPolicySource    string
 	LocalAddr                  string
 	LocalPort                  int
@@ -60,7 +60,11 @@ type StartSessionInput struct {
 }
 
 // IMSConfigFromVoice builds the author-facing IMSConfig from runtimehost inputs.
-func IMSConfigFromVoice(v voiceclient.Config, template policy.IMSRegisterTemplate, presetID string) IMSConfig {
+func IMSConfigFromVoice(v voiceclient.Config, behavior policy.CarrierBehavior, presetID string) IMSConfig {
+	if behavior.RegisterWireFormat == "" {
+		behavior = policy.Default3GPPBehavior()
+	}
+	template := behavior.RegisterTemplate
 	transport := strings.TrimSpace(v.Transport)
 	if transport == "" {
 		transport = "auto"
@@ -79,7 +83,7 @@ func IMSConfigFromVoice(v voiceclient.Config, template policy.IMSRegisterTemplat
 		IMPI:                    strings.TrimSpace(v.PrivateID),
 		IMPU:                    strings.TrimSpace(v.PublicURI),
 		CarrierPresetID:         strings.TrimSpace(presetID),
-		IMSRegisterTemplate:     template,
+		CarrierBehavior:         behavior,
 		IMSRegisterPolicySource: policySource,
 		Transport:               transport,
 		UserAgent:               strings.TrimSpace(v.RegisterProfile.UserAgent),
@@ -93,9 +97,6 @@ func IMSConfigFromVoice(v voiceclient.Config, template policy.IMSRegisterTemplat
 	}
 	if strings.TrimSpace(cfg.CarrierPresetID) == "" {
 		cfg.CarrierPresetID = "3gpp-default"
-	}
-	if strings.TrimSpace(cfg.IMSRegisterTemplate.ID) == "" {
-		cfg.IMSRegisterTemplate = policy.DefaultGiffgaffTemplate()
 	}
 	return cfg
 }
@@ -119,7 +120,7 @@ func internalConfigFromIMS(ims IMSConfig, in StartSessionInput) Config {
 		IMSI:                  strings.TrimSpace(in.IMSI),
 		SMSC:                  strings.TrimSpace(in.SMSC),
 		AKA:                   in.AKA,
-		Template:              ims.IMSRegisterTemplate,
+		CarrierBehavior:       ims.CarrierBehavior,
 		MCC:                   strings.TrimSpace(in.MCC),
 		MNC:                   strings.TrimSpace(in.MNC),
 		CellID:                strings.TrimSpace(in.CellID),
@@ -131,8 +132,8 @@ func internalConfigFromIMS(ims IMSConfig, in StartSessionInput) Config {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = "SimAdmin VoWiFi"
 	}
-	if strings.TrimSpace(cfg.Template.ID) == "" {
-		cfg.Template = policy.DefaultGiffgaffTemplate()
+	if cfg.CarrierBehavior.RegisterWireFormat == "" {
+		cfg.CarrierBehavior = policy.Default3GPPBehavior()
 	}
 	return cfg
 }

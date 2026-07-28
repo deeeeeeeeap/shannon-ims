@@ -25,6 +25,7 @@ type Transport struct {
 	policy             Policy
 	outbound           []transportFlow
 	inbound            map[uint32]*transportFlow
+	peerInboundPackets atomic.Uint64
 	outboundPackets    atomic.Uint64
 	inboundPackets     atomic.Uint64
 	passthroughPackets atomic.Uint64
@@ -168,6 +169,9 @@ func (t *Transport) TransformInbound(packet []byte) ([]byte, error) {
 		t.transformErrors.Add(1)
 		return nil, err
 	}
+	if t.matchesInboundEndpoints(parsed) {
+		t.peerInboundPackets.Add(1)
+	}
 	if parsed.fragmented && t.matchesInboundEndpoints(parsed) {
 		t.transformErrors.Add(1)
 		return nil, errors.New("ipsec3gpp: fragmented inbound policy packet rejected")
@@ -214,6 +218,7 @@ func (t *Transport) Stats() TransportStats {
 		return TransportStats{}
 	}
 	stats := TransportStats{
+		PeerInboundPackets: t.peerInboundPackets.Load(),
 		OutboundPackets:    t.outboundPackets.Load(),
 		InboundPackets:     t.inboundPackets.Load(),
 		PassthroughPackets: t.passthroughPackets.Load(),

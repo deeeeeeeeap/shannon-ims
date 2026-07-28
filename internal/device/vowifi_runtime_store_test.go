@@ -7,7 +7,7 @@ import (
 	"github.com/1239t/vowifi-go/runtimehost"
 )
 
-func (p *Pool) voWiFiRuntimeStore() vowifihost.RuntimeStore {
+func (p *Pool) voWiFiRuntimeStore() *vowifihost.Store {
 	if p == nil {
 		return vowifihost.NewRuntimeStore()
 	}

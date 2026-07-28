@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,6 +155,80 @@ func TestAttachSecureMessagingClearsInheritedDeadlineAndSendsMESSAGE(t *testing.
 	}
 }
 
+func TestAttachSecureStreamMessagingSendsMESSAGEOverExistingTCPFlow(t *testing.T) {
+	clientRaw, serverRaw := net.Pipe()
+	defer serverRaw.Close()
+	clientStream := newSecureMessagingTestStreamConn(clientRaw)
+
+	serverDone := make(chan error, 1)
+	go func() {
+		request, err := readSecureMessagingTestRequest(bufio.NewReader(serverRaw))
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		via := request.GetHeader("Via")
+		if via == nil || !strings.Contains(strings.ToUpper(via.Value()), "SIP/2.0/TCP") {
+			serverDone <- fmt.Errorf("MESSAGE did not use TCP Via")
+			return
+		}
+		if strings.Contains(strings.ToLower(via.Value()), ";rport") {
+			serverDone <- fmt.Errorf("TCP Via unexpectedly requested rport")
+			return
+		}
+		if !strings.Contains(via.Value(), ":5062") {
+			serverDone <- fmt.Errorf("TCP Via did not use the protected client port")
+			return
+		}
+		contact := request.GetHeader("Contact")
+		if contact == nil || !strings.Contains(strings.ToLower(contact.Value()), ":5063;transport=tcp") {
+			serverDone <- fmt.Errorf("Contact did not use the protected server port")
+			return
+		}
+		if transport := strings.ToUpper(request.Transport()); transport != "TCP" {
+			serverDone <- fmt.Errorf("request transport = %q, want TCP", transport)
+			return
+		}
+		response := sip.NewResponseFromRequest(request, 202, "Accepted", nil)
+		_, err = io.WriteString(serverRaw, response.String())
+		serverDone <- err
+	}()
+
+	cfg := Config{
+		DeviceID:        "test-device",
+		LocalIP:         net.ParseIP("10.0.0.2"),
+		LocalPort:       5062,
+		ContactPort:     5063,
+		PCSCFAddr:       net.JoinHostPort("10.0.0.3", "5090"),
+		SecurityVerify:  "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=5062;port-s=5063",
+		SMSC:            "+15550102030",
+		Realm:           "ims.example.invalid",
+		PrivateID:       "subscriber@ims.example.invalid",
+		PublicURI:       "sip:subscriber@ims.example.invalid",
+		HomeDomain:      "ims.example.invalid",
+		SkipRegister:    true,
+		RegisterProfile: SimAdminGBEERegisterProfile(),
+	}
+	client, err := AttachSecureStreamMessaging(context.Background(), cfg, clientStream)
+	if err != nil {
+		t.Fatalf("AttachSecureStreamMessaging: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result, err := client.SendSMS(ctx, "sip:safe.invalid", "test", []messaging.SMSPart{{RPMR: 1, Body: []byte{0x01}}})
+	if err != nil {
+		t.Fatalf("SendSMS: %v", err)
+	}
+	if result.PartsTotal != 1 {
+		t.Fatalf("PartsTotal = %d, want 1", result.PartsTotal)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAttachSecureMessagingHandlesDeliveryReportOnFlowS(t *testing.T) {
 	clientPolicy := secureMessagingTestPolicy(t)
 	serverPolicy := reverseSecureMessagingTestPolicy(clientPolicy)
@@ -238,6 +313,89 @@ func TestAttachSecureMessagingHandlesDeliveryReportOnFlowS(t *testing.T) {
 	}
 }
 
+func TestAttachSecureStreamMessagingHandlesDeliveryReportOnIndependentServerFlow(t *testing.T) {
+	clientRaw, clientPeer := net.Pipe()
+	defer clientPeer.Close()
+	serverRaw, serverPeer := net.Pipe()
+	defer serverPeer.Close()
+	dualFlow := newSecureMessagingTestDualFlowConn(clientRaw, serverRaw)
+
+	store := &secureMessagingTestDeliveryStore{reports: make(chan secureMessagingTestReport, 1)}
+	cfg := Config{
+		DeviceID:        "test-device",
+		LocalIP:         net.ParseIP("10.0.0.2"),
+		LocalPort:       5062,
+		ContactPort:     5063,
+		PCSCFAddr:       net.JoinHostPort("10.0.0.3", "5090"),
+		Realm:           "ims.example.invalid",
+		PrivateID:       "subscriber@ims.example.invalid",
+		PublicURI:       "sip:subscriber@ims.example.invalid",
+		HomeDomain:      "ims.example.invalid",
+		SkipRegister:    true,
+		DeliveryStore:   store,
+		RegisterProfile: SimAdminGBEERegisterProfile(),
+	}
+	client, err := AttachSecureStreamMessaging(context.Background(), cfg, dualFlow)
+	if err != nil {
+		t.Fatalf("AttachSecureStreamMessaging: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	var recipient sip.Uri
+	if err := sip.ParseUri("sip:subscriber@ims.example.invalid", &recipient); err != nil {
+		t.Fatalf("ParseUri: %v", err)
+	}
+	report := sip.NewRequest(sip.MESSAGE, recipient)
+	report.AppendHeader(sip.NewHeader("Via", "SIP/2.0/TCP [2001:db8::2]:5090;branch=z9hG4bK-report"))
+	report.AppendHeader(sip.NewHeader("From", "<sip:network@ims.example.invalid>;tag=report"))
+	report.AppendHeader(sip.NewHeader("To", "<sip:subscriber@ims.example.invalid>"))
+	report.AppendHeader(sip.NewHeader("Call-ID", "delivery-report"))
+	report.AppendHeader(sip.NewHeader("CSeq", "1 MESSAGE"))
+	report.AppendHeader(sip.NewHeader("Content-Type", smsContentType))
+	report.SetBody([]byte{0x03, 0x2a})
+	payload := []byte(report.String())
+	writeDone := make(chan error, 1)
+	go func() {
+		if _, err := serverPeer.Write(payload[:23]); err != nil {
+			writeDone <- err
+			return
+		}
+		_, err := serverPeer.Write(payload[23:])
+		writeDone <- err
+	}()
+
+	responseFrame, err := readSecureMessagingTestFrame(bufio.NewReader(serverPeer))
+	if err != nil {
+		t.Fatalf("read delivery response: %v", err)
+	}
+	message, err := sip.NewParser().ParseSIP(responseFrame)
+	if err != nil {
+		t.Fatalf("parse delivery response: %v", err)
+	}
+	response, ok := message.(*sip.Response)
+	if !ok || response.StatusCode != sip.StatusOK {
+		t.Fatalf("delivery response status=%v, want 200", response)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write delivery report: %v", err)
+	}
+	select {
+	case got := <-store.reports:
+		if got.rpMR != 0x2a || got.state != "acked" {
+			t.Fatalf("delivery report = %+v, want RP-MR 42 acked", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delivery report was not recorded")
+	}
+	if err := clientPeer.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	var one [1]byte
+	if _, err := clientPeer.Read(one[:]); err == nil {
+		t.Fatal("server-flow delivery response leaked onto the client flow")
+	}
+}
+
 type secureMessagingTestReport struct {
 	rpMR  int
 	state string
@@ -277,13 +435,80 @@ func (*secureMessagingTestDeliveryStore) GetSMSDeliveryStatus(string) (*messagin
 }
 
 func readSecureMessagingTestRequest(reader *bufio.Reader) (*sip.Request, error) {
-	var raw strings.Builder
+	raw, err := readSecureMessagingTestFrame(reader)
+	if err != nil {
+		return nil, err
+	}
+	message, err := sip.NewParser().ParseSIP(raw)
+	if err != nil {
+		return nil, err
+	}
+	request, ok := message.(*sip.Request)
+	if !ok {
+		return nil, fmt.Errorf("parsed %T, want request", message)
+	}
+	return request, nil
+}
+
+type secureMessagingTestStreamConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+type secureMessagingTestDualFlowConn struct {
+	net.Conn
+	server    net.Conn
+	reader    *bufio.Reader
+	closeOnce sync.Once
+}
+
+func newSecureMessagingTestDualFlowConn(client, server net.Conn) *secureMessagingTestDualFlowConn {
+	return &secureMessagingTestDualFlowConn{
+		Conn:   client,
+		server: server,
+		reader: bufio.NewReader(server),
+	}
+}
+
+func (c *secureMessagingTestDualFlowConn) ReadSIPMessage() ([]byte, error) {
+	return readSecureMessagingTestFrame(c.reader)
+}
+
+func (c *secureMessagingTestDualFlowConn) WriteServerFlow(payload []byte) (int, error) {
+	return c.server.Write(payload)
+}
+
+func (c *secureMessagingTestDualFlowConn) Close() error {
+	c.closeOnce.Do(func() {
+		_ = c.Conn.Close()
+		_ = c.server.Close()
+	})
+	return nil
+}
+
+func newSecureMessagingTestStreamConn(conn net.Conn) *secureMessagingTestStreamConn {
+	return &secureMessagingTestStreamConn{Conn: conn, reader: bufio.NewReader(conn)}
+}
+
+func (c *secureMessagingTestStreamConn) ReadSIPMessage() ([]byte, error) {
+	return readSecureMessagingTestFrame(c.reader)
+}
+
+func (c *secureMessagingTestStreamConn) WriteServerFlow(payload []byte) (int, error) {
+	return c.Conn.Write(payload)
+}
+
+func readSecureMessagingTestFrame(reader *bufio.Reader) ([]byte, error) {
+	var raw bytes.Buffer
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, err
 		}
 		raw.WriteString(line)
+		if raw.Len() > 64*1024 {
+			return nil, fmt.Errorf("SIP test frame header exceeds limit")
+		}
 		if strings.HasSuffix(raw.String(), "\r\n\r\n") {
 			break
 		}
@@ -301,15 +526,7 @@ func readSecureMessagingTestRequest(reader *bufio.Reader) (*sip.Request, error) 
 		}
 		raw.Write(body)
 	}
-	message, err := sip.NewParser().ParseSIP([]byte(raw.String()))
-	if err != nil {
-		return nil, err
-	}
-	request, ok := message.(*sip.Request)
-	if !ok {
-		return nil, fmt.Errorf("parsed %T, want request", message)
-	}
-	return request, nil
+	return raw.Bytes(), nil
 }
 
 func secureMessagingTestPolicy(t *testing.T) ipsec3gpp.Policy {

@@ -2,6 +2,7 @@ package vowifihost
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,7 +25,6 @@ func TestLifecycleControllerEnableKeepsRunContextAliveAfterSubmitReturns(t *test
 	if enableCtx == nil {
 		t.Fatal("enable context was not captured")
 	}
-
 	select {
 	case <-enableCtx.Done():
 		t.Fatalf("enable context was canceled after successful Submit: %v", enableCtx.Err())
@@ -32,17 +32,21 @@ func TestLifecycleControllerEnableKeepsRunContextAliveAfterSubmitReturns(t *test
 	}
 }
 
-func TestLifecycleControllerSwitchBeginPreemptsInFlightEnable(t *testing.T) {
+func TestLifecycleControllerSerializesCommandsPerDevice(t *testing.T) {
 	c := NewLifecycleController()
-
-	enableRelease := make(chan struct{})
-	started := make(chan LifecycleCommand, 2)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
 	done := make(chan error, 2)
+	var mu sync.Mutex
+	var order []LifecycleCommandKind
 
-	c.TestRun = func(ctx context.Context, cmd LifecycleCommand) error {
-		started <- cmd
+	c.TestRun = func(_ context.Context, cmd LifecycleCommand) error {
+		mu.Lock()
+		order = append(order, cmd.Kind)
+		mu.Unlock()
 		if cmd.Kind == LifecycleCommandEnable {
-			<-enableRelease
+			close(firstStarted)
+			<-releaseFirst
 		}
 		return nil
 	}
@@ -50,102 +54,62 @@ func TestLifecycleControllerSwitchBeginPreemptsInFlightEnable(t *testing.T) {
 	go func() {
 		done <- c.Submit(context.Background(), LifecycleCommand{DeviceID: "dev-1", Kind: LifecycleCommandEnable})
 	}()
-
-	var enableCmd LifecycleCommand
-	select {
-	case enableCmd = <-started:
-		if enableCmd.Kind != LifecycleCommandEnable {
-			t.Fatalf("first command = %s, want enable", enableCmd.Kind.String())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("enable command did not start")
-	}
-
-	go func() {
-		done <- c.Submit(context.Background(), LifecycleCommand{DeviceID: "dev-1", Kind: LifecycleCommandSwitchBegin})
-	}()
-
-	var switchCmd LifecycleCommand
-	select {
-	case switchCmd = <-started:
-		if switchCmd.Kind != LifecycleCommandSwitchBegin {
-			t.Fatalf("preempting command = %s, want switch_begin", switchCmd.Kind.String())
-		}
-	case <-time.After(150 * time.Millisecond):
-		t.Fatal("switch_begin did not preempt in-flight enable")
-	}
-
-	if switchCmd.Generation <= enableCmd.Generation {
-		t.Fatalf("switch_begin generation = %d, want > in-flight enable generation %d", switchCmd.Generation, enableCmd.Generation)
-	}
-
-	close(enableRelease)
-	for i := 0; i < 2; i++ {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("submit returned error: %v", err)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for submit to finish")
-		}
-	}
-}
-
-func TestLifecycleControllerRestartPreemptsInFlightEnable(t *testing.T) {
-	c := NewLifecycleController()
-
-	started := make(chan LifecycleCommand, 2)
-	done := make(chan error, 2)
-
-	c.TestRun = func(ctx context.Context, cmd LifecycleCommand) error {
-		started <- cmd
-		if cmd.Kind == LifecycleCommandEnable {
-			<-ctx.Done()
-		}
-		return nil
-	}
-
-	go func() {
-		done <- c.Submit(context.Background(), LifecycleCommand{DeviceID: "dev-1", Kind: LifecycleCommandEnable})
-	}()
-
-	var enableCmd LifecycleCommand
-	select {
-	case enableCmd = <-started:
-		if enableCmd.Kind != LifecycleCommandEnable {
-			t.Fatalf("first command = %s, want enable", enableCmd.Kind.String())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("enable command did not start")
-	}
-
+	<-firstStarted
 	go func() {
 		done <- c.Submit(context.Background(), LifecycleCommand{DeviceID: "dev-1", Kind: LifecycleCommandRestart})
 	}()
+	close(releaseFirst)
 
-	var restartCmd LifecycleCommand
-	select {
-	case restartCmd = <-started:
-		if restartCmd.Kind != LifecycleCommandRestart {
-			t.Fatalf("preempting command = %s, want restart", restartCmd.Kind.String())
-		}
-	case <-time.After(150 * time.Millisecond):
-		t.Fatal("restart did not preempt in-flight enable")
-	}
-
-	if restartCmd.Generation <= enableCmd.Generation {
-		t.Fatalf("restart generation = %d, want > in-flight enable generation %d", restartCmd.Generation, enableCmd.Generation)
-	}
-
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Fatalf("submit returned error: %v", err)
+				t.Fatalf("Submit() error = %v", err)
 			}
 		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for submit to finish")
+			t.Fatal("timed out waiting for serialized commands")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != LifecycleCommandEnable || order[1] != LifecycleCommandRestart {
+		t.Fatalf("command order = %v, want [enable restart]", order)
+	}
+}
+
+func TestLifecycleControllerAllowsDifferentDevicesToRunIndependently(t *testing.T) {
+	c := NewLifecycleController()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	done := make(chan error, 2)
+
+	c.TestRun = func(_ context.Context, cmd LifecycleCommand) error {
+		if cmd.DeviceID == "dev-a" {
+			close(firstStarted)
+			<-releaseFirst
+		} else {
+			close(secondStarted)
+		}
+		return nil
+	}
+	go func() {
+		done <- c.Submit(context.Background(), LifecycleCommand{DeviceID: "dev-a", Kind: LifecycleCommandEnable})
+	}()
+	<-firstStarted
+	go func() {
+		done <- c.Submit(context.Background(), LifecycleCommand{DeviceID: "dev-b", Kind: LifecycleCommandEnable})
+	}()
+
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second device did not run independently")
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("Submit() error = %v", err)
 		}
 	}
 }

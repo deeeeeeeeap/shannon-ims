@@ -49,7 +49,7 @@ func (p *Pool) handleTransportRecoveryExhausted(worker *Worker, generation uint6
 	}
 	logger.Warn("传输核心恢复已彻底失败，调度 worker 重建",
 		"device", worker.ID, "layer", layer, "reason", reason, "err", err)
-	p.clearDesiredVoWiFiRecoverState(worker.ID)
+	p.voWiFiHost().ForgetDesiredRecover(worker.ID)
 	return p.scheduleWorkerRecoveryWithTransportEvent(worker.ID, qmiTransportFailureRecoveryReason, &TransportRecoveryEvent{
 		DeviceID:         worker.ID,
 		WorkerGeneration: worker.generation,
