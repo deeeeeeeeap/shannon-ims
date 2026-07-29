@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/1239t/swu-go/pkg/logger"
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"go.uber.org/zap"
 )
 
@@ -116,7 +117,13 @@ func canonicalProtectedTCPClosure(value string) string {
 // It is called from a deferred block on every exit, so a stalled send reports the
 // same fields as a successful one. A nil runtime leaves the measurement untouched
 // rather than zeroing it, because a zero reads as "measured zero".
-func mergeProtectedTCPRuntimeStats(m *protectedTCPMeasurement, rt *protectedTCPRuntime) {
+type protectedTCPMeasurementSource interface {
+	Snapshot() ipsec3gpp.ProtectedLinkSnapshot
+	ClientFlowRetransmissions() int
+	SafeMSS() int
+}
+
+func mergeProtectedTCPRuntimeStats(m *protectedTCPMeasurement, rt protectedTCPMeasurementSource) {
 	if m == nil || rt == nil {
 		return
 	}

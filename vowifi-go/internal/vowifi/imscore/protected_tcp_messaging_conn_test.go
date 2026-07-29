@@ -11,13 +11,15 @@ import (
 )
 
 type fakeProtectedMessagingRuntime struct {
+	client   net.Conn
 	acceptCh chan net.Conn
 	closed   chan struct{}
 	once     sync.Once
 }
 
-func newFakeProtectedMessagingRuntime() *fakeProtectedMessagingRuntime {
+func newFakeProtectedMessagingRuntime(client net.Conn) *fakeProtectedMessagingRuntime {
 	return &fakeProtectedMessagingRuntime{
+		client:   client,
 		acceptCh: make(chan net.Conn, 1),
 		closed:   make(chan struct{}),
 	}
@@ -41,15 +43,39 @@ func (r *fakeProtectedMessagingRuntime) AcceptServerFlow() (net.Conn, error) {
 	}
 }
 
-func (r *fakeProtectedMessagingRuntime) Close() {
-	r.once.Do(func() { close(r.closed) })
+func (r *fakeProtectedMessagingRuntime) Close() error {
+	r.once.Do(func() {
+		close(r.closed)
+		if r.client != nil {
+			_ = r.client.Close()
+		}
+	})
+	return nil
+}
+
+func (r *fakeProtectedMessagingRuntime) Read(p []byte) (int, error) {
+	return r.client.Read(p)
+}
+func (r *fakeProtectedMessagingRuntime) Write(p []byte) (int, error) {
+	return r.client.Write(p)
+}
+func (r *fakeProtectedMessagingRuntime) LocalAddr() net.Addr  { return r.client.LocalAddr() }
+func (r *fakeProtectedMessagingRuntime) RemoteAddr() net.Addr { return r.client.RemoteAddr() }
+func (r *fakeProtectedMessagingRuntime) SetDeadline(deadline time.Time) error {
+	return r.client.SetDeadline(deadline)
+}
+func (r *fakeProtectedMessagingRuntime) SetReadDeadline(deadline time.Time) error {
+	return r.client.SetReadDeadline(deadline)
+}
+func (r *fakeProtectedMessagingRuntime) SetWriteDeadline(deadline time.Time) error {
+	return r.client.SetWriteDeadline(deadline)
 }
 
 func TestProtectedTCPMessagingConnRepliesOnOriginatingServerFlow(t *testing.T) {
-	runtime := newFakeProtectedMessagingRuntime()
 	client, clientPeer := net.Pipe()
+	runtime := newFakeProtectedMessagingRuntime(client)
 	defer clientPeer.Close()
-	messagingConn, err := newProtectedTCPMessagingConn(runtime, client)
+	messagingConn, err := newProtectedTCPMessagingConn(runtime)
 	if err != nil {
 		t.Fatalf("newProtectedTCPMessagingConn: %v", err)
 	}

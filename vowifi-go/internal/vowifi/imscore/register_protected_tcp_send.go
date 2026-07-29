@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
 	"github.com/emiago/sipgo/sip"
 )
@@ -80,38 +81,45 @@ func runProtectedTCPAuthenticatedRegister(
 	// From here the outcome belongs to this function.
 	handled = true
 
-	// 4. The provisional runtime. It returns already listening, so a runtime whose
-	// terminating path is missing is not observable.
-	runtime, err := startProtectedTCPRuntime(ctx, cfg, swuTCP, *state)
-	if err != nil {
+	channel := state.channel
+	if channel == nil {
+		return nil, handled, newProtectedPhaseError(protectedPhaseStageRuntime,
+			errors.New("imscore: protected channel lease is unavailable"))
+	}
+	keepChannel := false
+	defer func() {
+		if !keepChannel {
+			_ = channel.Close()
+		}
+	}()
+
+	// 4. The provisional channel. OpenTCP returns only after the terminating
+	// listener is installed, and the lease remains the sole owner on every exit.
+	if err := openProtectedTCPChannel(ctx, cfg, swuTCP, channel); err != nil {
 		return nil, handled, newProtectedPhaseError(protectedPhaseStageRuntime, err)
 	}
-	// Until ownership is transferred on success, every exit closes and joins it.
-	defer runtime.CloseUnlessTransferred()
 
 	// 5. The activation gate, against the REAL runtime state rather than a
 	// compile-time constant, and against this state's generation and policy.
-	if gateErr := authorizeProtectedTCPActivation(plan, runtime.Activation()); gateErr != nil {
+	activation := protectedTCPActivation{
+		ServerFlowReady: channel.ServerFlowReady(),
+		Generation:      channel.Generation(),
+	}
+	if gateErr := authorizeProtectedTCPActivation(plan, activation); gateErr != nil {
 		return nil, handled, newProtectedPhaseError(protectedPhaseStageActivation, gateErr)
 	}
-	if gateErr := verifyProtectedActivationMatchesRuntime(runtime, runtime.Activation()); gateErr != nil {
+	if gateErr := verifyProtectedActivationMatchesChannel(channel, activation); gateErr != nil {
 		return nil, handled, newProtectedPhaseError(protectedPhaseStageActivation, gateErr)
 	}
-	if gateErr := verifyProtectedRuntimeMatchesState(runtime, *state); gateErr != nil {
+	if gateErr := verifyProtectedChannelMatchesState(channel, *state); gateErr != nil {
 		return nil, handled, newProtectedPhaseError(protectedPhaseStageActivation, gateErr)
 	}
 
 	// 6. The client flow. Bound to the rotating port_uc, connecting to the winning
 	// candidate's port_ps, advertising the derived safe MSS in its SYN.
-	conn, err := runtime.DialClientFlow(ctx)
-	if err != nil {
+	if err := channel.DialTCPClient(ctx); err != nil {
 		return nil, handled, newProtectedPhaseError(protectedPhaseStageHandshake, err)
 	}
-	defer func() {
-		if err != nil {
-			_ = conn.Close()
-		}
-	}()
 
 	// 7. The single final request, built from the untouched base for this exact
 	// transport. Via carries the TCP token and no rport; Contact keeps port_us;
@@ -138,18 +146,18 @@ func runProtectedTCPAuthenticatedRegister(
 	var transport *streamRegisterTransport
 	measurement := protectedTCPMeasurement{
 		SerializedMessageLen: len(serialized),
-		EffectiveMSS:         runtime.SafeMSS(),
+		EffectiveMSS:         channel.SafeMSS(),
 		Closure:              protectedTCPClosureUnknown,
 	}
 	defer func() {
 		mergeProtectedTCPTransportMeasurement(&measurement, transport)
-		mergeProtectedTCPRuntimeStats(&measurement, runtime)
+		mergeProtectedTCPRuntimeStats(&measurement, channel)
 		logProtectedTCPMeasurement(measurement)
 	}()
 
 	// 8. Send once, and read the response from the SAME connection. A stream
 	// framer per connection turns the byte stream back into one SIP message.
-	transport, err = newStreamRegisterTransport(conn)
+	transport, err = newStreamRegisterTransport(channel)
 	if err != nil {
 		measurement.Closure = protectedTCPClosureWriteFailed
 		err = newProtectedPhaseError(protectedPhaseStageSend, err)
@@ -182,39 +190,49 @@ func runProtectedTCPAuthenticatedRegister(
 		return nil, handled, err
 	}
 
-	// 9. Success. Ownership of the runtime moves to the result exactly once, so
-	// the deferred CloseUnlessTransferred above becomes a no-op.
+	// 9. Success. The framer must finish on a message boundary; the result carries
+	// only the same opaque lease, never the client flow or stack pointers.
+	if !transport.AtMessageBoundary() {
+		err = newProtectedPhaseError(protectedPhaseStageResponse,
+			errors.New("imscore: protected TCP response did not end at a message boundary"))
+		return nil, handled, err
+	}
 	result, err = finalizeRegisterSuccess(cfg, *state, finalRes)
 	if err != nil {
 		return nil, handled, err
 	}
-	if err = transferProtectedTCPMessagingOwnership(result, runtime, transport); err != nil {
+	if result.channel != channel {
+		err = newProtectedPhaseError(protectedPhaseStageResponse,
+			errors.New("imscore: protected TCP result lost its channel lease"))
 		return nil, handled, err
 	}
-	// A TCP result must carry no legacy secure channel: service_lifecycle keys the
-	// legacy transport runtime off secureConn, and two runtimes would mean two
-	// readers of one ESP carrier.
-	result.secureConn = nil
+	keepChannel = true
 	return result, handled, nil
 }
 
-func transferProtectedTCPMessagingOwnership(result *registerResult, runtime *protectedTCPRuntime, transport *streamRegisterTransport) error {
-	if result == nil || runtime == nil || transport == nil {
-		return errors.New("imscore: protected TCP messaging ownership is unavailable")
+func openProtectedTCPChannel(
+	ctx context.Context,
+	cfg Config,
+	swuTCP voiceclient.SWUTCPDialer,
+	channel *ipsec3gpp.ProtectedChannelLease,
+) error {
+	if swuTCP == nil || channel == nil {
+		return errors.New("imscore: protected TCP requires a channel and SWu raw IP dataplane")
 	}
-	if result.protectedTCP != nil || result.protectedClientConn != nil {
-		return errors.New("imscore: protected TCP messaging ownership was already assigned")
+	rawDialer, ok := swuTCP.(voiceclient.SWURawIPDialer)
+	if !ok {
+		return errors.New("imscore: SWu dialer does not expose raw IP")
 	}
-	clientConn := transport.ReleaseConn()
-	if clientConn == nil {
-		return errors.New("imscore: protected TCP client flow was not transferable at a message boundary")
+	remoteIP := channel.RemoteIP()
+	if remoteIP == nil {
+		return errors.New("imscore: protected TCP has no P-CSCF address")
 	}
-	transferred, ok := runtime.TakeOwnership()
-	if !ok || transferred == nil {
-		_ = clientConn.Close()
-		return errors.New("imscore: protected TCP runtime ownership was already taken")
+	carrier, err := rawDialer.DialContextIP(ctx, cfg.LocalIP, remoteIP, 50)
+	if err != nil {
+		return err
 	}
-	result.protectedTCP = transferred
-	result.protectedClientConn = clientConn
+	if err := channel.OpenTCP(carrier, registerProtectedInnerMTU); err != nil {
+		return err
+	}
 	return nil
 }

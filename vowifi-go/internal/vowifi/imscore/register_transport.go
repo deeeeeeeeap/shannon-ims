@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 	"github.com/emiago/sipgo/sip"
 )
@@ -18,6 +19,8 @@ type registerAttemptCandidate struct {
 	Transport string
 	Gateway   string
 }
+
+var errProtectedPortsExhausted = errors.New("imscore: protected channel client ports are exhausted")
 
 type registerTransportAttemptResult struct {
 	result      *registerResult
@@ -42,24 +45,27 @@ func (s *Service) registerRawWithCandidate(ctx context.Context, candidate regist
 		attemptCfg.TransportPCSCFAddr = attemptCfg.PCSCFAddr
 	}
 
-	// The protected ports and the SA generation come from the Service, never from
-	// the session: this function runs once per candidate and once per transport
-	// mode, so a session-minted value would repeat inside one registration.
-	// TS 33.203 clause 7.4 requires port_uc to change per authenticated
-	// re-registration while port_us stays fixed; only a Service-scoped allocator
-	// can honour both.
-	allocation, err := s.allocateProtectedPorts()
+	// Admission, ports, SPIs, SA generation, and provisional cleanup all come from
+	// the Service's one ProtectedChannel owner. A stopped owner rejects before any
+	// network dial, and every failed candidate returns the reservation here.
+	if s.protectedChannels == nil {
+		return registerTransportAttemptResult{err: errors.New("imscore: protected channel owner is unavailable")}
+	}
+	channel, err := s.protectedChannels.Reserve()
 	if err != nil {
+		if ipsec3gpp.IsProtectedChannelPortsExhausted(err) {
+			err = errProtectedPortsExhausted
+		}
 		return registerTransportAttemptResult{err: err}
 	}
 	releasePending := true
 	defer func() {
-		if releasePending && s.protectedPorts != nil {
-			s.protectedPorts.release(allocation.generation)
+		if releasePending {
+			_ = channel.Close()
 		}
 	}()
-	session := newRegisterSessionWithPorts(
-		attemptCfg, s.swu, s.network, transportMode, attemptIndex, allocation)
+	session := newRegisterSessionWithChannel(
+		attemptCfg, s.swu, s.network, transportMode, attemptIndex, channel)
 	attemptCtx, cancel := context.WithTimeout(ctx, registerCandidateTimeout)
 	defer cancel()
 
@@ -80,12 +86,11 @@ func (s *Service) registerRawWithCandidate(ctx context.Context, candidate regist
 			reachedAuth: registerErrorReachedAuthPhase(err),
 		}
 	}
-	if res != nil && res.protectedTCP != nil {
-		res.protectedTCP.BindPortRelease(s.protectedPorts, allocation.generation)
+	if res != nil && res.channel == channel {
 		releasePending = false
-	} else if res != nil && res.secureConn != nil {
-		res.portRelease = func() { s.protectedPorts.release(allocation.generation) }
-		releasePending = false
+	} else if res != nil && res.channel != nil {
+		_ = res.channel.Close()
+		return registerTransportAttemptResult{err: errors.New("imscore: REGISTER returned a foreign protected channel")}
 	}
 	return registerTransportAttemptResult{result: res}
 }

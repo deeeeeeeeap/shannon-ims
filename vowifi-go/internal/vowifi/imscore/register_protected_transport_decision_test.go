@@ -227,7 +227,7 @@ func TestProtectedTransportDecisionIsSizeOnly(t *testing.T) {
 // here so any attempt to run AKA would panic or error rather than pass quietly.
 func TestProtectedTransportPreviewDoesNotAdvanceCSeqOrRecomputeAKA(t *testing.T) {
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	challenge := syntheticChallengeResponse(t)
 	// The protected ports only exist once the SA is installed, which is exactly
 	// the ordering production uses: 401 -> install -> decide -> build.
@@ -333,7 +333,7 @@ func TestProtectedTransportPreviewDoesNotAdvanceCSeqOrRecomputeAKA(t *testing.T)
 // the final request would inherit UDP artefacts on a TCP send.
 func TestProtectedRegisterBaseRequestIsTransportNeutral(t *testing.T) {
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	challenge := syntheticChallengeResponse(t)
 	if err := installIPSecFromChallenge(cfg, state, challenge); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)

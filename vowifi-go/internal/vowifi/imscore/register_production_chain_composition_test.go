@@ -8,6 +8,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 )
 
@@ -77,12 +78,21 @@ func syntheticProtectedRegisterConfig() Config {
 	}
 }
 
-func syntheticProtectedRegisterState(cfg Config) *registerState {
+func syntheticProtectedRegisterState(t *testing.T, cfg Config) *registerState {
+	t.Helper()
+	owner := ipsec3gpp.NewProtectedChannelOwner()
+	t.Cleanup(func() { _ = owner.Close() })
+	channel, err := owner.Reserve()
+	if err != nil {
+		t.Fatalf("reserve synthetic protected channel: %v", err)
+	}
 	return &registerState{
-		spiC:          2001,
-		spiS:          2002,
-		portC:         5062,
-		portS:         5063,
+		spiC:          channel.ClientSPI(),
+		spiS:          channel.ServerSPI(),
+		portC:         channel.ClientPort(),
+		portS:         channel.ServerPort(),
+		generation:    channel.Generation(),
+		channel:       channel,
 		transportMode: "udp",
 		fromTag:       "0000000000000000",
 		sipInstance:   cfg.SIPInstanceURN,
@@ -145,7 +155,13 @@ func countIPSec3GPPMechanisms(headerValue string) int {
 func buildProductionChainProtectedRegister(t *testing.T) (*sip.Request, *sip.Request, int) {
 	t.Helper()
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
+	// This is a wire-composition fixture, not a transport fixture. Pin the same
+	// synthetic four-digit Security-Client SPIs used by the historical baseline
+	// so a random decimal width cannot make the size assertion flaky. The opaque
+	// channel keeps its own authoritative SPI pair and no flow is opened here.
+	state.spiC = 2001
+	state.spiS = 2002
 
 	// A registerSession is what owns decorateRegisterRequest in production.
 	session := &registerSession{

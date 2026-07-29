@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 	"github.com/1239t/vowifi-go/runtimehost/messaging"
 	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
@@ -26,19 +27,9 @@ type Service struct {
 	localAddr       string
 	started         bool
 
-	network              IMSNetwork
-	transportRuntime     *transportRuntime
-	protectedRuntimes    *protectedRuntimeHolder
-	protectedPortRelease func()
-	swu                  voiceclient.SWUTCPDialer
-
-	// protectedPorts owns port_us, the rotating port_uc and the SA generation.
-	//
-	// It lives here rather than on registerSession because a session is created
-	// per attempt and per candidate: a session-scoped counter would restart
-	// several times inside one registration, and the generation's only job is to
-	// tell a current SA from a retired one. See protectedPortAllocator.
-	protectedPorts *protectedPortAllocator
+	network           IMSNetwork
+	protectedChannels *ipsec3gpp.ProtectedChannelOwner
+	swu               voiceclient.SWUTCPDialer
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -154,21 +145,13 @@ func (s *Service) Close(ctx context.Context) error {
 		s.lifecycleCancel()
 		s.lifecycleCancel = nil
 	}
-	if s.transportRuntime != nil {
-		s.transportRuntime.Close()
-		s.transportRuntime = nil
-	}
 	var innerErr error
 	if s.inner != nil {
 		innerErr = s.inner.Close(ctx)
 		s.inner = nil
 	}
-	if s.protectedRuntimes != nil {
-		s.protectedRuntimes.closeCurrent()
-	}
-	if s.protectedPortRelease != nil {
-		s.protectedPortRelease()
-		s.protectedPortRelease = nil
+	if s.protectedChannels != nil {
+		_ = s.protectedChannels.Close()
 	}
 	if us, ok := s.network.(*UserspaceIMSNetwork); ok {
 		_ = us.Close()

@@ -1,12 +1,7 @@
 package imscore
 
 import (
-	"context"
 	"fmt"
-	"net"
-
-	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
-	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
 )
 
 // Phase C2: dispatch the protected REGISTER onto the transport that was decided
@@ -37,7 +32,7 @@ import (
 // listener would register successfully and then silently miss every terminating
 // INVITE, MESSAGE and NOTIFY.
 //
-// The listener now exists (startProtectedTCPRuntime returns already listening),
+// The listener now exists (ProtectedChannelLease.OpenTCP returns already listening),
 // so what the gate still guards is the one thing offline tests cannot answer:
 // whether the P-CSCF actually accepts a protected REGISTER over TCP.
 //
@@ -56,41 +51,6 @@ import (
 // fragmenting request on the wire, which is the failure this path exists to
 // remove.
 var protectedTCPClientProductionEnabled = true
-
-// protectedRegisterChannel is one protected SIP channel plus everything that has
-// to be torn down with it.
-//
-// secure is populated for UDP only. The rest of the service still reaches for
-// it (PacketMode, messaging attach), so the UDP path keeps returning exactly
-// what it returned before.
-type protectedRegisterChannel struct {
-	conn      net.Conn
-	secure    *ipsec3gpp.SecureChannelConn
-	tcpStack  *ipsec3gpp.ProtectedTCPStack
-	transport string
-}
-
-// Close releases the channel. For TCP the stack owns the link endpoint and the
-// ESP carrier, so closing it joins the inbound pump; nothing is left detached.
-func (c *protectedRegisterChannel) Close() error {
-	if c == nil {
-		return nil
-	}
-	var firstErr error
-	if c.conn != nil {
-		if err := c.conn.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if c.tcpStack != nil {
-		if err := c.tcpStack.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	// The UDP secure channel is intentionally NOT closed here: on success it is
-	// handed to the caller as state.secureConn and outlives the REGISTER.
-	return firstErr
-}
 
 // protectedTCPActivation carries the runtime facts the activation gate needs.
 //
@@ -208,101 +168,4 @@ func applyProtectedTransportProductionGate(plan protectedRegisterPlan, activatio
 		return protectedRegisterPlan{}, err
 	}
 	return plan, nil
-}
-
-// dialProtectedRegisterConn is the name the register flow calls. It returns the
-// channel's net.Conn plus the channel itself so the caller can tear down the
-// whole protected stack, not just the connection.
-func dialProtectedRegisterConn(
-	ctx context.Context,
-	cfg Config,
-	swuTCP voiceclient.SWUTCPDialer,
-	state registerState,
-	transport string,
-) (*protectedRegisterChannel, error) {
-	return dialProtectedRegisterChannel(ctx, cfg, swuTCP, state, transport)
-}
-
-// dialProtectedRegisterChannel opens the protected channel for the transport the
-// plan selected.
-func dialProtectedRegisterChannel(
-	ctx context.Context,
-	cfg Config,
-	swuTCP voiceclient.SWUTCPDialer,
-	state registerState,
-	transport string,
-) (*protectedRegisterChannel, error) {
-	resolved, err := resolveProtectedTransport(transport)
-	if err != nil {
-		return nil, err
-	}
-	switch resolved {
-	case protectedTransportUDP:
-		// The legacy path, unchanged. dialSecureRegisterConn still enforces its
-		// own UDP assertion, so this branch cannot be reached with a TCP state.
-		secure, err := dialSecureRegisterConn(ctx, cfg, swuTCP, state)
-		if err != nil {
-			return nil, err
-		}
-		return &protectedRegisterChannel{
-			conn:      secure,
-			secure:    secure,
-			transport: protectedTransportUDP,
-		}, nil
-	case protectedTransportTCP:
-		return dialProtectedTCPRegisterChannel(ctx, cfg, swuTCP, state)
-	default:
-		// Unreachable: resolveProtectedTransport already failed closed.
-		return nil, fmt.Errorf("imscore: unsupported protected transport %q", transport)
-	}
-}
-
-// dialProtectedTCPRegisterChannel builds the real protected TCP client flow.
-//
-// Every egress leaves through ipsec3gpp's protected link endpoint, which has no
-// dataplane writer of its own, so no cleartext TCP segment can reach the SWu
-// tunnel even if this function is wrong.
-func dialProtectedTCPRegisterChannel(
-	ctx context.Context,
-	cfg Config,
-	swuTCP voiceclient.SWUTCPDialer,
-	state registerState,
-) (*protectedRegisterChannel, error) {
-	if swuTCP == nil {
-		return nil, fmt.Errorf("imscore: protected TCP requires SWu raw IP dataplane")
-	}
-	rawDialer, ok := swuTCP.(voiceclient.SWURawIPDialer)
-	if !ok {
-		return nil, fmt.Errorf("imscore: SWu dialer does not expose raw IP")
-	}
-	if state.transport == nil {
-		return nil, fmt.Errorf("imscore: protected TCP requires an installed ESP transform")
-	}
-	remoteIP := net.IP(state.ipsecPolicy.RemoteIP)
-	if remoteIP == nil {
-		return nil, fmt.Errorf("imscore: protected TCP has no P-CSCF address")
-	}
-
-	// The ESP carrier is the same raw IP connection the UDP path uses: protocol
-	// 50 to the winning candidate, taken from the per-attempt policy.
-	carrier, err := rawDialer.DialContextIP(ctx, cfg.LocalIP, remoteIP, 50)
-	if err != nil {
-		return nil, err
-	}
-	stack, err := ipsec3gpp.NewProtectedTCPStack(
-		carrier, state.transport, state.ipsecPolicy, registerProtectedInnerMTU)
-	if err != nil {
-		_ = carrier.Close()
-		return nil, err
-	}
-	conn, err := stack.DialClientFlow(ctx)
-	if err != nil {
-		_ = stack.Close()
-		return nil, err
-	}
-	return &protectedRegisterChannel{
-		conn:      conn,
-		tcpStack:  stack,
-		transport: protectedTransportTCP,
-	}, nil
 }

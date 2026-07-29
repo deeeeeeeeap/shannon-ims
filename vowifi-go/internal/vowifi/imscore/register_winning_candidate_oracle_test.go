@@ -89,14 +89,15 @@ func TestProtectedRegisterUsesWinningPCSCFCandidate(t *testing.T) {
 	}
 
 	// The winning candidate's 401 drives IPsec installation.
-	state := syntheticProtectedRegisterState(winning)
+	state := syntheticProtectedRegisterState(t, winning)
 	challenge := syntheticChallengeFromCandidate(t)
 	if err := installIPSecFromChallenge(winning, state, challenge); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
 	}
 
 	// 1. The ESP policy remote IP must be the winning candidate.
-	policyRemote := net.IP(state.ipsecPolicy.RemoteIP)
+	policy := protectedChannelPolicyForTest(t, winning, state)
+	policyRemote := state.channel.RemoteIP()
 	if !policyRemote.Equal(winningIP) {
 		t.Fatalf("IPsec policy remote is not the winning candidate")
 	}
@@ -107,29 +108,29 @@ func TestProtectedRegisterUsesWinningPCSCFCandidate(t *testing.T) {
 	// 2. SPI and port roles must come from the winning candidate's
 	// Security-Server. Per TS 33.203, the UE's outbound client flow uses the
 	// P-CSCF's spi-s, and its outbound server flow uses the P-CSCF's spi-c.
-	if got := state.ipsecPolicy.FlowC.OutboundSPI; got != 7002 {
+	if got := policy.FlowC.OutboundSPI; got != 7002 {
 		t.Fatalf("FlowC outbound SPI = %d, want the offered spi-s 7002", got)
 	}
-	if got := state.ipsecPolicy.FlowS.OutboundSPI; got != 7001 {
+	if got := policy.FlowS.OutboundSPI; got != 7001 {
 		t.Fatalf("FlowS outbound SPI = %d, want the offered spi-c 7001", got)
 	}
 	// Inbound SPIs stay the UE's own Security-Client values.
-	if got := state.ipsecPolicy.FlowC.InboundSPI; got != state.spiC {
+	if got := policy.FlowC.InboundSPI; got != state.spiC {
 		t.Fatalf("FlowC inbound SPI = %d, want the UE spi-c", got)
 	}
-	if got := state.ipsecPolicy.FlowS.InboundSPI; got != state.spiS {
+	if got := policy.FlowS.InboundSPI; got != state.spiS {
 		t.Fatalf("FlowS inbound SPI = %d, want the UE spi-s", got)
 	}
 	// Remote protected ports must be the offered ones.
-	if got := state.ipsecPolicy.RemotePortC; got != 7061 {
+	if got := policy.RemotePortC; got != 7061 {
 		t.Fatalf("remote port-c = %d, want the offered 7061", got)
 	}
-	if got := state.ipsecPolicy.RemotePortS; got != 7062 {
+	if got := policy.RemotePortS; got != 7062 {
 		t.Fatalf("remote port-s = %d, want the offered 7062", got)
 	}
 
 	// 3. The raw-IP destination of the protected request must be the winning
-	// candidate. dialSecureRegisterConn dials net.IP(state.ipsecPolicy.RemoteIP),
+	// candidate. dialSecureRegisterConn dials state.channel.RemoteIP(),
 	// and prepareProtectedRegisterRequest sets the SIP destination from the same
 	// field, so both follow from the policy remote above; assert the request
 	// destination explicitly because that is what actually goes on the wire.
@@ -169,7 +170,7 @@ func TestLosingCandidateNeverLeaksIntoProtectedBinding(t *testing.T) {
 		Registrar: net.JoinHostPort(base.LocalIP.String(), "5060"),
 		Gateway:   net.JoinHostPort(losingCandidateHost, "5060"),
 	})
-	losingState := syntheticProtectedRegisterState(losing)
+	losingState := syntheticProtectedRegisterState(t, losing)
 	if err := installIPSecFromChallenge(losing, losingState, syntheticChallengeResponse(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge(losing): %v", err)
 	}
@@ -180,21 +181,23 @@ func TestLosingCandidateNeverLeaksIntoProtectedBinding(t *testing.T) {
 		Registrar: net.JoinHostPort(base.LocalIP.String(), "5060"),
 		Gateway:   net.JoinHostPort(winningCandidateHost, "5060"),
 	})
-	winningState := syntheticProtectedRegisterState(winning)
+	winningState := syntheticProtectedRegisterState(t, winning)
 	if err := installIPSecFromChallenge(winning, winningState, syntheticChallengeFromCandidate(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge(winning): %v", err)
 	}
 
 	losingIP := effectiveIPSecRemoteIP(losing)
-	if net.IP(winningState.ipsecPolicy.RemoteIP).Equal(losingIP) {
+	if winningState.channel.RemoteIP().Equal(losingIP) {
 		t.Fatal("the second attempt's IPsec policy is bound to the first candidate")
 	}
 	// The first attempt's own policy must be unchanged; state is per-attempt.
-	if !net.IP(losingState.ipsecPolicy.RemoteIP).Equal(losingIP) {
+	if !losingState.channel.RemoteIP().Equal(losingIP) {
 		t.Fatal("the first attempt's policy was mutated by the second attempt")
 	}
 	// And the two attempts must not share SPI role assignments.
-	if losingState.ipsecPolicy.FlowC.OutboundSPI == winningState.ipsecPolicy.FlowC.OutboundSPI {
+	losingPolicy := protectedChannelPolicyForTest(t, losing, losingState)
+	winningPolicy := protectedChannelPolicyForTest(t, winning, winningState)
+	if losingPolicy.FlowC.OutboundSPI == winningPolicy.FlowC.OutboundSPI {
 		t.Fatal("both attempts derived the same outbound SPI; offers were not applied per candidate")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 )
 
@@ -76,7 +77,7 @@ func SetupService(imsCfg IMSConfig, network IMSNetwork, in StartSessionInput) (*
 		imsCfg:            imsCfg,
 		cfg:               internal,
 		network:           network,
-		protectedRuntimes: newProtectedRuntimeHolder(),
+		protectedChannels: ipsec3gpp.NewProtectedChannelOwner(),
 	}, nil
 }
 

@@ -12,40 +12,28 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-func TestServiceSendSMSUsesTransferredProtectedTCPClientFlow(t *testing.T) {
-	cfg, state, _, allocator := runtimeTestStateWithAllocator(t)
+func TestServiceSendSMSUsesAdoptedProtectedTCPChannel(t *testing.T) {
+	fixture := newProtectedChannelTCPFixture(t)
+	cfg := syntheticProtectedRegisterConfig()
+	cfg.LocalIP = net.ParseIP("2001:db8::10")
 	cfg.SMSC = "+15550102030"
-	dialer := &countingCarrierDialer{}
-	runtime, err := startProtectedTCPRuntime(context.Background(), cfg, dialer, *state)
-	if err != nil {
-		t.Fatalf("startProtectedTCPRuntime: %v", err)
-	}
-	runtime.BindPortRelease(allocator, state.generation)
-	owned, ok := runtime.TakeOwnership()
-	if !ok {
-		t.Fatal("runtime ownership unavailable")
-	}
-	client, peer := net.Pipe()
-	defer peer.Close()
 	result := &registerResult{
-		protectedTCP:        owned,
-		protectedClientConn: client,
-		ipsecPolicy:         state.ipsecPolicy,
-		transport:           state.transport,
-		verifyHeader:        "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc",
+		channel:      fixture.lease,
+		verifyHeader: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc",
 	}
-	service := &Service{cfg: cfg, protectedRuntimes: newProtectedRuntimeHolder()}
-	if err := service.adoptProtectedTCPResult(result); err != nil {
-		t.Fatalf("adoptProtectedTCPResult: %v", err)
+	service := &Service{cfg: cfg, protectedChannels: fixture.owner}
+	handle, err := service.adoptProtectedChannelResult(result)
+	if err != nil {
+		t.Fatalf("adopt protected channel: %v", err)
 	}
-	if err := service.attachMessaging(context.Background(), cfg.PCSCFAddr, result); err != nil {
+	if err := service.attachMessaging(context.Background(), cfg.PCSCFAddr, result, handle); err != nil {
 		t.Fatalf("attachMessaging: %v", err)
 	}
 	defer service.Close(context.Background())
 
 	serverDone := make(chan error, 1)
 	go func() {
-		request, err := readProtectedMessagingTestRequest(peer)
+		request, err := readProtectedMessagingTestRequest(fixture.peer)
 		if err != nil {
 			serverDone <- err
 			return
@@ -56,12 +44,12 @@ func TestServiceSendSMSUsesTransferredProtectedTCPClientFlow(t *testing.T) {
 			serverDone <- fmt.Errorf("MESSAGE did not use TCP Via")
 			return
 		}
-		if contact == nil || !strings.Contains(strings.ToLower(contact.Value()), fmt.Sprintf(":%d;transport=tcp", state.ipsecPolicy.FlowS.LocalPort)) {
+		if contact == nil || !strings.Contains(strings.ToLower(contact.Value()), fmt.Sprintf(":%d;transport=tcp", fixture.serverPort)) {
 			serverDone <- fmt.Errorf("MESSAGE Contact did not use protected server port")
 			return
 		}
 		response := sip.NewResponseFromRequest(request, 202, "Accepted", nil)
-		_, err = peer.Write([]byte(response.String()))
+		_, err = fixture.peer.Write([]byte(response.String()))
 		serverDone <- err
 	}()
 
@@ -76,9 +64,6 @@ func TestServiceSendSMSUsesTransferredProtectedTCPClientFlow(t *testing.T) {
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
-	}
-	if got := dialer.dials.Load(); got != 1 {
-		t.Fatalf("raw ESP carrier dials = %d, want 1", got)
 	}
 }
 

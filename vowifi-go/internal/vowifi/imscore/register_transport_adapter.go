@@ -125,9 +125,8 @@ type connRegisterTransport struct {
 	transport string
 	parser    *sip.ParserStream
 
-	mu       sync.Mutex
-	released bool
-	closed   bool
+	mu     sync.Mutex
+	closed bool
 }
 
 func newConnRegisterTransport(conn net.Conn, traceID, deviceID, transport string) *connRegisterTransport {
@@ -164,7 +163,7 @@ func (t *connRegisterTransport) SendPayload(ctx context.Context, payload []byte)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed || t.released {
+	if t.closed {
 		return fmt.Errorf("imscore: register transport closed")
 	}
 	if err := t.conn.SetWriteDeadline(time.Now().Add(registerTransportDeadline())); err != nil {
@@ -185,7 +184,7 @@ func (t *connRegisterTransport) ReadResponse(ctx context.Context) (*sip.Response
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed || t.released {
+	if t.closed {
 		return nil, fmt.Errorf("imscore: register transport closed")
 	}
 
@@ -262,23 +261,6 @@ func (t *connRegisterTransport) Close() error {
 		t.rawConn = nil
 	}
 	return err
-}
-
-func (t *connRegisterTransport) ReleaseConn() net.Conn {
-	if t == nil {
-		return nil
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.released = true
-	if t.parser != nil {
-		t.parser.Close()
-		t.parser = nil
-	}
-	conn := t.rawConn
-	t.conn = nil
-	t.rawConn = nil
-	return conn
 }
 
 func isTimeoutError(err error) bool {

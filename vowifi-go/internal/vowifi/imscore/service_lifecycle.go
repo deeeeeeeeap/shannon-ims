@@ -9,8 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/1239t/swu-go/pkg/logger"
-
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
 )
@@ -64,19 +63,16 @@ func (s *Service) Start(ctx context.Context) error {
 		})
 		return newSafeRegisterFailure(err)
 	}
-	if err := assertProtectedChannelExclusivity(reg); err != nil {
+	channel, err := s.adoptProtectedChannelResult(reg)
+	if err != nil {
 		return err
 	}
-	usesProtectedTCP := protectedResultUsesTCPRuntime(reg)
-	if usesProtectedTCP {
-		if err := s.adoptProtectedTCPResult(reg); err != nil {
-			return err
+	keepChannel := false
+	defer func() {
+		if !keepChannel {
+			_ = channel.Close()
 		}
-	}
-	if reg.portRelease != nil {
-		s.protectedPortRelease = reg.portRelease
-		reg.portRelease = nil
-	}
+	}()
 
 	winningPCSCF := strings.TrimSpace(reg.pcscfAddr)
 	if winningPCSCF == "" {
@@ -90,23 +86,14 @@ func (s *Service) Start(ctx context.Context) error {
 	s.expiresSeconds = reg.expiresSeconds
 	s.verifyHeader = reg.verifyHeader
 	s.sipSecurityMode = "ipsec3gpp"
-	s.ipsecInstalled = reg.secureConn != nil || usesProtectedTCP
+	s.ipsecInstalled = true
 	s.pcscf = winningPCSCF
 	s.localAddr = s.cfg.LocalIP.String()
 
-	if shouldStartLegacyTransportRuntime(reg) {
-		rt, err := startTransportRuntime(lifecycleCtx, s.cfg, swu, reg.ipsecPolicy, reg.transport, reg.secureConn)
-		if err != nil {
-			logger.Warn("IMS transport runtime start failed")
-		} else {
-			s.transportRuntime = rt
-			s.logTCPWriterLoop(lifecycleCtx, reg.secureConn)
-		}
-	}
-
-	if err := s.attachMessaging(lifecycleCtx, winningPCSCF, reg); err != nil {
+	if err := s.attachMessaging(lifecycleCtx, winningPCSCF, reg, channel); err != nil {
 		return err
 	}
+	keepChannel = true
 	s.started = true
 	return nil
 }
@@ -123,34 +110,18 @@ func (s *Service) resolveSWUDialer() (voiceclient.SWUTCPDialer, error) {
 	return newSWUNetstack(s.cfg.LocalIP, s.cfg.Dataplane)
 }
 
-func (s *Service) logTCPWriterLoop(ctx context.Context, conn net.Conn) {
-	if s == nil || s.transportRuntime == nil || conn == nil {
-		return
-	}
-	logger.Info("IMS TCP writer started")
-
-	go func() {
-		<-ctx.Done()
-		logger.Info("IMS TCP writer stopped")
-	}()
-}
-
 // attachMessaging hooks voiceclient for SMS/USSD after imscore registration.
-func (s *Service) attachMessaging(ctx context.Context, winningPCSCF string, reg *registerResult) error {
+func (s *Service) attachMessaging(ctx context.Context, winningPCSCF string, reg *registerResult, channel *ipsec3gpp.ProtectedChannelHandle) error {
 	messagingProfile, err := messagingRegisterProfileForBehavior(s.cfg.CarrierBehavior)
 	if err != nil {
 		return fmt.Errorf("voiceclient attach: %w", err)
 	}
-	if s != nil && s.protectedRuntimes != nil && s.protectedRuntimes.current() != nil {
-		if reg == nil || reg.protectedClientConn == nil {
-			return fmt.Errorf("voiceclient attach: protected TCP client flow unavailable")
-		}
-		runtime := s.protectedRuntimes.current()
-		clientConn := reg.protectedClientConn
-		reg.protectedClientConn = nil
-		streamConn, err := newProtectedTCPMessagingConn(runtime, clientConn)
+	if channel == nil {
+		return fmt.Errorf("voiceclient attach: protected channel unavailable")
+	}
+	if !channel.PacketMode() {
+		streamConn, err := newProtectedTCPMessagingConn(channel)
 		if err != nil {
-			_ = clientConn.Close()
 			return fmt.Errorf("voiceclient attach: %w", err)
 		}
 		protectedPCSCF := strings.TrimSpace(winningPCSCF)
@@ -161,8 +132,8 @@ func (s *Service) attachMessaging(ctx context.Context, winningPCSCF string, reg 
 			DeviceID:        s.cfg.DeviceID,
 			TraceID:         s.cfg.TraceID,
 			LocalIP:         s.cfg.LocalIP,
-			LocalPort:       reg.ipsecPolicy.FlowC.LocalPort,
-			ContactPort:     reg.ipsecPolicy.FlowS.LocalPort,
+			LocalPort:       channel.ClientPort(),
+			ContactPort:     channel.ServerPort(),
 			PCSCFAddr:       protectedPCSCF,
 			SecurityVerify:  reg.verifyHeader,
 			SMSC:            s.cfg.SMSC,
@@ -193,18 +164,18 @@ func (s *Service) attachMessaging(ctx context.Context, winningPCSCF string, reg 
 		s.inner = inner
 		return nil
 	}
-	if reg == nil || reg.secureConn == nil || !reg.secureConn.PacketMode() {
+	if reg == nil || !channel.PacketMode() {
 		return fmt.Errorf("voiceclient attach: secure ESP packet channel unavailable")
 	}
 	protectedPCSCF := winningPCSCF
-	if remoteIP := net.IP(reg.ipsecPolicy.RemoteIP); remoteIP != nil && reg.ipsecPolicy.FlowC.RemotePort > 0 {
-		protectedPCSCF = net.JoinHostPort(remoteIP.String(), strconv.Itoa(reg.ipsecPolicy.FlowC.RemotePort))
+	if remoteIP := channel.RemoteIP(); remoteIP != nil && channel.RemoteClientPort() > 0 {
+		protectedPCSCF = net.JoinHostPort(remoteIP.String(), strconv.Itoa(channel.RemoteClientPort()))
 	}
 	voiceCfg := voiceclient.Config{
 		DeviceID:        s.cfg.DeviceID,
 		TraceID:         s.cfg.TraceID,
 		LocalIP:         s.cfg.LocalIP,
-		LocalPort:       reg.ipsecPolicy.FlowC.LocalPort,
+		LocalPort:       channel.ClientPort(),
 		PCSCFAddr:       protectedPCSCF,
 		SecurityVerify:  reg.verifyHeader,
 		SMSC:            s.cfg.SMSC,
@@ -227,7 +198,7 @@ func (s *Service) attachMessaging(ctx context.Context, winningPCSCF string, reg 
 	if s.cfg.RegisterExpirySeconds > 0 {
 		voiceCfg.RegisterExpiry = time.Duration(s.cfg.RegisterExpirySeconds) * time.Second
 	}
-	inner, err := voiceclient.AttachSecureMessaging(ctx, voiceCfg, reg.secureConn)
+	inner, err := voiceclient.AttachSecureMessaging(ctx, voiceCfg, channel)
 	if err != nil {
 		return fmt.Errorf("voiceclient attach: %w", err)
 	}

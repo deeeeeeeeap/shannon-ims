@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/1239t/vowifi-go/engine/sim"
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 )
 
 type invalidIPSecKeysAKA struct{}
@@ -191,8 +192,7 @@ func TestProtectedPhaseFailureStopsCandidateAdvancement(t *testing.T) {
 // them. This drives the real function with a dataplane that cannot connect.
 func TestProtectedTCPPathReturnsTypedPhaseError(t *testing.T) {
 	withProtectedTCPEnabled(t)
-	cfg, state, _, alloc := runtimeTestStateWithAllocator(t)
-	defer alloc.release(state.generation)
+	cfg, state, _ := runtimeTestStateWithProtectedChannel(t)
 
 	challenge := syntheticChallengeResponse(t)
 	challenged := syntheticChallengedRequest(t, cfg, state)
@@ -221,13 +221,37 @@ func TestProtectedTCPPathReturnsTypedPhaseError(t *testing.T) {
 	if shouldRetryNextRegisterTransport(0, err, 0, 2, false) {
 		t.Fatal("the protected TCP failure would still trigger a transport retry")
 	}
+	if openErr := state.channel.OpenUDP(newRuntimeCarrier()); openErr == nil {
+		t.Fatal("the failed TCP attempt left its provisional channel reusable")
+	}
 	t.Logf("MEASURED typed_failure=true retry=false handled=true")
+}
+
+func runtimeTestStateWithProtectedChannel(t *testing.T) (Config, *registerState, *ipsec3gpp.ProtectedChannelOwner) {
+	t.Helper()
+	cfg := syntheticProtectedRegisterConfig()
+	owner := ipsec3gpp.NewProtectedChannelOwner()
+	t.Cleanup(func() { _ = owner.Close() })
+	channel, err := owner.Reserve()
+	if err != nil {
+		t.Fatalf("reserve protected channel: %v", err)
+	}
+	state := syntheticProtectedRegisterState(t, cfg)
+	state.spiC = channel.ClientSPI()
+	state.spiS = channel.ServerSPI()
+	state.portC = channel.ClientPort()
+	state.portS = channel.ServerPort()
+	state.generation = channel.Generation()
+	state.channel = channel
+	if err := installIPSecFromChallenge(cfg, state, syntheticChallengeResponse(t)); err != nil {
+		t.Fatalf("installIPSecFromChallenge: %v", err)
+	}
+	return cfg, state, owner
 }
 
 func TestProtectedTCPPreparationFailureDoesNotFallBackToLegacyUDP(t *testing.T) {
 	withProtectedTCPEnabled(t)
-	cfg, state, _, allocator := runtimeTestStateWithAllocator(t)
-	defer allocator.release(state.generation)
+	cfg, state, _ := runtimeTestStateWithProtectedChannel(t)
 	cfg.ProtectedTransport = "auto"
 	dialer := &countingCarrierDialer{}
 

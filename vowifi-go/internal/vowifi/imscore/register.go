@@ -53,9 +53,7 @@ type registerState struct {
 
 	sipInstance   string
 	selectedOffer *imsheaders.SecurityOffer
-	ipsecPolicy   ipsec3gpp.Policy
-	transport     *ipsec3gpp.Transport
-	secureConn    *ipsec3gpp.SecureChannelConn
+	channel       *ipsec3gpp.ProtectedChannelLease
 
 	expiresSeconds int
 	verifyHeader   string
@@ -66,21 +64,7 @@ type registerResult struct {
 	expiresSeconds int
 	verifyHeader   string
 	serviceRoutes  []string
-	secureConn     *ipsec3gpp.SecureChannelConn
-	ipsecPolicy    ipsec3gpp.Policy
-	transport      *ipsec3gpp.Transport
-	portRelease    func()
-
-	// protectedTCP is the runtime a protected-TCP registration built, waiting to
-	// be handed to the Service.
-	//
-	// It is mutually exclusive with secureConn. service_lifecycle keys the legacy
-	// transport runtime off secureConn != nil, so a result that carried both would
-	// start two readers on one ESP carrier - and swuNetstack.dispatchRawIPPacket
-	// delivers a COPY to every matching raw connection, so each packet would be
-	// processed twice by two independent replay windows.
-	protectedTCP        *protectedTCPRuntime
-	protectedClientConn net.Conn
+	channel        *ipsec3gpp.ProtectedChannelLease
 }
 
 type initialRegisterVariant struct {
@@ -251,9 +235,6 @@ func runSecureAuthenticatedRegister(ctx context.Context, cfg Config, swuTCP voic
 			registerStatusResult(finalRes.StatusCode),
 		)
 	}
-	_ = secureTransport.ReleaseConn()
-
-	state.secureConn = secureConn
 	return finalizeRegisterSuccess(cfg, *state, finalRes)
 }
 
@@ -318,7 +299,7 @@ func installIPSecFromChallenge(cfg Config, state *registerState, res *sip.Respon
 	if uePortS == 0 {
 		uePortS = 5063
 	}
-	pol, err := ipsec3gpp.NewPolicy(ipsec3gpp.PolicyInput{
+	policyInput := ipsec3gpp.PolicyInput{
 		LocalIP:  cfg.LocalIP,
 		RemoteIP: rip,
 		Mech:     mech,
@@ -328,22 +309,19 @@ func installIPSecFromChallenge(cfg Config, state *registerState, res *sip.Respon
 		UEPortS:  uePortS,
 		UESPIc:   state.spiC,
 		UESPIs:   state.spiS,
-	})
-	if err != nil {
+	}
+	if state.channel == nil {
+		return fmt.Errorf("protected channel lease is unavailable")
+	}
+	if err := state.channel.Install(policyInput); err != nil {
 		return err
 	}
-	state.portC = pol.LocalPortC
-	state.portS = pol.LocalPortS
-	transport, err := ipsec3gpp.NewTransport(pol)
-	if err != nil {
-		return err
-	}
-	state.ipsecPolicy = pol
-	state.transport = transport
+	state.portC = state.channel.ClientPort()
+	state.portS = state.channel.ServerPort()
 	return nil
 }
 
-func dialSecureRegisterConn(ctx context.Context, cfg Config, swuTCP voiceclient.SWUTCPDialer, state registerState) (*ipsec3gpp.SecureChannelConn, error) {
+func dialSecureRegisterConn(ctx context.Context, cfg Config, swuTCP voiceclient.SWUTCPDialer, state registerState) (net.Conn, error) {
 	if canonicalRegisterTransport(state.transportMode) != "udp" {
 		return nil, fmt.Errorf("protected ESP requires UDP register transport, got %q", state.transportMode)
 	}
@@ -354,7 +332,10 @@ func dialSecureRegisterConn(ctx context.Context, cfg Config, swuTCP voiceclient.
 	if !ok {
 		return nil, fmt.Errorf("SWu dialer does not expose raw IP")
 	}
-	rip := net.IP(state.ipsecPolicy.RemoteIP)
+	if state.channel == nil {
+		return nil, fmt.Errorf("protected channel lease is unavailable")
+	}
+	rip := state.channel.RemoteIP()
 	if rip == nil {
 		return nil, fmt.Errorf("invalid protected P-CSCF IP")
 	}
@@ -362,7 +343,11 @@ func dialSecureRegisterConn(ctx context.Context, cfg Config, swuTCP voiceclient.
 	if err != nil {
 		return nil, err
 	}
-	return ipsec3gpp.WrapSecureChannelUDP(rawConn, state.transport, state.ipsecPolicy), nil
+	if err := state.channel.OpenUDP(rawConn); err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	return state.channel, nil
 }
 
 func buildAuthenticatedRegister(cfg Config, state registerState, prevReq *sip.Request, prevRes *sip.Response) (*sip.Request, *sip.Request, error) {
@@ -512,8 +497,12 @@ func prepareProtectedRegisterRequest(cfg Config, state registerState, req *sip.R
 	if canonicalRegisterTransport(state.transportMode) != "udp" {
 		return fmt.Errorf("protected REGISTER transport must be UDP")
 	}
-	protectedServerPort := state.ipsecPolicy.FlowS.LocalPort
-	remotePort := state.ipsecPolicy.FlowC.RemotePort
+	if state.channel == nil {
+		return fmt.Errorf("protected channel lease is unavailable")
+	}
+	protectedServerPort := state.channel.ServerPort()
+	remotePort := state.channel.RemoteClientPort()
+	remoteIP := state.channel.RemoteIP()
 	if protectedServerPort <= 0 || remotePort <= 0 {
 		return fmt.Errorf("protected REGISTER ports are unavailable")
 	}
@@ -531,7 +520,7 @@ func prepareProtectedRegisterRequest(cfg Config, state registerState, req *sip.R
 	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d REGISTER", cseq)))
 	req.ReplaceHeader(sip.NewHeader("Contact", buildIMSCoreContactForTransport(cfg, state, protectedServerPort, "udp")))
 	req.SetTransport("UDP")
-	req.SetDestination(net.JoinHostPort(net.IP(state.ipsecPolicy.RemoteIP).String(), strconv.Itoa(remotePort)))
+	req.SetDestination(net.JoinHostPort(remoteIP.String(), strconv.Itoa(remotePort)))
 	return nil
 }
 
@@ -686,9 +675,7 @@ func finalizeRegisterSuccess(cfg Config, state registerState, res *sip.Response)
 		expiresSeconds: expires,
 		verifyHeader:   state.verifyHeader,
 		serviceRoutes:  serviceRoutes,
-		secureConn:     state.secureConn,
-		ipsecPolicy:    state.ipsecPolicy,
-		transport:      state.transport,
+		channel:        state.channel,
 	}, nil
 }
 
@@ -937,34 +924,6 @@ func randomEphemeralSIPPort() int {
 		port := 10000 + int(n.Int64())
 		if port != 5060 && port != 5061 {
 			return port
-		}
-	}
-}
-
-func randomNonZeroUint32() uint32 {
-	// Prefer signed 31-bit SPI values (1..0x7fffffff); some IMS stacks reject high-bit SPIs.
-	for {
-		n, err := rand.Int(rand.Reader, big.NewInt(0x7fffffff))
-		if err != nil {
-			return 0x00ffee01
-		}
-		if v := uint32(n.Int64()) + 1; v != 0 {
-			return v
-		}
-	}
-}
-
-// randomConsecutiveSPIPair returns Qualcomm-style 31-bit consecutive SPIs: spi-c=base, spi-s=base+1.
-func randomConsecutiveSPIPair() (spiC, spiS uint32) {
-	// base in [1, 0x7ffffffe] so base+1 stays within signed 31-bit positive range.
-	for {
-		n, err := rand.Int(rand.Reader, big.NewInt(0x7ffffffe))
-		if err != nil {
-			return 0x00ffee01, 0x00ffee02
-		}
-		base := uint32(n.Int64()) + 1
-		if base >= 1 && base <= 0x7ffffffe {
-			return base, base + 1
 		}
 	}
 }

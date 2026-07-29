@@ -212,6 +212,7 @@ func (*registerSessionTestPacketRelay) SetWriteDeadline(time.Time) error { retur
 
 type registerSessionTestRawSWU struct {
 	base     voiceclient.SWUTCPDialer
+	cfg      Config
 	dp       *registerSessionTestPacketDataplane
 	state    func() *registerState
 	secureCh chan<- registerSessionTestCapture
@@ -229,10 +230,14 @@ func (s *registerSessionTestRawSWU) DialContextIP(ctx context.Context, localIP n
 		return nil, fmt.Errorf("base SWu dialer lacks raw IP support")
 	}
 	state := s.state()
-	if state == nil || state.transport == nil || len(state.ck) == 0 || len(state.ik) == 0 {
+	if state == nil || state.channel == nil || len(state.ck) == 0 || len(state.ik) == 0 {
 		return nil, fmt.Errorf("raw ESP dial before IPsec state is ready")
 	}
-	serverPolicy := reverseRegisterSessionTestPolicy(state.ipsecPolicy)
+	clientPolicy, err := protectedChannelPolicyFromStateForTest(s.cfg, state)
+	if err != nil {
+		return nil, err
+	}
+	serverPolicy := reverseRegisterSessionTestPolicy(clientPolicy)
 	serverTransport, err := ipsec3gpp.NewTransport(serverPolicy)
 	if err != nil {
 		return nil, err
@@ -516,6 +521,7 @@ func TestAUTSResyncFreshChallengeInstallsIPSecThenProtectedRegister(t *testing.T
 	var session *registerSession
 	swu := &registerSessionTestRawSWU{
 		base:     baseSWU,
+		cfg:      cfg,
 		dp:       dp,
 		state:    func() *registerState { return session.state },
 		secureCh: secureCh,
@@ -543,10 +549,10 @@ func TestAUTSResyncFreshChallengeInstallsIPSecThenProtectedRegister(t *testing.T
 			t.Fatalf("runInitialRegisterFlow: %v; secure peer did not finish", err)
 		}
 	}
-	if result == nil || result.secureConn == nil {
-		t.Fatal("REGISTER succeeded without a secure connection")
+	if result == nil || result.channel == nil {
+		t.Fatal("REGISTER succeeded without an opaque protected channel")
 	}
-	defer result.secureConn.Close()
+	defer result.channel.Close()
 
 	unprotected := <-unprotectedCh
 	if unprotected.err != nil {
@@ -607,9 +613,9 @@ func TestAUTSResyncFreshChallengeInstallsIPSecThenProtectedRegister(t *testing.T
 	if got := registerSessionTestHeaderNames(protected); !reflect.DeepEqual(got, wantProtectedHeaderOrder) {
 		t.Fatalf("protected REGISTER header order = %v, want %v", got, wantProtectedHeaderOrder)
 	}
-	wantServerPort := result.ipsecPolicy.FlowS.LocalPort
-	if wantServerPort <= 0 || wantServerPort == result.ipsecPolicy.FlowC.LocalPort {
-		t.Fatalf("invalid protected server port mapping: flow_c=%d flow_s=%d", result.ipsecPolicy.FlowC.LocalPort, wantServerPort)
+	wantServerPort := result.channel.ServerPort()
+	if wantServerPort <= 0 || wantServerPort == result.channel.ClientPort() {
+		t.Fatal("invalid protected client/server port mapping")
 	}
 	wantServerPortToken := ":" + strconv.Itoa(wantServerPort)
 	if got := registerSessionTestHeaderValue(protected, "Via"); !strings.Contains(got, wantServerPortToken) {

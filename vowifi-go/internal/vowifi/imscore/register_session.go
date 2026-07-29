@@ -13,6 +13,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/runtimehost/voiceclient"
 )
 
@@ -46,39 +47,32 @@ type registerSession struct {
 	localPort int
 }
 
-// newRegisterSession builds a session with the legacy fixed protected ports.
-//
-// It is retained for callers that have no Service-owned allocation to hand in.
-// Prefer newRegisterSessionWithPorts: TS 33.203 clause 7.4 requires port_uc to
-// change on every authenticated re-registration, and a fixed pair cannot do
-// that. See protectedPortAllocator.
+// newRegisterSession builds an isolated session for synthetic callers. Production
+// registration reserves its lease from Service.protectedChannels instead.
 func newRegisterSession(cfg Config, swu voiceclient.SWUTCPDialer, network IMSNetwork, transportMode string, attemptIndex int) *registerSession {
-	return newRegisterSessionWithPorts(cfg, swu, network, transportMode, attemptIndex,
-		legacyProtectedPortAllocation())
+	owner := ipsec3gpp.NewProtectedChannelOwner()
+	channel, err := owner.Reserve()
+	if err != nil {
+		return nil
+	}
+	return newRegisterSessionWithChannel(cfg, swu, network, transportMode, attemptIndex, channel)
 }
 
-// newRegisterSessionWithPorts builds a session bound to one Service-owned
-// protected port allocation.
-//
-// The allocation decides port_uc, port_us and the SA generation. The session
-// must not invent any of them: it is created per attempt and per candidate, so
-// anything it mints is reset several times per registration and can never be
-// monotonic or stable in the way clause 7.4 requires.
-func newRegisterSessionWithPorts(
+func newRegisterSessionWithChannel(
 	cfg Config,
 	swu voiceclient.SWUTCPDialer,
 	network IMSNetwork,
 	transportMode string,
 	attemptIndex int,
-	allocation protectedPortAllocation,
+	channel *ipsec3gpp.ProtectedChannelLease,
 ) *registerSession {
-	spiC, spiS := randomConsecutiveSPIPair()
 	state := &registerState{
-		spiC:          spiC,
-		spiS:          spiS,
-		portC:         allocation.clientPort,
-		portS:         allocation.serverPort,
-		generation:    allocation.generation,
+		spiC:          channel.ClientSPI(),
+		spiS:          channel.ServerSPI(),
+		portC:         channel.ClientPort(),
+		portS:         channel.ServerPort(),
+		generation:    channel.Generation(),
+		channel:       channel,
 		transportMode: canonicalRegisterTransport(transportMode),
 		fromTag:       sip.GenerateTagN(16),
 		sipInstance:   resolveStableSIPInstance(cfg),

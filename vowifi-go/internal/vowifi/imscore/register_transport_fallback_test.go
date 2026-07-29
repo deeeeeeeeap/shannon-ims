@@ -17,6 +17,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	"github.com/1239t/vowifi-go/engine/sim"
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 )
 
@@ -107,9 +108,10 @@ func TestGenericRegisterFallsBackFromUDPTimeoutToTCP(t *testing.T) {
 	cfg.PCSCFAddr = "192.0.2.3:5060"
 	cfg.TransportPCSCFAddr = cfg.PCSCFAddr
 	service := &Service{
-		imsCfg:  IMSConfig{Transport: "auto"},
-		cfg:     cfg,
-		network: network,
+		imsCfg:            IMSConfig{Transport: "auto"},
+		cfg:               cfg,
+		network:           network,
+		protectedChannels: ipsec3gpp.NewProtectedChannelOwner(),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -161,9 +163,10 @@ func TestGenericRegisterDoesNotFallbackAfterAuthenticationResponse(t *testing.T)
 			cfg.PCSCFAddr = "192.0.2.3:5060"
 			cfg.TransportPCSCFAddr = cfg.PCSCFAddr
 			service := &Service{
-				imsCfg:  IMSConfig{Transport: "auto"},
-				cfg:     cfg,
-				network: network,
+				imsCfg:            IMSConfig{Transport: "auto"},
+				cfg:               cfg,
+				network:           network,
+				protectedChannels: ipsec3gpp.NewProtectedChannelOwner(),
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -221,7 +224,7 @@ func TestGenericRegisterAuthenticationFailureDoesNotAdvanceCandidate(t *testing.
 			cfg.CarrierBehavior = policy.Default3GPPBehavior()
 			aka := &syntheticAuthTimeoutAKA{}
 			cfg.AKA = aka
-			service := &Service{cfg: cfg, network: network}
+			service := &Service{cfg: cfg, network: network, protectedChannels: ipsec3gpp.NewProtectedChannelOwner()}
 			candidates := []registerAttemptCandidate{
 				{Registrar: "192.0.2.3:5060", Gateway: "192.0.2.3:5060"},
 				{Registrar: "192.0.2.4:5060", Gateway: "192.0.2.4:5060"},

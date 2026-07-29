@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/1239t/vowifi-go/internal/vowifi/ipsec3gpp"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 )
 
@@ -37,11 +38,11 @@ func withProtectedTCPEnabled(t *testing.T) {
 
 // enabledPathState builds an installed state whose protected REGISTER is large
 // enough to select TCP, on a template that opts in.
-func enabledPathState(t *testing.T) (Config, *registerState, *protectedPortAllocator) {
+func enabledPathState(t *testing.T) (Config, *registerState, *ipsec3gpp.ProtectedChannelOwner) {
 	t.Helper()
-	cfg, state, _, alloc := runtimeTestStateWithAllocator(t)
+	cfg, state, owner := runtimeTestStateWithProtectedChannel(t)
 	cfg.ProtectedTransport = "auto"
-	return cfg, state, alloc
+	return cfg, state, owner
 }
 
 // ---------------------------------------------------------------------------
@@ -124,8 +125,7 @@ func TestEnabledPathSelectsTCPOnlyForOptedInTemplateAndOversizeRequest(t *testin
 // as a TCP-path failure rather than anything that could be retried on UDP.
 func TestEnabledPathListensBeforeHandshakeAndUsesOneCarrier(t *testing.T) {
 	withProtectedTCPEnabled(t)
-	cfg, state, alloc := enabledPathState(t)
-	defer alloc.release(state.generation)
+	cfg, state, _ := enabledPathState(t)
 	dialer := &countingCarrierDialer{}
 
 	challenge := syntheticChallengeResponse(t)
@@ -189,26 +189,30 @@ func TestEnabledPathFailureKeepsIncumbentAndReleasesGeneration(t *testing.T) {
 	withProtectedTCPEnabled(t)
 
 	// An incumbent registration, already live.
-	incumbentCfg, incumbentState, alloc := enabledPathState(t)
-	incumbentDialer := &countingCarrierDialer{}
-	incumbent, err := startProtectedTCPRuntime(context.Background(), incumbentCfg, incumbentDialer, *incumbentState)
+	incumbentCfg, incumbentState, owner := enabledPathState(t)
+	incumbentCarrier := newRuntimeCarrier()
+	if err := incumbentState.channel.OpenUDP(incumbentCarrier); err != nil {
+		t.Fatalf("open incumbent channel: %v", err)
+	}
+	incumbent, err := owner.Adopt(incumbentState.channel)
 	if err != nil {
-		t.Fatalf("incumbent startProtectedTCPRuntime: %v", err)
+		t.Fatalf("adopt incumbent channel: %v", err)
 	}
-	incumbent.BindPortRelease(alloc, incumbentState.generation)
-	holder := newProtectedRuntimeHolder()
-	if err := holder.replace(incumbent); err != nil {
-		t.Fatalf("the incumbent was not installed: %v", err)
-	}
-	defer holder.closeCurrent()
+	defer incumbent.Close()
 
 	// A second registration on a NEW generation, which will fail for want of a peer.
-	replacement := alloc.next()
+	replacement, err := owner.Reserve()
+	if err != nil {
+		t.Fatalf("reserve replacement channel: %v", err)
+	}
 	replacementCfg := incumbentCfg
-	replacementState := syntheticProtectedRegisterState(replacementCfg)
-	replacementState.portC = replacement.clientPort
-	replacementState.portS = replacement.serverPort
-	replacementState.generation = replacement.generation
+	replacementState := syntheticProtectedRegisterState(t, replacementCfg)
+	replacementState.spiC = replacement.ClientSPI()
+	replacementState.spiS = replacement.ServerSPI()
+	replacementState.portC = replacement.ClientPort()
+	replacementState.portS = replacement.ServerPort()
+	replacementState.generation = replacement.Generation()
+	replacementState.channel = replacement
 	if err := installIPSecFromChallenge(replacementCfg, replacementState, syntheticChallengeResponse(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
 	}
@@ -227,15 +231,12 @@ func TestEnabledPathFailureKeepsIncumbentAndReleasesGeneration(t *testing.T) {
 		t.Fatal("the replacement unexpectedly succeeded")
 	}
 
-	// The incumbent survived, still listening, still holding its port.
-	if current := holder.current(); current != incumbent {
-		t.Fatal("a failed replacement displaced the incumbent")
+	// The incumbent survives as the owner's current generation.
+	if _, err := incumbent.Write([]byte("current")); err != nil {
+		t.Fatalf("failed replacement displaced the incumbent: %v", err)
 	}
-	if !incumbent.ServerFlowReady() {
-		t.Fatal("the incumbent's listener was taken down by a failed replacement")
-	}
-	if !alloc.isActive(incumbentState.generation) {
-		t.Fatal("the incumbent's port was released by a failed replacement")
+	if got := incumbentCarrier.closeCount(); got != 0 {
+		t.Fatalf("failed replacement closed incumbent carrier %d times", got)
 	}
 
 	// The replacement's own carrier is gone.
@@ -256,8 +257,7 @@ func TestEnabledPathFailureKeepsIncumbentAndReleasesGeneration(t *testing.T) {
 // and re-choosing would use keys negotiated with a different P-CSCF.
 func TestEnabledPathFailureDoesNotSwitchCandidateOrStartLegacyRuntime(t *testing.T) {
 	withProtectedTCPEnabled(t)
-	cfg, state, alloc := enabledPathState(t)
-	defer alloc.release(state.generation)
+	cfg, state, _ := enabledPathState(t)
 
 	// Two distinct candidates, so a switch would be observable.
 	winning := candidateAttemptConfig(cfg, registerAttemptCandidate{
@@ -284,13 +284,10 @@ func TestEnabledPathFailureDoesNotSwitchCandidateOrStartLegacyRuntime(t *testing
 		t.Fatalf("dials = %d, want 1: a failure must not try another candidate", got)
 	}
 
-	// A failed TCP result carries no runtime and no legacy channel, so
-	// service_lifecycle would start neither.
-	if protectedResultUsesTCPRuntime(result) {
-		t.Fatal("a nil result reported owning a TCP runtime")
-	}
-	if shouldStartLegacyTransportRuntime(result) {
-		t.Fatal("a failed TCP registration would start the legacy transport runtime")
+	// A failed TCP result carries no provisional channel, so Service has nothing
+	// to adopt and no legacy runtime can start.
+	if result != nil && result.channel != nil {
+		t.Fatal("a failed TCP registration returned an ownership-capable channel")
 	}
 	t.Logf("MEASURED dials=1 candidate_switches=0 legacy_runtime=false")
 }
@@ -303,8 +300,7 @@ func TestEnabledPathFailureDoesNotSwitchCandidateOrStartLegacyRuntime(t *testing
 // the regression guard for every carrier that already works.
 func TestEnabledPathStillUsesLegacyUDPWhenRequestFits(t *testing.T) {
 	withProtectedTCPEnabled(t)
-	cfg, state, alloc := enabledPathState(t)
-	defer alloc.release(state.generation)
+	cfg, state, _ := enabledPathState(t)
 
 	// An opted-out template keeps the protected send on UDP at any size.
 	cfg.CarrierBehavior = policy.ResolveCarrierBehavior("234", "10")

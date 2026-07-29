@@ -13,8 +13,7 @@ import (
 // flow. Inbound messages may arrive on either flow; their response is written
 // back to the exact connection that carried the request.
 type protectedTCPMessagingConn struct {
-	runtime protectedTCPMessagingRuntime
-	client  net.Conn
+	channel protectedTCPMessagingChannel
 
 	frames chan protectedTCPMessagingFrame
 	done   chan struct{}
@@ -29,10 +28,10 @@ type protectedTCPMessagingConn struct {
 	readerWait sync.WaitGroup
 }
 
-type protectedTCPMessagingRuntime interface {
+type protectedTCPMessagingChannel interface {
+	net.Conn
 	ServerFlowReady() bool
 	AcceptServerFlow() (net.Conn, error)
-	Close()
 }
 
 type protectedTCPMessagingFrame struct {
@@ -41,19 +40,15 @@ type protectedTCPMessagingFrame struct {
 	err     error
 }
 
-func newProtectedTCPMessagingConn(runtime protectedTCPMessagingRuntime, client net.Conn) (*protectedTCPMessagingConn, error) {
-	if runtime == nil || !runtime.ServerFlowReady() {
+func newProtectedTCPMessagingConn(channel protectedTCPMessagingChannel) (*protectedTCPMessagingConn, error) {
+	if channel == nil || !channel.ServerFlowReady() {
 		return nil, errors.New("imscore: protected TCP messaging runtime is not ready")
 	}
-	if client == nil {
-		return nil, errors.New("imscore: protected TCP messaging client flow is unavailable")
-	}
-	if err := client.SetDeadline(time.Time{}); err != nil {
+	if err := channel.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
 	c := &protectedTCPMessagingConn{
-		runtime: runtime,
-		client:  client,
+		channel: channel,
 		frames:  make(chan protectedTCPMessagingFrame, 16),
 		done:    make(chan struct{}),
 	}
@@ -65,7 +60,7 @@ func newProtectedTCPMessagingConn(runtime protectedTCPMessagingRuntime, client n
 
 func (c *protectedTCPMessagingConn) runClientReader() {
 	defer c.readerWait.Done()
-	if err := c.readFrames(c.client); err != nil && !c.isClosing() {
+	if err := c.readFrames(c.channel); err != nil && !c.isClosing() {
 		c.fail(err)
 	}
 }
@@ -73,7 +68,7 @@ func (c *protectedTCPMessagingConn) runClientReader() {
 func (c *protectedTCPMessagingConn) runServerAcceptor() {
 	defer c.readerWait.Done()
 	for {
-		server, err := c.runtime.AcceptServerFlow()
+		server, err := c.channel.AcceptServerFlow()
 		if err != nil {
 			if !c.isClosing() {
 				c.fail(err)
@@ -180,12 +175,12 @@ func (c *protectedTCPMessagingConn) Read(p []byte) (int, error) {
 }
 
 func (c *protectedTCPMessagingConn) Write(p []byte) (int, error) {
-	if c == nil || c.client == nil || c.isClosing() {
+	if c == nil || c.channel == nil || c.isClosing() {
 		return 0, net.ErrClosed
 	}
 	c.wireWrite.Lock()
 	defer c.wireWrite.Unlock()
-	return writeFullSIPStream(c.client, p)
+	return writeFullSIPStream(c.channel, p)
 }
 
 func (c *protectedTCPMessagingConn) WriteServerFlow(p []byte) (int, error) {
@@ -232,15 +227,14 @@ func (c *protectedTCPMessagingConn) Close() error {
 		c.server = nil
 		close(c.done)
 		c.mu.Unlock()
-		if c.client != nil {
-			_ = c.client.Close()
-		}
 		if server != nil {
 			_ = server.Close()
 		}
-		// Closing the runtime also closes the listener, which joins an Accept that
-		// has not yet produced the terminating server flow.
-		c.runtime.Close()
+		// Closing the one generation-bound channel closes its client flow and
+		// listener, then joins reads and a pending Accept.
+		if c.channel != nil {
+			_ = c.channel.Close()
+		}
 		c.readerWait.Wait()
 	})
 	return nil
@@ -259,36 +253,36 @@ func (c *protectedTCPMessagingConn) isClosing() bool {
 }
 
 func (c *protectedTCPMessagingConn) LocalAddr() net.Addr {
-	if c == nil || c.client == nil {
+	if c == nil || c.channel == nil {
 		return nil
 	}
-	return c.client.LocalAddr()
+	return c.channel.LocalAddr()
 }
 
 func (c *protectedTCPMessagingConn) RemoteAddr() net.Addr {
-	if c == nil || c.client == nil {
+	if c == nil || c.channel == nil {
 		return nil
 	}
-	return c.client.RemoteAddr()
+	return c.channel.RemoteAddr()
 }
 
 func (c *protectedTCPMessagingConn) SetDeadline(deadline time.Time) error {
-	if c == nil || c.client == nil {
+	if c == nil || c.channel == nil {
 		return net.ErrClosed
 	}
-	return c.client.SetDeadline(deadline)
+	return c.channel.SetDeadline(deadline)
 }
 
 func (c *protectedTCPMessagingConn) SetReadDeadline(deadline time.Time) error {
-	if c == nil || c.client == nil {
+	if c == nil || c.channel == nil {
 		return net.ErrClosed
 	}
-	return c.client.SetReadDeadline(deadline)
+	return c.channel.SetReadDeadline(deadline)
 }
 
 func (c *protectedTCPMessagingConn) SetWriteDeadline(deadline time.Time) error {
-	if c == nil || c.client == nil {
+	if c == nil || c.channel == nil {
 		return net.ErrClosed
 	}
-	return c.client.SetWriteDeadline(deadline)
+	return c.channel.SetWriteDeadline(deadline)
 }

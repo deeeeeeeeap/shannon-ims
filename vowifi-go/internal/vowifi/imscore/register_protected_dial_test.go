@@ -68,7 +68,7 @@ func TestProtectedDialDispatchesOnResolvedTransport(t *testing.T) {
 // path, so a missing tunnel can never be mistaken for a transport problem.
 func TestProtectedDialRequiresRawDataplaneOnBothPaths(t *testing.T) {
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	if err := installIPSecFromChallenge(cfg, state, syntheticChallengeResponse(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
 	}
@@ -76,11 +76,13 @@ func TestProtectedDialRequiresRawDataplaneOnBothPaths(t *testing.T) {
 	ctx := context.Background()
 	for _, mode := range []string{protectedTransportUDP, protectedTransportTCP} {
 		t.Run(mode, func(t *testing.T) {
-			conn, err := dialProtectedRegisterConn(ctx, cfg, nil, *state, mode)
+			var err error
+			if mode == protectedTransportUDP {
+				_, err = dialSecureRegisterConn(ctx, cfg, nil, *state)
+			} else {
+				err = openProtectedTCPChannel(ctx, cfg, nil, state.channel)
+			}
 			if err == nil {
-				if conn != nil {
-					_ = conn.Close()
-				}
 				t.Fatal("dial succeeded without a SWu dataplane")
 			}
 		})
@@ -205,19 +207,13 @@ func TestExplicitProtectedTCPFailsClosedUntilServerFlowReady(t *testing.T) {
 
 	// And the refusal must happen before anything is dialled or written: the dial
 	// helper is never reached, so no carrier is opened and no SIP is serialized.
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	if err := installIPSecFromChallenge(cfg, state, syntheticChallengeResponse(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
 	}
 	dialer := &countingRawDialer{}
 	if err := authorizeProtectedTCPActivation(plan, protectedTCPActivation{}); err == nil {
-		// Only if the gate wrongly allows it would production dial at all.
-		channel, dialErr := dialProtectedRegisterConn(
-			context.Background(), cfg, dialer, *state, protectedTransportTCP)
-		if channel != nil {
-			_ = channel.Close()
-		}
-		t.Fatalf("gate allowed activation; dial returned %v", dialErr)
+		t.Fatal("gate allowed activation before the physical dial")
 	}
 	if got := dialer.dials; got != 0 {
 		t.Fatalf("carrier dials = %d, want 0: the refusal must precede any physical write", got)
@@ -280,7 +276,7 @@ func TestProtectedTCPClientUsesWinningCandidateAndNegotiatedPorts(t *testing.T) 
 		t.Fatal("the two test candidates must be distinct and resolvable")
 	}
 
-	state := syntheticProtectedRegisterState(winning)
+	state := syntheticProtectedRegisterState(t, winning)
 	challenge := syntheticChallengeFromCandidate(t)
 	if err := installIPSecFromChallenge(winning, state, challenge); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
@@ -310,18 +306,19 @@ func TestProtectedTCPClientUsesWinningCandidateAndNegotiatedPorts(t *testing.T) 
 	}
 
 	// 2. Destination port is the offered protected server port, not a default.
-	if port != itoaC2(state.ipsecPolicy.FlowC.RemotePort) {
+	if port != itoaC2(state.channel.RemoteClientPort()) {
 		t.Fatal("protected TCP destination port is not the negotiated port_ps")
 	}
 
 	// 3. The local bind must be the UE protected client port from the same policy.
 	// ipsec3gpp.ClientFlowBindPort is what DialClientFlow itself binds, so this
 	// asserts the production rule rather than restating it.
-	if got := ipsec3gpp.ClientFlowBindPort(state.ipsecPolicy); got != state.ipsecPolicy.FlowC.LocalPort {
+	policy := protectedChannelPolicyForTest(t, winning, state)
+	if got := ipsec3gpp.ClientFlowBindPort(policy); got != state.channel.ClientPort() {
 		t.Fatalf("client bind port = %d, want the policy port_uc", got)
 	}
 	// And it must differ from the server port, or the two flows would collide.
-	if state.ipsecPolicy.FlowC.LocalPort == state.ipsecPolicy.FlowS.LocalPort {
+	if state.channel.ClientPort() == state.channel.ServerPort() {
 		t.Fatal("port_uc and port_us are identical in the derived policy")
 	}
 
@@ -336,7 +333,7 @@ func TestProtectedTCPClientUsesWinningCandidateAndNegotiatedPorts(t *testing.T) 
 // composition oracle for the transport switch.
 func TestProtectedTCPClientRequestCompositionFollowsSpec(t *testing.T) {
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	challenge := syntheticChallengeResponse(t)
 	if err := installIPSecFromChallenge(cfg, state, challenge); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
@@ -372,7 +369,7 @@ func TestProtectedTCPClientRequestCompositionFollowsSpec(t *testing.T) {
 	// TS 24.229 clause 5.1.1.2.2 b): Contact carries the protected server port on
 	// every protected REGISTER, with no transport exemption.
 	contact := headerValueForTest(req, "Contact")
-	if !strings.Contains(contact, itoaC2(state.ipsecPolicy.FlowS.LocalPort)) {
+	if !strings.Contains(contact, itoaC2(state.channel.ServerPort())) {
 		t.Fatal("Contact does not carry the protected server port")
 	}
 
@@ -428,7 +425,7 @@ func TestProtectedTCPClientRequestCompositionFollowsSpec(t *testing.T) {
 // otherwise the carriers that already register would regress.
 func TestProtectedUDPCompositionIsUnchanged(t *testing.T) {
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	challenge := syntheticChallengeResponse(t)
 	if err := installIPSecFromChallenge(cfg, state, challenge); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
@@ -612,7 +609,7 @@ func (*closeCountingConn) SetWriteDeadline(time.Time) error { return nil }
 // never UDP <- TCP after a timeout.
 func TestProtectedTCPClientReadsResponseOnSameConnectionAndNeverFallsBack(t *testing.T) {
 	cfg := syntheticProtectedRegisterConfig()
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	if err := installIPSecFromChallenge(cfg, state, syntheticChallengeResponse(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
 	}
@@ -622,11 +619,8 @@ func TestProtectedTCPClientReadsResponseOnSameConnectionAndNeverFallsBack(t *tes
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		ch, err := dialProtectedRegisterConn(ctx, cfg, dialer, *state, protectedTransportTCP)
+		err := openProtectedTCPChannel(ctx, cfg, dialer, state.channel)
 		if err == nil {
-			if ch != nil {
-				_ = ch.Close()
-			}
 			t.Fatal("the dial succeeded despite a failing ESP carrier")
 		}
 		// Exactly one carrier attempt: no retry, no second candidate.
@@ -643,21 +637,20 @@ func TestProtectedTCPClientReadsResponseOnSameConnectionAndNeverFallsBack(t *tes
 		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer cancel()
 
-		ch, err := dialProtectedRegisterConn(ctx, cfg, dialer, *state, protectedTransportTCP)
-		if err == nil {
-			// If a handshake somehow completed, the invariants below still apply.
-			defer func() { _ = ch.Close() }()
-			if ch.secure != nil {
-				t.Fatal("the TCP channel exposed a legacy packet-mode secure channel")
-			}
-			if ch.conn == nil {
-				t.Fatal("the TCP channel has no connection to read the response from")
-			}
-			if ch.transport != protectedTransportTCP {
-				t.Fatalf("channel transport = %q, want tcp", ch.transport)
-			}
-			return
+		if err := openProtectedTCPChannel(ctx, cfg, dialer, state.channel); err != nil {
+			t.Fatalf("open protected TCP channel: %v", err)
 		}
+		if state.channel.PacketMode() {
+			t.Fatal("the TCP channel exposed packet-mode semantics")
+		}
+		if !state.channel.ServerFlowReady() {
+			t.Fatal("the TCP channel returned before its server flow was ready")
+		}
+		err := state.channel.DialTCPClient(ctx)
+		if err == nil {
+			t.Fatal("the TCP handshake unexpectedly completed without a peer")
+		}
+		_ = state.channel.Close()
 		// The failing path must still have opened exactly one carrier and must not
 		// have leaked it.
 		if dialer.dials != 1 {

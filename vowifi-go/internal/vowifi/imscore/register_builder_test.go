@@ -210,30 +210,6 @@ func TestVodafoneUKInitialRegisterUsesMinimalHeaderSet(t *testing.T) {
 	}
 }
 
-func TestRandomNonZeroUint32StaysWithinSigned31Bit(t *testing.T) {
-	for i := 0; i < 64; i++ {
-		v := randomNonZeroUint32()
-		if v == 0 || v > 0x7fffffff {
-			t.Fatalf("randomNonZeroUint32() = %d, want 1..0x7fffffff", v)
-		}
-	}
-}
-
-func TestRandomConsecutiveSPIPair(t *testing.T) {
-	for i := 0; i < 64; i++ {
-		c, s := randomConsecutiveSPIPair()
-		if c == 0 || c > 0x7ffffffe {
-			t.Fatalf("spi-c=%d out of range", c)
-		}
-		if s != c+1 {
-			t.Fatalf("spi-s=%d want spi-c+1=%d", s, c+1)
-		}
-		if s > 0x7fffffff {
-			t.Fatalf("spi-s=%d exceeds 31-bit", s)
-		}
-	}
-}
-
 func TestVodafoneUKInitialRegisterStartsServerInitiatedSecurityAgreement(t *testing.T) {
 	cfg := Config{
 		HomeDomain:         "ims.mnc015.mcc234.3gppnetwork.org",

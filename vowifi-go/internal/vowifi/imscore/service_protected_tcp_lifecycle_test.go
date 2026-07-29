@@ -6,58 +6,39 @@ import (
 	"testing"
 )
 
-func TestServiceAdoptsProtectedTCPRuntimeAndClosesIt(t *testing.T) {
-	cfg, state, _, allocator := runtimeTestStateWithAllocator(t)
-	dialer := &countingCarrierDialer{}
-	runtime, err := startProtectedTCPRuntime(context.Background(), cfg, dialer, *state)
-	if err != nil {
-		t.Fatalf("startProtectedTCPRuntime: %v", err)
-	}
-	runtime.BindPortRelease(allocator, state.generation)
-
-	owned, ok := runtime.TakeOwnership()
-	if !ok || owned == nil {
-		t.Fatal("register result could not take runtime ownership")
-	}
-	clientConn, peerConn := net.Pipe()
-	defer peerConn.Close()
+func TestServiceAdoptsOpaqueProtectedTCPChannelAndJoinsItOnClose(t *testing.T) {
+	fixture := newProtectedChannelTCPFixture(t)
+	cfg := syntheticProtectedRegisterConfig()
+	cfg.LocalIP = net.ParseIP("2001:db8::10")
 	result := &registerResult{
-		protectedTCP:        owned,
-		protectedClientConn: clientConn,
-		ipsecPolicy:         state.ipsecPolicy,
-		transport:           state.transport,
+		channel:      fixture.lease,
+		verifyHeader: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc",
 	}
-	service := &Service{cfg: cfg, protectedRuntimes: newProtectedRuntimeHolder()}
-
-	if err := service.adoptProtectedTCPResult(result); err != nil {
-		t.Fatalf("adoptProtectedTCPResult: %v", err)
+	service := &Service{cfg: cfg, protectedChannels: fixture.owner}
+	handle, err := service.adoptProtectedChannelResult(result)
+	if err != nil {
+		t.Fatalf("adopt protected channel: %v", err)
 	}
-	if result.protectedTCP != nil {
-		t.Fatal("register result retained runtime after Service adoption")
+	if result.channel != nil {
+		t.Fatal("register result retained the lease after Service adoption")
 	}
-	if current := service.protectedRuntimes.current(); current != runtime {
-		t.Fatal("Service did not retain the adopted runtime")
+	if handle.PacketMode() {
+		t.Fatal("adopted TCP channel reports packet mode")
 	}
-	if runtime.Closed() {
-		t.Fatal("Service adoption closed the live runtime")
-	}
-	if shouldStartLegacyTransportRuntime(result) {
-		t.Fatal("legacy transport would start alongside protected TCP")
-	}
-	if err := service.attachMessaging(context.Background(), "", result); err != nil {
-		t.Fatalf("protected TCP registration should remain usable without messaging: %v", err)
+	if err := service.attachMessaging(context.Background(), cfg.PCSCFAddr, result, handle); err != nil {
+		t.Fatalf("attach messaging: %v", err)
 	}
 	if !service.MessagingReady() {
-		t.Fatal("protected TCP service did not attach messaging to the transferred client flow")
+		t.Fatal("protected TCP service did not attach messaging to the opaque channel")
 	}
 
 	if err := service.Close(context.Background()); err != nil {
 		t.Fatalf("Service.Close: %v", err)
 	}
-	if !runtime.Closed() || !runtime.Joined() {
-		t.Fatal("Service.Close did not close and join the protected runtime")
+	if got := fixture.clientCarrier.closeCount.Load(); got != 1 {
+		t.Fatalf("physical carrier closes = %d, want 1", got)
 	}
-	if allocator.isActive(state.generation) {
-		t.Fatal("Service.Close did not release the protected port generation")
+	if _, err := handle.Write([]byte("stale")); err == nil {
+		t.Fatal("stale channel handle remained writable after Service.Close")
 	}
 }

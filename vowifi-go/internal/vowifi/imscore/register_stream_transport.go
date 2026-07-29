@@ -54,9 +54,8 @@ type streamRegisterTransport struct {
 	// is what the write path actually accepted.
 	bytesWritten int
 
-	mu       sync.Mutex
-	closed   bool
-	released bool
+	mu     sync.Mutex
+	closed bool
 }
 
 // newStreamRegisterTransport wraps one connection with its own framer.
@@ -88,7 +87,7 @@ func (t *streamRegisterTransport) SendPayload(ctx context.Context, payload []byt
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed || t.released {
+	if t.closed {
 		return errors.New("imscore: stream transport closed")
 	}
 	if err := ctx.Err(); err != nil {
@@ -133,7 +132,7 @@ func (t *streamRegisterTransport) ReadResponse(ctx context.Context) (*sip.Respon
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed || t.released {
+	if t.closed {
 		return nil, errors.New("imscore: stream transport closed")
 	}
 
@@ -226,6 +225,18 @@ func (t *streamRegisterTransport) FramesProduced() int {
 	return t.framesProduced
 }
 
+// AtMessageBoundary reports whether registration consumed every framed byte on
+// this borrowed connection. It transfers no connection ownership; the enclosing
+// ProtectedChannel remains the sole owner throughout REGISTER and messaging.
+func (t *streamRegisterTransport) AtMessageBoundary() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.closed && len(t.pending) == 0 && t.framer.Buffered() == 0
+}
+
 // streamReadChunkLen is one Read's buffer. It is unrelated to message size: the
 // framer reassembles across reads.
 const streamReadChunkLen = 4096
@@ -260,25 +271,6 @@ func parseStreamSIPResponse(frame []byte) (*sip.Response, error) {
 	return found, nil
 }
 
-// ReleaseConn hands the connection to a longer-lived owner. The framer is
-// dropped: a new owner must start from a clean message boundary.
-func (t *streamRegisterTransport) ReleaseConn() net.Conn {
-	if t == nil {
-		return nil
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.released || t.closed {
-		return nil
-	}
-	if len(t.pending) != 0 || t.framer.Buffered() != 0 {
-		return nil
-	}
-	t.released = true
-	t.framer.Reset()
-	return t.conn
-}
-
 // Close closes the connection and drops any buffered bytes.
 func (t *streamRegisterTransport) Close() error {
 	if t == nil {
@@ -291,9 +283,5 @@ func (t *streamRegisterTransport) Close() error {
 	}
 	t.closed = true
 	t.framer.Reset()
-	if t.released {
-		// The connection belongs to someone else now.
-		return nil
-	}
 	return t.conn.Close()
 }

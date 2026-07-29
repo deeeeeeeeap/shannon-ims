@@ -207,7 +207,7 @@ func TestProtectedTCPPathConsumesOneAuthenticationVector(t *testing.T) {
 	counting := &countingAKAProvider{inner: countingAKAFixture()}
 	cfg.AKA = counting
 
-	state := syntheticProtectedRegisterState(cfg)
+	state := syntheticProtectedRegisterState(t, cfg)
 	if err := installIPSecFromChallenge(cfg, state, syntheticChallengeResponse(t)); err != nil {
 		t.Fatalf("installIPSecFromChallenge: %v", err)
 	}

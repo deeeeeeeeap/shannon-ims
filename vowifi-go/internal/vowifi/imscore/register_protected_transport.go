@@ -224,8 +224,12 @@ func applyProtectedRegisterTransport(cfg Config, state registerState, req *sip.R
 	if req == nil {
 		return errors.New("imscore: missing protected REGISTER request")
 	}
-	protectedServerPort := state.ipsecPolicy.FlowS.LocalPort
-	remotePort := state.ipsecPolicy.FlowC.RemotePort
+	if state.channel == nil {
+		return errors.New("imscore: protected channel lease is unavailable")
+	}
+	protectedServerPort := state.channel.ServerPort()
+	remotePort := state.channel.RemoteClientPort()
+	remoteIP := state.channel.RemoteIP()
 	if protectedServerPort <= 0 || remotePort <= 0 {
 		return errors.New("imscore: protected REGISTER ports are unavailable")
 	}
@@ -261,8 +265,7 @@ func applyProtectedRegisterTransport(cfg Config, state registerState, req *sip.R
 	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d REGISTER", cseq)))
 	req.ReplaceHeader(sip.NewHeader("Contact",
 		buildIMSCoreContactForTransport(cfg, state, protectedServerPort, transport)))
-	req.SetDestination(net.JoinHostPort(
-		net.IP(state.ipsecPolicy.RemoteIP).String(), strconv.Itoa(remotePort)))
+	req.SetDestination(net.JoinHostPort(remoteIP.String(), strconv.Itoa(remotePort)))
 	return nil
 }
 

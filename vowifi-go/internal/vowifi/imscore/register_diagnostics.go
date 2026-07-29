@@ -408,8 +408,8 @@ func logProtectedRegisterReadFailure(state *registerState) {
 		result:    "no_sip_response",
 		protected: true,
 	}
-	if state != nil && state.transport != nil {
-		stats := state.transport.Stats()
+	if state != nil && state.channel != nil {
+		stats := state.channel.Stats()
 		d.ipsecInstalled = true
 		d.peerIPInboundPackets = boundRegisterESPCounterU64(stats.PeerInboundPackets)
 		d.espOutboundPackets = boundRegisterESPCounterU64(stats.OutboundPackets)
