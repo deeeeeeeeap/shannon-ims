@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	smspdu "github.com/warthog618/sms"
 	"github.com/warthog618/sms/encoding/tpdu"
@@ -36,8 +37,14 @@ const (
 )
 
 type SubmitOptions struct {
-	Encoding SMSEncoding
+	Encoding            SMSEncoding
+	RequestStatusReport bool
 }
+
+var (
+	submitTPMessageReference smspdu.Counter
+	submitConcatReference    smspdu.Counter
+)
 
 func NormalizeSMSEncoding(raw string) (SMSEncoding, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -293,6 +300,77 @@ func EncodeAddress(number string) []byte {
 //   - RP-DATA (Network -> MS): MTI = 001 (0x01)
 func BuildRPData(rpMr byte, tpduBytes []byte, smsc string) []byte {
 	smscAddr := EncodeAddress(smsc)
+	return buildRPData(rpMr, tpduBytes, smscAddr)
+}
+
+// BuildRPDataStrict constructs RP-DATA after deriving a numeric RP-Destination
+// Address from the service-centre value. SIP/tel presentation is accepted only
+// when it contains an unambiguous numeric user; non-numeric SC PSI values fail
+// closed rather than being mis-encoded as BCD after SIP MESSAGE was accepted.
+func BuildRPDataStrict(rpMr byte, tpduBytes []byte, smsc string) ([]byte, error) {
+	normalized, err := normalizeRPServiceCentreAddress(smsc)
+	if err != nil {
+		return nil, err
+	}
+	const maxRPUserDataTPDU = 232
+	if len(tpduBytes) > maxRPUserDataTPDU {
+		return nil, errors.New("TPDU exceeds RP-User Data length")
+	}
+	return buildRPData(rpMr, tpduBytes, EncodeAddress(normalized)), nil
+}
+
+func normalizeRPServiceCentreAddress(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", errors.New("service-centre address is empty")
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "sip:"):
+		value = value[len("sip:"):]
+		at := strings.IndexByte(value, '@')
+		if at <= 0 {
+			return "", errors.New("SIP service-centre URI has no numeric user")
+		}
+		value = value[:at]
+	case strings.HasPrefix(lower, "sips:"):
+		value = value[len("sips:"):]
+		at := strings.IndexByte(value, '@')
+		if at <= 0 {
+			return "", errors.New("SIPS service-centre URI has no numeric user")
+		}
+		value = value[:at]
+	case strings.HasPrefix(lower, "tel:"):
+		value = value[len("tel:"):]
+		if end := strings.IndexAny(value, ";?"); end >= 0 {
+			value = value[:end]
+		}
+	case strings.ContainsAny(value, "@:"):
+		return "", errors.New("service-centre address is not numeric")
+	}
+
+	var normalized strings.Builder
+	digits := 0
+	for _, r := range strings.TrimSpace(value) {
+		switch {
+		case r >= '0' && r <= '9':
+			normalized.WriteRune(r)
+			digits++
+		case r == '+' && normalized.Len() == 0:
+			normalized.WriteRune(r)
+		case unicode.IsSpace(r) || r == '-' || r == '(' || r == ')':
+			continue
+		default:
+			return "", errors.New("service-centre address contains non-numeric characters")
+		}
+	}
+	if digits == 0 || digits > 20 {
+		return "", errors.New("service-centre address digit length is invalid")
+	}
+	return normalized.String(), nil
+}
+
+func buildRPData(rpMr byte, tpduBytes, smscAddr []byte) []byte {
 
 	out := make([]byte, 0, 2+1+len(smscAddr)+1+len(tpduBytes))
 	out = append(out, 0x00) // RP-Message Type: RP-DATA (MS -> Network)
@@ -415,7 +493,10 @@ func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte,
 		encoderOptions = append(encoderOptions, smspdu.AsUCS2)
 	}
 
-	tpdus, err := smspdu.Encode(msg, encoderOptions...)
+	encoder := smspdu.NewEncoder(append([]smspdu.EncoderOption{smspdu.AsSubmit}, encoderOptions...)...)
+	encoder.MsgCount = &submitTPMessageReference
+	encoder.ConcatRef = &submitConcatReference
+	tpdus, err := encoder.Encode(msg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -427,9 +508,13 @@ func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte,
 	var lenList []int
 
 	for _, pdu := range tpdus {
-		// 修复短号码地址类型：库默认将所有号码设为 TonInternational (0x91)，
-		// 但运营商短号码（如 888、10086）应使用 TonUnknown (0x81)
-		if IsShortCode(normalizedTo) {
+		if opts.RequestStatusReport {
+			pdu.FirstOctet |= tpdu.FoSRR
+		}
+		// The dependency defaults every destination to international TON. A
+		// destination without an explicit '+' is national/short-code input and
+		// must remain unknown TON so the SMSC can interpret it in its own plan.
+		if !strings.HasPrefix(normalizedTo, "+") {
 			da := pdu.DA
 			da.SetTypeOfNumber(tpdu.TonUnknown)
 			da.SetNumberingPlan(tpdu.NpISDN)
@@ -445,4 +530,18 @@ func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte,
 	}
 
 	return bytesList, lenList, nil
+}
+
+// SetSubmitMessageReference replaces TP-MR in an already encoded
+// SMS-SUBMIT. SMS TPDUs have no checksum, so callers may allocate the
+// reference after segmentation without changing any other wire field.
+func SetSubmitMessageReference(tpduBytes []byte, mr byte) error {
+	if len(tpduBytes) < 2 {
+		return errors.New("SMS-SUBMIT TPDU too short")
+	}
+	if tpduBytes[0]&0x03 != byte(tpdu.MtSubmit) {
+		return errors.New("TPDU is not SMS-SUBMIT")
+	}
+	tpduBytes[1] = mr
+	return nil
 }

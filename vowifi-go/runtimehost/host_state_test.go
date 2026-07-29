@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/1239t/vowifi-go/internal/vowifi/runtimecore"
+	"github.com/1239t/vowifi-go/runtimehost/eventhost"
 	"github.com/1239t/vowifi-go/runtimehost/messaging"
 )
 
@@ -21,6 +22,7 @@ type lifecycleMessagingService struct {
 	closeCtxDeadline atomic.Bool
 	sendStarted      chan struct{}
 	releaseSend      chan struct{}
+	outcome          messaging.SendOutcome
 }
 
 func (s *lifecycleMessagingService) SendSMS(context.Context, string, string, []messaging.SMSPart) (messaging.SendOutcome, error) {
@@ -32,6 +34,9 @@ func (s *lifecycleMessagingService) SendSMS(context.Context, string, string, []m
 	}
 	if s.releaseSend != nil {
 		<-s.releaseSend
+	}
+	if s.outcome.MessageID != "" {
+		return s.outcome, nil
 	}
 	return messaging.SendOutcome{MessageID: "synthetic"}, nil
 }
@@ -130,6 +135,38 @@ func TestInstanceSendSMSRejectsAfterStop(t *testing.T) {
 	}
 	if got := service.sendCalls.Load(); got != 0 {
 		t.Fatalf("fake SendSMS calls=%d after Stop(), want 0", got)
+	}
+}
+
+func TestInstanceSendSMSReturnsAndPublishesImmediateTerminalDeliveryState(t *testing.T) {
+	service := &lifecycleMessagingService{outcome: messaging.SendOutcome{
+		MessageID:     "synthetic-message",
+		PartsTotal:    1,
+		DeliveryState: "pending",
+	}}
+	dispatcher := &channelEventDispatcher{events: make(chan eventhost.Event, 1)}
+	instance := &Instance{
+		deviceID:      "synthetic-device",
+		svc:           service,
+		deliveryStore: terminalDeliveryStore{},
+		dispatch:      dispatcher,
+		state:         State{SMSReady: true},
+	}
+
+	outcome, err := instance.SendSMS(context.Background(), "sip:safe.invalid", "synthetic", nil)
+	if err != nil {
+		t.Fatalf("SendSMS() error=%v", err)
+	}
+	if outcome.DeliveryState != "acked" {
+		t.Fatalf("SendSMS() delivery state=%q, want immediate acked state", outcome.DeliveryState)
+	}
+	event := <-dispatcher.events
+	sent, ok := event.(eventhost.SMSSent)
+	if !ok {
+		t.Fatalf("event=%T, want SMSSent", event)
+	}
+	if sent.MessageID != "synthetic-message" || sent.DeliveryState != "acked" {
+		t.Fatalf("SMSSent message_id=%q state=%q", sent.MessageID, sent.DeliveryState)
 	}
 }
 
@@ -493,6 +530,38 @@ func TestMarkIMSReadyStateDoesNotExposeNetworkAddress(t *testing.T) {
 	if state.LastReason != "ims_ready" {
 		t.Fatalf("LastReason = %q, want bounded ims_ready enum", state.LastReason)
 	}
+}
+
+type terminalDeliveryStore struct{}
+
+func (terminalDeliveryStore) CreateSMSDelivery(string, string, string, string, string, int, time.Time) error {
+	return nil
+}
+
+func (terminalDeliveryStore) UpsertSMSDeliveryPart(string, int, string, int, string, time.Time) error {
+	return nil
+}
+
+func (terminalDeliveryStore) MarkSMSDeliveryPartReport(string, string, string, int, string, int, int, string, time.Time) (messaging.DeliveryPartMatch, error) {
+	return messaging.DeliveryPartMatch{}, nil
+}
+
+func (terminalDeliveryStore) RecomputeSMSDelivery(string, time.Time) error { return nil }
+
+func (terminalDeliveryStore) UpdateSMSDeliveryState(string, string, string, int, time.Time) error {
+	return nil
+}
+
+func (terminalDeliveryStore) GetSMSDeliveryStatus(messageID string) (*messaging.DeliveryStatus, error) {
+	return &messaging.DeliveryStatus{MessageID: messageID, State: "acked", Acks: 1, PartsTotal: 1}, nil
+}
+
+type channelEventDispatcher struct {
+	events chan eventhost.Event
+}
+
+func (d *channelEventDispatcher) Dispatch(_ context.Context, event eventhost.Event) {
+	d.events <- event
 }
 
 func TestStalePipelineCannotUpdateStateOrNotifyAfterStop(t *testing.T) {

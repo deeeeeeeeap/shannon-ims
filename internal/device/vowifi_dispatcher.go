@@ -32,7 +32,7 @@ func (d poolVoWiFiRuntimeDispatcher) Dispatch(ctx context.Context, e eventhost.E
 		recordResult = res
 	case eventhost.SMSSent:
 		if err := recorder.RecordSent(v); err != nil {
-			logger.Warn("VoWiFi 上层入库出站短信失败", "device", v.DevID, "to", v.TargetURI, "err", err)
+			logger.Warn("VoWiFi 上层入库出站短信失败", "device", v.DevID, "err", err)
 		}
 	case eventhost.LocalNumberLearned:
 		if err := recorder.RecordLocalNumberLearned(v); err != nil {

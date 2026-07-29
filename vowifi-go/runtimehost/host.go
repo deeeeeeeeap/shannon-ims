@@ -16,6 +16,7 @@ import (
 	"github.com/1239t/vowifi-go/internal/vowifi/imscore"
 	"github.com/1239t/vowifi-go/internal/vowifi/policy"
 	"github.com/1239t/vowifi-go/internal/vowifi/runtimecore"
+	"github.com/1239t/vowifi-go/runtimehost/eventhost"
 	"github.com/1239t/vowifi-go/runtimehost/identity"
 	"github.com/1239t/vowifi-go/runtimehost/messaging"
 	"github.com/1239t/vowifi-go/runtimehost/transport"
@@ -181,7 +182,7 @@ type StartRequest struct {
 	RegisterExpiry time.Duration
 
 	DeliveryStore messaging.DeliveryStore
-	Dispatch      interface{}
+	Dispatch      eventhost.Dispatcher
 	BeforeStart   func(context.Context, SessionConfig) error
 	ShouldRun     func() bool
 
@@ -244,6 +245,7 @@ type Instance struct {
 	traceID         string
 	pcscfOverride   string
 	deliveryStore   messaging.DeliveryStore
+	dispatch        eventhost.Dispatcher
 
 	mu                  sync.Mutex
 	serviceUsers        int
@@ -576,7 +578,30 @@ func (i *Instance) SendSMS(ctx context.Context, peer, content string, parts []me
 	i.acquireServiceUseLocked()
 	i.mu.Unlock()
 	defer i.releaseServiceUse()
-	return svc.SendSMS(ctx, peer, content, parts)
+	outcome, err := svc.SendSMS(ctx, peer, content, parts)
+	if err != nil {
+		return outcome, err
+	}
+	messageID := strings.TrimSpace(outcome.MessageID)
+	deliveryState := strings.TrimSpace(outcome.DeliveryState)
+	if i.deliveryStore != nil && messageID != "" {
+		if status, statusErr := i.deliveryStore.GetSMSDeliveryStatus(messageID); statusErr == nil && status != nil && strings.TrimSpace(status.State) != "" {
+			deliveryState = strings.TrimSpace(status.State)
+			outcome.DeliveryState = deliveryState
+		}
+	}
+	if i.dispatch != nil {
+		i.dispatch.Dispatch(ctx, eventhost.SMSSent{
+			DevID:         i.deviceID,
+			TargetURI:     peer,
+			Content:       content,
+			Time:          time.Now(),
+			MessageID:     messageID,
+			TotalParts:    outcome.PartsTotal,
+			DeliveryState: deliveryState,
+		})
+	}
+	return outcome, nil
 }
 
 func (i *Instance) updateState(mut func(*State)) State {
@@ -714,6 +739,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		traceID:         strings.TrimSpace(req.TraceID),
 		pcscfOverride:   req.PCSCFAddr,
 		deliveryStore:   req.DeliveryStore,
+		dispatch:        req.Dispatch,
 
 		lifecycleGeneration: 1,
 		watchDone:           make(chan struct{}),

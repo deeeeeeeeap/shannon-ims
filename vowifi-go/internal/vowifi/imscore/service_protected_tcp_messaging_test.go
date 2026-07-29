@@ -39,13 +39,12 @@ func TestServiceSendSMSUsesAdoptedProtectedTCPChannel(t *testing.T) {
 			return
 		}
 		via := request.GetHeader("Via")
-		contact := request.GetHeader("Contact")
 		if via == nil || !strings.Contains(strings.ToUpper(via.Value()), "SIP/2.0/TCP") {
 			serverDone <- fmt.Errorf("MESSAGE did not use TCP Via")
 			return
 		}
-		if contact == nil || !strings.Contains(strings.ToLower(contact.Value()), fmt.Sprintf(":%d;transport=tcp", fixture.serverPort)) {
-			serverDone <- fmt.Errorf("MESSAGE Contact did not use protected server port")
+		if contact := request.GetHeader("Contact"); contact != nil {
+			serverDone <- fmt.Errorf("MESSAGE unexpectedly included Contact")
 			return
 		}
 		response := sip.NewResponseFromRequest(request, 202, "Accepted", nil)

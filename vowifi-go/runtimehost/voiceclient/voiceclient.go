@@ -535,7 +535,9 @@ func (c *Client) newRequest(method sip.RequestMethod, target string, initialRegi
 		toURI = recipient.String()
 	}
 	req.AppendHeader(sip.NewHeader("To", "<"+toURI+">"))
-	req.AppendHeader(sip.NewHeader("Contact", c.cfg.buildContactHeader(c.registerProfile, c.sipInstanceURN, c.contactUser)))
+	if method != sip.MESSAGE {
+		req.AppendHeader(sip.NewHeader("Contact", c.cfg.buildContactHeader(c.registerProfile, c.sipInstanceURN, c.contactUser)))
+	}
 	if method == sip.REGISTER {
 		requestURI := "sip:" + strings.TrimSpace(c.cfg.HomeDomain)
 		if initialRegister {

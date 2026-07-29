@@ -98,6 +98,7 @@ type secureMessagingTransport struct {
 	mu      sync.Mutex
 	pending map[string]chan *sip.Response
 	cseq    atomic.Uint32
+	rpAcks  chan smsRPAckTask
 
 	done      chan struct{}
 	doneOnce  sync.Once
@@ -110,11 +111,13 @@ func newSecureMessagingTransport(client *Client, conn net.Conn) *secureMessaging
 		client:  client,
 		conn:    conn,
 		pending: make(map[string]chan *sip.Response),
+		rpAcks:  make(chan smsRPAckTask, 16),
 		done:    make(chan struct{}),
 	}
 	t.cseq.Store(1)
-	t.wg.Add(1)
+	t.wg.Add(2)
 	go t.readLoop()
+	go t.rpAckLoop()
 	return t
 }
 
@@ -278,19 +281,48 @@ func (t *secureMessagingTransport) deliverResponse(response *sip.Response) {
 
 func (t *secureMessagingTransport) respondToRequest(request *sip.Request) {
 	var response *sip.Response
+	var rpAck *smsRPAckTask
 	if request.Method == sip.MESSAGE {
-		response = t.client.incomingMessageResponse(request)
+		response, rpAck = t.client.incomingMessageResult(request)
 	} else {
 		response = sip.NewResponseFromRequest(request, 501, "Not Implemented", nil)
 	}
 	payload := []byte(response.String())
 	if writer, ok := t.conn.(interface{ WriteServerFlow([]byte) (int, error) }); ok {
-		_, _ = writer.WriteServerFlow(payload)
+		n, err := writer.WriteServerFlow(payload)
+		if err == nil && n == len(payload) && rpAck != nil {
+			t.enqueueRPAck(*rpAck)
+		}
 		return
 	}
 	t.writeMu.Lock()
-	_, _ = t.conn.Write(payload)
+	n, err := t.conn.Write(payload)
 	t.writeMu.Unlock()
+	if err == nil && n == len(payload) && rpAck != nil {
+		t.enqueueRPAck(*rpAck)
+	}
+}
+
+func (t *secureMessagingTransport) enqueueRPAck(task smsRPAckTask) {
+	select {
+	case <-t.done:
+		t.client.logStatusReportRPAckResult("canceled")
+	case t.rpAcks <- task:
+	default:
+		t.client.logStatusReportRPAckResult("queue_full")
+	}
+}
+
+func (t *secureMessagingTransport) rpAckLoop() {
+	defer t.wg.Done()
+	for {
+		select {
+		case <-t.done:
+			return
+		case task := <-t.rpAcks:
+			t.client.sendStatusReportRPAck(task)
+		}
+	}
 }
 
 func (t *secureMessagingTransport) signalDone() {

@@ -109,7 +109,7 @@ func TestAttachSecureMessagingClearsInheritedDeadlineAndSendsMESSAGE(t *testing.
 		serverDone <- err
 	}()
 
-	store := &secureMessagingTestDeliveryStore{parts: make(chan secureMessagingTestPart, 1)}
+	store := &secureMessagingTestDeliveryStore{parts: make(chan secureMessagingTestPart, 2)}
 	cfg := Config{
 		DeviceID:        "test-device",
 		LocalIP:         net.ParseIP("10.0.0.2"),
@@ -180,10 +180,9 @@ func TestAttachSecureStreamMessagingSendsMESSAGEOverExistingTCPFlow(t *testing.T
 			serverDone <- fmt.Errorf("TCP Via did not use the protected client port")
 			return
 		}
-		contact := request.GetHeader("Contact")
-		if contact == nil || !strings.Contains(strings.ToLower(contact.Value()), ":5063;transport=tcp") {
-			serverDone <- fmt.Errorf("Contact did not use the protected server port")
-			return
+		var messageErr error
+		if contact := request.GetHeader("Contact"); contact != nil {
+			messageErr = fmt.Errorf("MESSAGE unexpectedly included Contact")
 		}
 		if transport := strings.ToUpper(request.Transport()); transport != "TCP" {
 			serverDone <- fmt.Errorf("request transport = %q, want TCP", transport)
@@ -191,6 +190,9 @@ func TestAttachSecureStreamMessagingSendsMESSAGEOverExistingTCPFlow(t *testing.T
 		}
 		response := sip.NewResponseFromRequest(request, 202, "Accepted", nil)
 		_, err = io.WriteString(serverRaw, response.String())
+		if err == nil {
+			err = messageErr
+		}
 		serverDone <- err
 	}()
 

@@ -6,7 +6,7 @@ import { Loading } from '@element-plus/icons-vue'
 import { useSMSStore } from '../stores/sms'
 import { usePollingScheduler } from '../composables/usePollingScheduler'
 import { toAppError } from '../services/http'
-import type { SmsThreadQueryParams } from '../services/sms'
+import type { SmsSendResult, SmsThreadQueryParams } from '../services/sms'
 import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ErrorState from '../components/ErrorState.vue'
@@ -52,6 +52,7 @@ const smsPageRef = ref<HTMLElement | null>(null)
 const smsPageWidth = ref(0)
 const SMS_NARROW_BREAKPOINT = 980
 let smsPageResizeObserver: ResizeObserver | null = null
+let smsPageDisposed = false
 
 function syncSmsPageWidth() {
   smsPageWidth.value = smsPageRef.value?.clientWidth || 0
@@ -575,6 +576,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  smsPageDisposed = true
   clearLongPress()
   smsPageResizeObserver?.disconnect()
   smsPageResizeObserver = null
@@ -586,6 +588,63 @@ function openSendModal() {
   sendForm.value.message = ''
   selectedSendDeviceId.value = selectedDevice.value !== 'all' ? selectedDevice.value : (devices.value[0]?.id || '')
   showSendModal.value = true
+}
+
+function notifySMSSubmission(result: SmsSendResult) {
+  const suffix = result.partsTotal > 1 ? `（${result.partsTotal}段）` : ''
+  if (result.deliveryState === 'delivered') {
+    ElMessage.success(`状态报告已确认收件终端收到${suffix}`)
+    return
+  }
+  if (result.deliveryState === 'acked') {
+    ElMessage.info(`短信中心已确认提交（不代表收件人已收到）${suffix}`)
+    return
+  }
+  if (result.deliveryState === 'failed' || result.deliveryState === 'timeout') {
+    ElMessage.error(`短信发送失败${suffix}`)
+    return
+  }
+  if (result.deliveryState === 'delivery_unconfirmed') {
+    ElMessage.warning(`短信中心已完成处理，但未确认收件终端收到${suffix}`)
+    return
+  }
+  ElMessage.info(`${result.message || '短信已提交，等待运营商回执'}${suffix}`)
+}
+
+async function monitorSMSDelivery(result: SmsSendResult) {
+  const initialState = result.deliveryState.trim().toLowerCase()
+  if (!result.messageId || initialState === 'delivered' || initialState === 'delivery_unconfirmed' || initialState === 'failed' || initialState === 'timeout') return
+  let acceptedNoticeShown = initialState === 'acked' || initialState === 'delivery_pending'
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise(resolve => window.setTimeout(resolve, 2000))
+    if (smsPageDisposed) return
+    const delivery = await smsStore.getDelivery(result.messageId)
+    if (!delivery.ok) continue
+    if (delivery.data.state === 'delivered') {
+      ElMessage.success('状态报告已确认收件终端收到')
+      await fetchMessagesAndThread()
+      return
+    }
+    if (delivery.data.state === 'delivery_unconfirmed') {
+      ElMessage.warning('短信中心已完成处理，但未确认收件终端收到')
+      await fetchMessagesAndThread()
+      return
+    }
+    if ((delivery.data.state === 'acked' || delivery.data.state === 'delivery_pending') && !acceptedNoticeShown) {
+      ElMessage.info('短信中心已确认提交（不代表收件人已收到）')
+      await fetchMessagesAndThread()
+      acceptedNoticeShown = true
+    }
+    if (delivery.data.state === 'failed' || delivery.data.state === 'timeout') {
+      const cause = delivery.data.failedPartCause
+      ElMessage.error(cause ? `运营商拒绝短信（RP cause ${cause}）` : '运营商未接受短信')
+      await fetchMessagesAndThread()
+      return
+    }
+  }
+  if (acceptedNoticeShown) {
+    ElMessage.info('短信中心已接受，当前尚未收到最终投递状态报告')
+  }
 }
 
 async function handleSendModal() {
@@ -601,8 +660,8 @@ async function handleSendModal() {
       message: sendForm.value.message
     })
     if (!result.ok) throw new Error(result.error.message || '发送失败')
-    const parts = result.data.partsTotal
-    ElMessage.success(`短信已发送${parts > 1 ? `（${parts}段）` : ''}`)
+    notifySMSSubmission(result.data)
+    void monitorSMSDelivery(result.data)
     showSendModal.value = false
     setTimeout(async () => {
       await fetchMessagesAndThread()
@@ -627,13 +686,12 @@ async function sendToCurrentThread() {
   }
   sending.value = true
   try {
-    if (selectedDevice.value === 'all') {
-      const result = await smsStore.send({ imsi: t.imsi, phone: t.peer, message: text })
-      if (!result.ok) throw new Error(result.error.message || '发送失败')
-    } else {
-      const result = await smsStore.send({ device_id: resolvedDeviceId, phone: t.peer, message: text })
-      if (!result.ok) throw new Error(result.error.message || '发送失败')
-    }
+    const result = selectedDevice.value === 'all'
+      ? await smsStore.send({ imsi: t.imsi, phone: t.peer, message: text })
+      : await smsStore.send({ device_id: resolvedDeviceId, phone: t.peer, message: text })
+    if (!result.ok) throw new Error(result.error.message || '发送失败')
+    notifySMSSubmission(result.data)
+    void monitorSMSDelivery(result.data)
     composer.value = ''
     scrollThreadToBottom()
     setTimeout(async () => {
@@ -928,8 +986,10 @@ async function confirmDeleteThread(thread: SmsThread) {
                         {{ m.device_name }}
                       </span>
                       <span class="text-[11px] text-gray-400 font-mono">{{ new Date(m.timestamp).toLocaleString() }}</span>
-                      <span v-if="m.type === 2 && m.status === 2" class="text-green-500 text-xs" title="发送成功">✓</span>
+                      <span v-if="m.type === 2 && m.status === 5" class="text-green-500 text-xs" title="状态报告已确认收件终端收到">✓</span>
+                      <span v-else-if="m.type === 2 && m.status === 2" class="text-blue-500 text-xs" title="短信中心已确认提交，不代表收件人已收到">↑</span>
                       <span v-else-if="m.type === 2 && m.status === 3" class="text-red-500 text-xs" title="发送失败">✗</span>
+                      <span v-else-if="m.type === 2 && m.status === 4" class="text-amber-500 text-xs" title="已提交，等待运营商回执">…</span>
                       <el-button
                         v-if="!isNarrowLayout && (m.type !== 2 || !m.device_name)"
                         text

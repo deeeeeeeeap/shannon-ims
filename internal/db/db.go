@@ -81,6 +81,7 @@ func (PendingPhoneNumber) TableName() string { return "pending_phone_numbers" }
 // SMS 短信表 (关联 IMSI)
 type SMS struct {
 	ID         uint      `gorm:"primaryKey" json:"id"`
+	MessageID  string    `gorm:"column:message_id;index" json:"message_id"`
 	IMSI       string    `gorm:"column:imsi;index:idx_sms_imsi_peer_ts,priority:1;index:idx_sms_imsi_ts,priority:1" json:"imsi"`
 	ICCID      string    `gorm:"column:iccid;index" json:"iccid"`
 	Peer       string    `gorm:"column:peer;index:idx_sms_imsi_peer_ts,priority:2" json:"peer"`
@@ -89,7 +90,7 @@ type SMS struct {
 	Recipient  string    `json:"recipient"`
 	Content    string    `json:"content"`
 	Type       int       `json:"type"`   // 1: 接收, 2: 发送
-	Status     int       `json:"status"` // 0: 未读, 1: 已读, 2: 发送成功, 3: 发送失败
+	Status     int       `json:"status"` // 0: 未读, 1: 已读, 2: 已确认, 3: 发送失败, 4: 已提交待回执
 	Timestamp  time.Time `gorm:"index:idx_sms_imsi_peer_ts,priority:3,sort:desc;index:idx_sms_ts,sort:desc;index:idx_sms_imsi_ts,priority:2,sort:desc" json:"timestamp"`
 	CreatedAt  time.Time `json:"created_at"`
 }
@@ -716,9 +717,20 @@ func HasDuplicateReceivedSMS(imsi, localPhone, sender, recipient, content string
 // SaveSMSWithLocalPhone 保存短信记录并显式写入本机号码。
 // localPhone 为空时会按方向自动推导，并在必要时回退到订阅手机号。
 func SaveSMSWithLocalPhone(imsi, localPhone, sender, recipient, content string, smsType, status int, timestamp time.Time) error {
+	return saveSMSWithLocalPhone("", imsi, localPhone, sender, recipient, content, smsType, status, timestamp)
+}
+
+// SaveVoWiFiSMSWithLocalPhone persists an IMS SMS submission together with
+// the delivery message ID so a later RP-ACK/RP-ERROR can update the same row.
+func SaveVoWiFiSMSWithLocalPhone(messageID, imsi, localPhone, sender, recipient, content string, smsType, status int, timestamp time.Time) error {
+	return saveSMSWithLocalPhone(messageID, imsi, localPhone, sender, recipient, content, smsType, status, timestamp)
+}
+
+func saveSMSWithLocalPhone(messageID, imsi, localPhone, sender, recipient, content string, smsType, status int, timestamp time.Time) error {
 	if DB == nil {
 		return nil
 	}
+	messageID = strings.TrimSpace(messageID)
 	imsi = strings.TrimSpace(imsi)
 	sender = strings.TrimSpace(sender)
 	recipient = strings.TrimSpace(recipient)
@@ -728,6 +740,7 @@ func SaveSMSWithLocalPhone(imsi, localPhone, sender, recipient, content string, 
 	// 运行时即解析 ICCID（与 P4 回填同一约定：无真实映射回退 "imsi:" 前缀），
 	// 否则新短信 iccid 为空，按 ICCID 维度的查询/删除会全部落空。
 	sms := SMS{
+		MessageID:  messageID,
 		IMSI:       imsi,
 		ICCID:      GetICCIDForIMSI(imsi),
 		Peer:       peer,
@@ -740,6 +753,13 @@ func SaveSMSWithLocalPhone(imsi, localPhone, sender, recipient, content string, 
 		Timestamp:  timestamp.Truncate(time.Second),
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
+		if messageID != "" && smsType == 2 {
+			resolvedStatus, err := resolveVoWiFiSMSHistoryStatus(tx, messageID, sms.Status)
+			if err != nil {
+				return err
+			}
+			sms.Status = resolvedStatus
+		}
 		if err := tx.Create(&sms).Error; err != nil {
 			return err
 		}
@@ -748,6 +768,51 @@ func SaveSMSWithLocalPhone(imsi, localPhone, sender, recipient, content string, 
 		}
 		return upsertSMSContactFromSMS(tx, &sms)
 	})
+}
+
+func resolveVoWiFiSMSHistoryStatus(tx *gorm.DB, messageID string, fallback int) (int, error) {
+	if tx == nil || strings.TrimSpace(messageID) == "" {
+		return fallback, nil
+	}
+	var delivery SMSDelivery
+	err := tx.Select("state").Where("message_id = ?", strings.TrimSpace(messageID)).First(&delivery).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fallback, nil
+	}
+	if err != nil {
+		return fallback, err
+	}
+	return voWiFiSMSHistoryStatusForDeliveryState(delivery.State, fallback), nil
+}
+
+func voWiFiSMSHistoryStatusForDeliveryState(state string, fallback int) int {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case SMSDeliveryStateDelivered:
+		return 5
+	case SMSDeliveryStateAcked:
+		return 2
+	case SMSDeliveryStateFailed, SMSDeliveryPartStateTimeout:
+		return 3
+	case SMSDeliveryStatePending, SMSDeliveryStatePartialAck:
+		return 4
+	case SMSDeliveryStateDeliveryPending, SMSDeliveryStateDeliveryUnconfirmed:
+		return 2
+	default:
+		return fallback
+	}
+}
+
+func UpdateVoWiFiSMSHistoryStatus(messageID string, status int) error {
+	if DB == nil {
+		return nil
+	}
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return nil
+	}
+	return DB.Model(&SMS{}).
+		Where("message_id = ? AND type = ?", messageID, 2).
+		Update("status", status).Error
 }
 
 func normalizeSMSPeer(smsType int, sender, recipient string) string {

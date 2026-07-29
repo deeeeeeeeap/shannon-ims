@@ -1,6 +1,8 @@
+import axios from 'axios'
 import { api } from '../stores/auth'
-import { callService } from './http'
+import { callService, toAppError } from './http'
 import type { ServiceResult } from '../types/domain'
+import { fail, ok } from '../types/domain'
 import type { DeviceMgmtListItem } from '../types/api'
 import type { SMSContactDTO, SMSMessageDTO, SmsThreadVM } from '../types/view-model'
 
@@ -20,10 +22,40 @@ export type SmsSendPayload = {
   message: string
 }
 
+export type SmsSendResult = {
+  partsTotal: number
+  messageId: string
+  deliveryState: string
+  message: string
+}
+
+export type SmsDeliveryResult = {
+  state: string
+  acks: number
+  partsTotal: number
+  failedPartCause?: number
+}
+
 export type SmsDeleteThreadPayload = {
   device_id?: string
   imsi?: string
   peer: string
+}
+
+type SmsSendAPIResponse = {
+  parts_total?: number
+  message_id?: string
+  delivery_state?: string
+  message?: string
+}
+
+function normalizeSmsSendResponse(data?: SmsSendAPIResponse): SmsSendResult {
+  return {
+    partsTotal: Number(data?.parts_total || 0),
+    messageId: String(data?.message_id || ''),
+    deliveryState: String(data?.delivery_state || 'pending'),
+    message: String(data?.message || '短信已提交，等待运营商回执')
+  }
 }
 
 function parseTs(s: string) {
@@ -87,12 +119,36 @@ export const smsService = {
       return list.slice().sort((a, b) => parseTs(a.timestamp) - parseTs(b.timestamp) || a.id - b.id)
     })
   },
-  send(payload: SmsSendPayload) {
-    return callService(async () => {
-      const res = await api.post<{ parts_total?: number }>('/sms/send', payload)
-      return {
-        partsTotal: Number(res.data?.parts_total || 0)
+  async send(payload: SmsSendPayload): Promise<ServiceResult<SmsSendResult>> {
+    try {
+      const res = await api.post<SmsSendAPIResponse>('/sms/send', payload)
+      return ok(normalizeSmsSendResponse(res.data))
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.data && typeof err.response.data === 'object') {
+        const data = err.response.data as SmsSendAPIResponse
+        if (String(data.message_id || '').trim()) {
+          return ok(normalizeSmsSendResponse(data))
+        }
       }
+      return fail(toAppError(err))
+    }
+  },
+  getDelivery(messageId: string) {
+    return callService(async () => {
+      const res = await api.get<{ delivery?: Record<string, unknown> }>(`/sms/delivery/${encodeURIComponent(messageId)}`)
+      const delivery = res.data?.delivery || {}
+      const rawParts = delivery.parts ?? delivery.Parts
+      const parts = Array.isArray(rawParts) ? rawParts as Array<Record<string, unknown>> : []
+      const failedPart = parts.find(part => {
+        const state = String((part.state ?? part.State) || '')
+        return state === 'failed' || state === 'delivery_failed'
+      })
+      return {
+        state: String((delivery.state ?? delivery.State) || 'pending'),
+        acks: Number((delivery.acks ?? delivery.Acks) || 0),
+        partsTotal: Number((delivery.parts_total ?? delivery.PartsTotal) || 0),
+        failedPartCause: failedPart ? Number((failedPart.rp_cause ?? failedPart.RPCause) || 0) : undefined
+      } satisfies SmsDeliveryResult
     })
   },
   deleteMessage(id: number) {

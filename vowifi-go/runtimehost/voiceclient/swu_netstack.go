@@ -17,6 +17,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	gtcp "gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	gudp "gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const swuNetstackNICID = 1
@@ -126,10 +127,42 @@ func (n *swuNetstack) DialContextTCP(ctx context.Context, localIP net.IP, localP
 		Addr: addrFromNetIP(remoteIP),
 		Port: uint16(remotePort),
 	}
-	conn, err := gonet.DialTCPWithBind(ctx, n.stack, localAddr, remoteAddr, networkProto)
-	if err != nil {
-		return nil, fmt.Errorf("voiceclient: SWu userspace TCP dial %s:%d: %w", remoteIP.String(), remotePort, err)
+	var wq waiter.Queue
+	ep, tcpErr := n.stack.NewEndpoint(gtcp.ProtocolNumber, networkProto, &wq)
+	if tcpErr != nil {
+		return nil, fmt.Errorf("voiceclient: SWu userspace TCP endpoint: %v", tcpErr)
 	}
+	if err := ep.SetSockOptInt(tcpip.MaxSegOption, swuTCPConservativeMSSCap); err != nil {
+		ep.Close()
+		return nil, fmt.Errorf("voiceclient: set SWu TCP MSS: %v", err)
+	}
+	if err := ep.Bind(localAddr); err != nil {
+		ep.Close()
+		return nil, fmt.Errorf("voiceclient: bind SWu userspace TCP: %v", err)
+	}
+
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	wq.EventRegister(&waitEntry)
+	defer wq.EventUnregister(&waitEntry)
+
+	connectErr := ep.Connect(remoteAddr)
+	if _, started := connectErr.(*tcpip.ErrConnectStarted); started {
+		select {
+		case <-ctx.Done():
+			ep.Close()
+			return nil, ctx.Err()
+		case <-n.closed:
+			ep.Close()
+			return nil, net.ErrClosed
+		case <-notifyCh:
+		}
+		connectErr = ep.LastError()
+	}
+	if connectErr != nil {
+		ep.Close()
+		return nil, fmt.Errorf("voiceclient: SWu userspace TCP dial %s:%d: %v", remoteIP.String(), remotePort, connectErr)
+	}
+	conn := gonet.NewTCPConn(&wq, ep)
 	logger.Info("IMS SWu TCP connected",
 		logger.String("local_ip", localIP.String()),
 		logger.Int("local_port", localPort),
@@ -291,6 +324,7 @@ func (n *swuNetstack) inboundLoop() {
 			if n.dispatchRawIPPacket(packet) {
 				continue
 			}
+			packet = clampSWUTCPHandshakeMSS(packet, swuTCPConservativeMSSCap)
 			proto := networkProtocolForPacket(packet)
 			if proto == 0 {
 				continue

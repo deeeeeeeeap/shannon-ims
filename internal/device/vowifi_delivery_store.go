@@ -22,15 +22,29 @@ func (vowifiDeliveryStore) UpsertSMSDeliveryPart(messageID string, partNo int, c
 func (vowifiDeliveryStore) MarkSMSDeliveryPartReport(inReplyTo, callID, deviceID string, rpMR int, state string, sipCode int, rpCause int, errText string, at time.Time) (messaging.DeliveryPartMatch, error) {
 	part, err := db.MarkSMSDeliveryPartReport(inReplyTo, callID, deviceID, rpMR, state, sipCode, rpCause, errText, at)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, db.ErrSMSDeliveryReportAmbiguous) {
 			return messaging.DeliveryPartMatch{}, messaging.ErrDeliveryNotFound
 		}
 		return messaging.DeliveryPartMatch{}, err
 	}
 	return messaging.DeliveryPartMatch{
-		MessageID: part.MessageID,
-		PartNo:    part.PartNo,
-		State:     part.State,
+		MessageID:         part.MessageID,
+		PartNo:            part.PartNo,
+		State:             part.State,
+		CorrelationMethod: part.CorrelationMethod,
+	}, nil
+}
+
+func (vowifiDeliveryStore) MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient string, tpMR int, state string, tpStatus int, at time.Time) (messaging.DeliveryPartMatch, error) {
+	part, err := db.MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient, tpMR, state, tpStatus, at)
+	if err != nil {
+		return messaging.DeliveryPartMatch{}, err
+	}
+	return messaging.DeliveryPartMatch{
+		MessageID:         part.MessageID,
+		PartNo:            part.PartNo,
+		State:             part.State,
+		CorrelationMethod: part.CorrelationMethod,
 	}, nil
 }
 

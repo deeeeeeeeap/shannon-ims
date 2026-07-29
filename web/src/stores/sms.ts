@@ -42,6 +42,10 @@ export const useSMSStore = defineStore('sms', () => {
     return smsService.send(payload)
   }
 
+  async function getDelivery(messageId: string) {
+    return smsService.getDelivery(messageId)
+  }
+
   async function deleteMessage(id: number) {
     return smsService.deleteMessage(id)
   }
@@ -61,6 +65,7 @@ export const useSMSStore = defineStore('sms', () => {
     fetchThreads,
     fetchThread,
     send,
+    getDelivery,
     deleteMessage,
     deleteThread
   }

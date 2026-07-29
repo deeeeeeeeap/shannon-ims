@@ -21,8 +21,8 @@ type vowifiSMSRecordResult struct {
 	Suppressed bool
 }
 
-func RecordVoWiFiSMSSendFailure(p *Pool, deviceID, target, content string, at time.Time) error {
-	return vowifiSMSHistoryRecorder{pool: p}.RecordSendFailure(deviceID, target, content, at)
+func RecordVoWiFiSMSSendFailure(p *Pool, deviceID, messageID, target, content string, at time.Time) error {
+	return vowifiSMSHistoryRecorder{pool: p}.RecordSendFailureWithMessageID(deviceID, messageID, target, content, at)
 }
 
 func (r vowifiSMSHistoryRecorder) resolveIMSI(devID, fallbackIMSI string) string {
@@ -98,16 +98,31 @@ func (r vowifiSMSHistoryRecorder) RecordSent(e eventhost.SMSSent) error {
 		return nil
 	}
 	localPhone := r.localPhone(imsi)
-	return db.SaveSMSWithLocalPhone(imsi, localPhone, localPhone, strings.TrimSpace(e.TargetURI), e.Content, 2, 2, r.eventTime(e.Time))
+	return db.SaveVoWiFiSMSWithLocalPhone(strings.TrimSpace(e.MessageID), imsi, localPhone, localPhone, strings.TrimSpace(e.TargetURI), e.Content, 2, sentSMSHistoryStatus(e.DeliveryState), r.eventTime(e.Time))
+}
+
+func sentSMSHistoryStatus(deliveryState string) int {
+	switch strings.ToLower(strings.TrimSpace(deliveryState)) {
+	case "acked":
+		return 2
+	case "failed", "timeout":
+		return 3
+	default:
+		return 4
+	}
 }
 
 func (r vowifiSMSHistoryRecorder) RecordSendFailure(devID, target, content string, at time.Time) error {
+	return r.RecordSendFailureWithMessageID(devID, "", target, content, at)
+}
+
+func (r vowifiSMSHistoryRecorder) RecordSendFailureWithMessageID(devID, messageID, target, content string, at time.Time) error {
 	imsi := r.resolveIMSI(devID, "")
 	if imsi == "" {
 		return nil
 	}
 	localPhone := r.localPhone(imsi)
-	return db.SaveSMSWithLocalPhone(imsi, localPhone, localPhone, strings.TrimSpace(target), content, 2, 3, r.eventTime(at))
+	return db.SaveVoWiFiSMSWithLocalPhone(strings.TrimSpace(messageID), imsi, localPhone, localPhone, strings.TrimSpace(target), content, 2, 3, r.eventTime(at))
 }
 
 func (r vowifiSMSHistoryRecorder) RecordLocalNumberLearned(e eventhost.LocalNumberLearned) error {

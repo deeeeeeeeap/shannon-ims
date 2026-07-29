@@ -2,11 +2,13 @@ package device
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/1239t/vohive/internal/db"
 	"github.com/1239t/vowifi-go/runtimehost/eventhost"
+	"github.com/1239t/vowifi-go/runtimehost/messaging"
 )
 
 func TestVoWiFiSMSHistoryRecorderPersistsSentSMS(t *testing.T) {
@@ -19,11 +21,12 @@ func TestVoWiFiSMSHistoryRecorderPersistsSentSMS(t *testing.T) {
 
 	at := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
 	err := vowifiSMSHistoryRecorder{pool: p}.RecordSent(eventhost.SMSSent{
-		DevID:      "dev-1",
-		TargetURI:  "+10010",
-		Content:    "hello",
-		Time:       at,
-		TotalParts: 1,
+		DevID:         "dev-1",
+		TargetURI:     "+10010",
+		Content:       "hello",
+		Time:          at,
+		TotalParts:    1,
+		DeliveryState: "acked",
 	})
 	if err != nil {
 		t.Fatalf("RecordSent() error=%v", err)
@@ -35,6 +38,256 @@ func TestVoWiFiSMSHistoryRecorderPersistsSentSMS(t *testing.T) {
 	}
 	if sms.Sender != "+8613800000000" || sms.Recipient != "+10010" || sms.Content != "hello" || sms.Status != 2 {
 		t.Fatalf("sent sms=%+v", sms)
+	}
+}
+
+func TestVoWiFiSMSHistoryRecorderKeepsPendingSubmissionDistinctFromDelivered(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	p := NewPool(nil)
+	p.workers["dev-pending"] = &Worker{ID: "dev-pending", Backend: &workerPhoneBackendStub{imsi: "imsi-pending"}}
+
+	err := vowifiSMSHistoryRecorder{pool: p}.RecordSent(eventhost.SMSSent{
+		DevID:         "dev-pending",
+		TargetURI:     "+10010",
+		Content:       "pending submission",
+		Time:          time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC),
+		MessageID:     "synthetic-message",
+		TotalParts:    1,
+		DeliveryState: "pending",
+	})
+	if err != nil {
+		t.Fatalf("RecordSent() error=%v", err)
+	}
+
+	var sms db.SMS
+	if err := db.DB.Where("imsi = ? AND type = ?", "imsi-pending", 2).First(&sms).Error; err != nil {
+		t.Fatalf("First(pending sms) error=%v", err)
+	}
+	if sms.Status != 4 {
+		t.Fatalf("pending SMS status=%d, want 4", sms.Status)
+	}
+	if sms.MessageID != "synthetic-message" {
+		t.Fatalf("pending SMS message_id=%q, want delivery correlation", sms.MessageID)
+	}
+}
+
+func TestVoWiFiDeliveryReportUpdatesCorrelatedHistoryRow(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	p := NewPool(nil)
+	p.workers["dev-report"] = &Worker{ID: "dev-report", Backend: &workerPhoneBackendStub{imsi: "imsi-report"}}
+	at := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	const messageID = "synthetic-report-message"
+
+	if err := (vowifiSMSHistoryRecorder{pool: p}).RecordSent(eventhost.SMSSent{
+		DevID:         "dev-report",
+		TargetURI:     "+10010",
+		Content:       "pending submission",
+		Time:          at,
+		MessageID:     messageID,
+		TotalParts:    1,
+		DeliveryState: "pending",
+	}); err != nil {
+		t.Fatalf("RecordSent: %v", err)
+	}
+	if err := db.CreateSMSDelivery(messageID, "imsi-report", "dev-report", "+10010", "pending submission", 1, at); err != nil {
+		t.Fatalf("CreateSMSDelivery: %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart(messageID, 1, "", 42, db.SMSDeliveryPartStatePending, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart: %v", err)
+	}
+	match, err := (vowifiDeliveryStore{}).MarkSMSDeliveryPartReport("", "", "dev-report", 42, db.SMSDeliveryPartStateAcked, 200, 0, "", at.Add(time.Second))
+	if err != nil {
+		t.Fatalf("MarkSMSDeliveryPartReport: %v", err)
+	}
+	if match.CorrelationMethod != "rp_mr" {
+		t.Fatalf("correlation method = %q, want rp_mr", match.CorrelationMethod)
+	}
+
+	var sms db.SMS
+	if err := db.DB.Where("message_id = ?", messageID).First(&sms).Error; err != nil {
+		t.Fatalf("load correlated SMS: %v", err)
+	}
+	if sms.Status != 2 {
+		t.Fatalf("correlated SMS status=%d, want acknowledged status 2", sms.Status)
+	}
+}
+
+func TestVoWiFiDeliveryStoreFailsClosedOnAmbiguousRPMR(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	at := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	if err := db.CreateSMSDelivery("old-report", "synthetic-imsi", "dev-ambiguous", "+10010", "old", 1, at); err != nil {
+		t.Fatalf("CreateSMSDelivery(old): %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart("old-report", 1, "old-call", 42, db.SMSDeliveryPartStateAcked, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart(old): %v", err)
+	}
+	newAt := at.Add(30 * time.Second)
+	if err := db.CreateSMSDelivery("new-report", "synthetic-imsi", "dev-ambiguous", "+10010", "new", 1, newAt); err != nil {
+		t.Fatalf("CreateSMSDelivery(new): %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart("new-report", 1, "new-call", 42, db.SMSDeliveryPartStatePending, newAt); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart(new): %v", err)
+	}
+
+	_, err := (vowifiDeliveryStore{}).MarkSMSDeliveryPartReport("", "", "dev-ambiguous", 42, db.SMSDeliveryPartStateAcked, 200, 0, "", newAt.Add(time.Second))
+	if !errors.Is(err, messaging.ErrDeliveryNotFound) {
+		t.Fatalf("ambiguous adapter result = %v, want delivery not found", err)
+	}
+}
+
+func TestVoWiFiSMSHistoryRecorderReconcilesTerminalDeliveryAfterStalePendingEvent(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	p := NewPool(nil)
+	p.workers["dev-early-report"] = &Worker{ID: "dev-early-report", Backend: &workerPhoneBackendStub{imsi: "imsi-early-report"}}
+	at := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	const messageID = "synthetic-early-report"
+
+	if err := db.CreateSMSDelivery(messageID, "imsi-early-report", "dev-early-report", "+10010", "synthetic", 1, at); err != nil {
+		t.Fatalf("CreateSMSDelivery: %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart(messageID, 1, "", 41, db.SMSDeliveryPartStatePending, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart: %v", err)
+	}
+	if _, err := (vowifiDeliveryStore{}).MarkSMSDeliveryPartReport("", "", "dev-early-report", 41, db.SMSDeliveryPartStateAcked, 200, 0, "", at.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSMSDeliveryPartReport: %v", err)
+	}
+
+	// The runtime event may carry a stale pending snapshot if the report lands
+	// after its status read but before history publication. Persistence must
+	// reconcile against the authoritative delivery row instead of downgrading.
+	if err := (vowifiSMSHistoryRecorder{pool: p}).RecordSent(eventhost.SMSSent{
+		DevID:         "dev-early-report",
+		TargetURI:     "+10010",
+		Content:       "synthetic",
+		Time:          at,
+		MessageID:     messageID,
+		TotalParts:    1,
+		DeliveryState: "pending",
+	}); err != nil {
+		t.Fatalf("RecordSent: %v", err)
+	}
+
+	var sms db.SMS
+	if err := db.DB.Where("message_id = ?", messageID).First(&sms).Error; err != nil {
+		t.Fatalf("load correlated SMS: %v", err)
+	}
+	if sms.Status != 2 {
+		t.Fatalf("stale pending event downgraded terminal history status=%d, want 2", sms.Status)
+	}
+}
+
+func TestVoWiFiDeliveryReportUsesAggregateStateForMultipartHistory(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	p := NewPool(nil)
+	p.workers["dev-multipart"] = &Worker{ID: "dev-multipart", Backend: &workerPhoneBackendStub{imsi: "imsi-multipart"}}
+	at := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	const messageID = "synthetic-multipart-report"
+
+	if err := (vowifiSMSHistoryRecorder{pool: p}).RecordSent(eventhost.SMSSent{
+		DevID:         "dev-multipart",
+		TargetURI:     "+10010",
+		Content:       "synthetic multipart",
+		Time:          at,
+		MessageID:     messageID,
+		TotalParts:    2,
+		DeliveryState: "pending",
+	}); err != nil {
+		t.Fatalf("RecordSent: %v", err)
+	}
+	if err := db.CreateSMSDelivery(messageID, "imsi-multipart", "dev-multipart", "+10010", "synthetic multipart", 2, at); err != nil {
+		t.Fatalf("CreateSMSDelivery: %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart(messageID, 1, "", 51, db.SMSDeliveryPartStatePending, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart(part 1): %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart(messageID, 2, "", 52, db.SMSDeliveryPartStatePending, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart(part 2): %v", err)
+	}
+	store := vowifiDeliveryStore{}
+	if _, err := store.MarkSMSDeliveryPartReport("", "", "dev-multipart", 51, db.SMSDeliveryPartStateFailed, 200, 95, "", at.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSMSDeliveryPartReport(failed): %v", err)
+	}
+	if _, err := store.MarkSMSDeliveryPartReport("", "", "dev-multipart", 52, db.SMSDeliveryPartStateAcked, 200, 0, "", at.Add(2*time.Second)); err != nil {
+		t.Fatalf("MarkSMSDeliveryPartReport(acked): %v", err)
+	}
+
+	status, err := db.GetSMSDeliveryStatus(messageID)
+	if err != nil {
+		t.Fatalf("GetSMSDeliveryStatus: %v", err)
+	}
+	if status.State != db.SMSDeliveryStateFailed {
+		t.Fatalf("aggregate delivery state=%q, want failed", status.State)
+	}
+	var sms db.SMS
+	if err := db.DB.Where("message_id = ?", messageID).First(&sms).Error; err != nil {
+		t.Fatalf("load correlated SMS: %v", err)
+	}
+	if sms.Status != 3 {
+		t.Fatalf("multipart history status=%d after failure then ACK, want failed status 3", sms.Status)
+	}
+}
+
+func TestConcurrentMultipartReportsConvergeHistoryToAggregateFailure(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	p := NewPool(nil)
+	p.workers["dev-concurrent"] = &Worker{ID: "dev-concurrent", Backend: &workerPhoneBackendStub{imsi: "imsi-concurrent"}}
+	at := time.Unix(1, 0).UTC()
+	const messageID = "synthetic-concurrent-report"
+
+	if err := (vowifiSMSHistoryRecorder{pool: p}).RecordSent(eventhost.SMSSent{
+		DevID:         "dev-concurrent",
+		TargetURI:     "+10010",
+		Content:       "synthetic concurrent",
+		Time:          at,
+		MessageID:     messageID,
+		TotalParts:    2,
+		DeliveryState: "pending",
+	}); err != nil {
+		t.Fatalf("RecordSent: %v", err)
+	}
+	if err := db.CreateSMSDelivery(messageID, "imsi-concurrent", "dev-concurrent", "+10010", "synthetic concurrent", 2, at); err != nil {
+		t.Fatalf("CreateSMSDelivery: %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart(messageID, 1, "", 61, db.SMSDeliveryPartStatePending, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart(part 1): %v", err)
+	}
+	if err := db.UpsertSMSDeliveryPart(messageID, 2, "", 62, db.SMSDeliveryPartStatePending, at); err != nil {
+		t.Fatalf("UpsertSMSDeliveryPart(part 2): %v", err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	store := vowifiDeliveryStore{}
+	go func() {
+		<-start
+		_, err := store.MarkSMSDeliveryPartReport("", "", "dev-concurrent", 61, db.SMSDeliveryPartStateAcked, 200, 0, "", at.Add(time.Second))
+		results <- err
+	}()
+	go func() {
+		<-start
+		_, err := store.MarkSMSDeliveryPartReport("", "", "dev-concurrent", 62, db.SMSDeliveryPartStateFailed, 200, 95, "", at.Add(time.Second))
+		results <- err
+	}()
+	close(start)
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := <-results; err != nil {
+			t.Fatalf("MarkSMSDeliveryPartReport: %v", err)
+		}
+	}
+
+	status, err := db.GetSMSDeliveryStatus(messageID)
+	if err != nil {
+		t.Fatalf("GetSMSDeliveryStatus: %v", err)
+	}
+	if status.State != db.SMSDeliveryStateFailed {
+		t.Fatalf("aggregate delivery state=%q, want failed", status.State)
+	}
+	var sms db.SMS
+	if err := db.DB.Where("message_id = ?", messageID).First(&sms).Error; err != nil {
+		t.Fatalf("load correlated SMS: %v", err)
+	}
+	if sms.Status != 3 {
+		t.Fatalf("concurrent report history status=%d, want failed status 3", sms.Status)
 	}
 }
 
@@ -129,6 +382,31 @@ func TestVoWiFiSMSHistoryRecorderPersistsSendFailure(t *testing.T) {
 	}
 }
 
+func TestRecordVoWiFiSMSSendFailurePreservesTrackingMessageID(t *testing.T) {
+	initDevicePhoneNumberTestDB(t)
+	p := NewPool(nil)
+	p.workers["dev-tracked-fail"] = &Worker{ID: "dev-tracked-fail", Backend: &workerPhoneBackendStub{imsi: "imsi-tracked-fail"}}
+	at := time.Unix(1, 0).UTC()
+	const messageID = "synthetic-tracked-failure"
+	if err := db.CreateSMSDelivery(messageID, "imsi-tracked-fail", "dev-tracked-fail", "+10010", "synthetic", 1, at); err != nil {
+		t.Fatalf("CreateSMSDelivery: %v", err)
+	}
+	if err := db.UpdateSMSDeliveryState(messageID, db.SMSDeliveryStateFailed, "", 0, at); err != nil {
+		t.Fatalf("UpdateSMSDeliveryState: %v", err)
+	}
+
+	if err := RecordVoWiFiSMSSendFailure(p, "dev-tracked-fail", messageID, "+10010", "synthetic", at); err != nil {
+		t.Fatalf("RecordVoWiFiSMSSendFailure: %v", err)
+	}
+	var sms db.SMS
+	if err := db.DB.Where("message_id = ?", messageID).First(&sms).Error; err != nil {
+		t.Fatalf("load tracked failure history: %v", err)
+	}
+	if sms.Status != 3 {
+		t.Fatalf("tracked failure history status=%d, want 3", sms.Status)
+	}
+}
+
 func TestVoWiFiSMSHistoryRecorderPersistsLocalNumberLearned(t *testing.T) {
 	initDevicePhoneNumberTestDB(t)
 	p := NewPool(nil)
@@ -182,10 +460,11 @@ func TestVoWiFiRuntimeDispatcherPersistsSMSSentWithoutNotifier(t *testing.T) {
 	p.workers["dev-dispatch"] = &Worker{ID: "dev-dispatch", Backend: &workerPhoneBackendStub{imsi: "imsi-dispatch"}}
 
 	poolVoWiFiRuntimeDispatcher{pool: p}.Dispatch(context.Background(), eventhost.SMSSent{
-		DevID:     "dev-dispatch",
-		TargetURI: "+10010",
-		Content:   "sent through dispatcher",
-		Time:      time.Now(),
+		DevID:         "dev-dispatch",
+		TargetURI:     "+10010",
+		Content:       "sent through dispatcher",
+		Time:          time.Now(),
+		DeliveryState: "acked",
 	})
 
 	var count int64

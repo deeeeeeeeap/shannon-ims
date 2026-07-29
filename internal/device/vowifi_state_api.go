@@ -91,6 +91,7 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 		return messaging.SendOutcome{}, fmt.Errorf("设备 %s 未配置 SMSC，无法构建 RP-DATA", deviceID)
 	}
 
+	opts.RequestStatusReport = true
 	tpdus, _, err := smscodec.BuildSubmitTPDUsWithOptions(to, text, opts)
 	if err != nil {
 		return messaging.SendOutcome{}, fmt.Errorf("编码 SMS TPDU 失败: %w", err)
@@ -99,9 +100,17 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 	parts := make([]messaging.SMSPart, 0, len(tpdus))
 	for _, tpdu := range tpdus {
 		mr := nextRPMR()
+		if err := smscodec.SetSubmitMessageReference(tpdu, mr); err != nil {
+			return messaging.SendOutcome{}, fmt.Errorf("设置 SMS TP-MR 失败: %w", err)
+		}
+		body, err := smscodec.BuildRPDataStrict(mr, tpdu, smsc)
+		if err != nil {
+			return messaging.SendOutcome{}, fmt.Errorf("构建 RP-DATA 失败: %w", err)
+		}
 		parts = append(parts, messaging.SMSPart{
 			RPMR: mr,
-			Body: smscodec.BuildRPData(mr, tpdu, smsc),
+			TPMR: mr,
+			Body: body,
 		})
 	}
 

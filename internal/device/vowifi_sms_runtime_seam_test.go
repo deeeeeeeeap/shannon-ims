@@ -2,8 +2,10 @@ package device
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/pkg/smscodec"
 	"github.com/1239t/vowifi-go/runtimehost"
+	"github.com/1239t/vowifi-go/runtimehost/eventhost"
 	"github.com/1239t/vowifi-go/runtimehost/messaging"
 )
 
@@ -22,8 +25,11 @@ type poolSMSMessagingAdapter struct {
 	closeCalls      atomic.Int32
 	sending         atomic.Bool
 	closedWhileSend atomic.Bool
+	partsMu         sync.Mutex
+	parts           []messaging.SMSPart
 	sendStarted     chan struct{}
 	releaseSend     chan struct{}
+	sendErr         error
 }
 
 type poolSMSBarrierSMSCBackend struct {
@@ -42,8 +48,15 @@ func (b *poolSMSBarrierSMSCBackend) GetSMSC(ctx context.Context) (string, error)
 	}
 }
 
-func (a *poolSMSMessagingAdapter) SendSMS(context.Context, string, string, []messaging.SMSPart) (messaging.SendOutcome, error) {
+func (a *poolSMSMessagingAdapter) SendSMS(_ context.Context, _, _ string, parts []messaging.SMSPart) (messaging.SendOutcome, error) {
 	a.sendCalls.Add(1)
+	a.partsMu.Lock()
+	a.parts = make([]messaging.SMSPart, len(parts))
+	for i := range parts {
+		a.parts[i] = parts[i]
+		a.parts[i].Body = append([]byte(nil), parts[i].Body...)
+	}
+	a.partsMu.Unlock()
 	a.sending.Store(true)
 	defer a.sending.Store(false)
 	if a.sendStarted != nil {
@@ -52,7 +65,32 @@ func (a *poolSMSMessagingAdapter) SendSMS(context.Context, string, string, []mes
 	if a.releaseSend != nil {
 		<-a.releaseSend
 	}
-	return messaging.SendOutcome{MessageID: "synthetic"}, nil
+	return messaging.SendOutcome{MessageID: "synthetic", PartsTotal: 1, DeliveryState: "pending"}, a.sendErr
+}
+
+func (a *poolSMSMessagingAdapter) sentParts() []messaging.SMSPart {
+	a.partsMu.Lock()
+	defer a.partsMu.Unlock()
+	parts := make([]messaging.SMSPart, len(a.parts))
+	copy(parts, a.parts)
+	return parts
+}
+
+type poolSMSEventDispatcher struct {
+	mu     sync.Mutex
+	events []eventhost.Event
+}
+
+func (d *poolSMSEventDispatcher) Dispatch(_ context.Context, event eventhost.Event) {
+	d.mu.Lock()
+	d.events = append(d.events, event)
+	d.mu.Unlock()
+}
+
+func (d *poolSMSEventDispatcher) snapshot() []eventhost.Event {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]eventhost.Event(nil), d.events...)
 }
 
 func (*poolSMSMessagingAdapter) SendUSSD(context.Context, string) (*messaging.USSDResult, error) {
@@ -113,6 +151,7 @@ func newPoolSMSCallChain(t *testing.T, state runtimehost.State, adapter messagin
 		},
 	}
 	inst := &runtimehost.Instance{}
+	setRuntimeInstanceFieldForPoolSMSTest(t, inst, "deviceID", deviceID)
 	setRuntimeInstanceFieldForPoolSMSTest(t, inst, "state", state)
 	setRuntimeInstanceFieldForPoolSMSTest(t, inst, "svc", adapter)
 	pool.voWiFiRuntimeStore().SetInstance(deviceID, inst)
@@ -284,6 +323,8 @@ func TestPoolSendVoWiFiSMSStopWaitsForInFlightSend(t *testing.T) {
 func TestPoolSendVoWiFiSMSSuccessDispatchesExactlyOnce(t *testing.T) {
 	adapter := &poolSMSMessagingAdapter{}
 	pool, deviceID := newPoolSMSCallChain(t, runtimehost.State{SMSReady: true}, adapter)
+	dispatcher := &poolSMSEventDispatcher{}
+	setRuntimeInstanceFieldForPoolSMSTest(t, pool.voWiFiRuntimeStore().Instance(deviceID), "dispatch", eventhost.Dispatcher(dispatcher))
 
 	outcome, err := pool.SendVoWiFiSMSWithOptions(
 		context.Background(),
@@ -300,5 +341,119 @@ func TestPoolSendVoWiFiSMSSuccessDispatchesExactlyOnce(t *testing.T) {
 	}
 	if got := adapter.sendCalls.Load(); got != 1 {
 		t.Fatalf("messaging adapter calls=%d for successful send, want 1", got)
+	}
+	events := dispatcher.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("runtime events=%d for successful send, want 1", len(events))
+	}
+	sent, ok := events[0].(eventhost.SMSSent)
+	if !ok {
+		t.Fatalf("runtime event=%T, want SMSSent", events[0])
+	}
+	if sent.DevID != deviceID || sent.TargetURI != "55501" || sent.Content != "synthetic" ||
+		sent.MessageID != "synthetic" || sent.TotalParts != 1 || sent.DeliveryState != "pending" {
+		t.Fatalf("SMSSent metadata mismatch: device=%q parts=%d state=%q", sent.DevID, sent.TotalParts, sent.DeliveryState)
+	}
+}
+
+func TestPoolSendVoWiFiSMSRequestsStatusReportWithCorrelatableTPMR(t *testing.T) {
+	adapter := &poolSMSMessagingAdapter{}
+	pool, deviceID := newPoolSMSCallChain(t, runtimehost.State{SMSReady: true}, adapter)
+
+	if _, err := pool.SendVoWiFiSMSWithOptions(
+		context.Background(),
+		deviceID,
+		"55501",
+		"synthetic",
+		smscodec.SubmitOptions{},
+	); err != nil {
+		t.Fatalf("SendVoWiFiSMSWithOptions() error=%v", err)
+	}
+	parts := adapter.sentParts()
+	if len(parts) != 1 {
+		t.Fatalf("sent parts=%d, want 1", len(parts))
+	}
+	_, tpdu, err := smscodec.ParseRPData(parts[0].Body)
+	if err != nil {
+		t.Fatalf("ParseRPData: %v", err)
+	}
+	if len(tpdu) < 2 || tpdu[0]&0x20 == 0 {
+		t.Fatal("VoWiFi SMS-SUBMIT has TP-SRR=0")
+	}
+	if tpdu[1] != parts[0].RPMR || parts[0].TPMR != parts[0].RPMR {
+		t.Fatalf("message-reference correlation mismatch")
+	}
+}
+
+func TestPoolSendVoWiFiSMSRequestsStatusReportForEveryMultipartSegment(t *testing.T) {
+	adapter := &poolSMSMessagingAdapter{}
+	pool, deviceID := newPoolSMSCallChain(t, runtimehost.State{SMSReady: true}, adapter)
+	if _, err := pool.SendVoWiFiSMSWithOptions(
+		context.Background(), deviceID, "55501", strings.Repeat("a", 400), smscodec.SubmitOptions{},
+	); err != nil {
+		t.Fatalf("SendVoWiFiSMSWithOptions() error=%v", err)
+	}
+	parts := adapter.sentParts()
+	if len(parts) < 2 {
+		t.Fatalf("multipart SMS produced %d part(s)", len(parts))
+	}
+	seen := map[byte]bool{}
+	for _, part := range parts {
+		_, tpdu, err := smscodec.ParseRPData(part.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tpdu) < 2 || tpdu[0]&0x20 == 0 || tpdu[1] != part.TPMR || part.TPMR != part.RPMR {
+			t.Fatal("multipart status-report reference mismatch")
+		}
+		if seen[part.TPMR] {
+			t.Fatal("multipart segments reused TP-MR")
+		}
+		seen[part.TPMR] = true
+	}
+}
+
+func TestPoolSendVoWiFiSMSFailureDoesNotDispatchSentEvent(t *testing.T) {
+	adapter := &poolSMSMessagingAdapter{sendErr: errors.New("synthetic send failure")}
+	pool, deviceID := newPoolSMSCallChain(t, runtimehost.State{SMSReady: true}, adapter)
+	dispatcher := &poolSMSEventDispatcher{}
+	setRuntimeInstanceFieldForPoolSMSTest(t, pool.voWiFiRuntimeStore().Instance(deviceID), "dispatch", eventhost.Dispatcher(dispatcher))
+
+	if _, err := pool.SendVoWiFiSMSWithOptions(
+		context.Background(),
+		deviceID,
+		"55501",
+		"synthetic",
+		smscodec.SubmitOptions{},
+	); err == nil {
+		t.Fatal("SendVoWiFiSMSWithOptions() error=nil, want synthetic failure")
+	}
+	if got := adapter.sendCalls.Load(); got != 1 {
+		t.Fatalf("messaging adapter calls=%d for failed send, want 1", got)
+	}
+	if events := dispatcher.snapshot(); len(events) != 0 {
+		t.Fatalf("runtime events=%d for failed send, want 0", len(events))
+	}
+}
+
+func TestPoolSendVoWiFiSMSRejectsNonNumericRPServiceCentreBeforeAdapter(t *testing.T) {
+	adapter := &poolSMSMessagingAdapter{}
+	pool, deviceID := newPoolSMSCallChain(t, runtimehost.State{SMSReady: true}, adapter)
+	pool.workers[deviceID].Backend = &workerSMSCBackendStub{
+		workerStatusBackendStub: workerStatusBackendStub{mode: backend.BackendAT},
+		seq:                     []smscResult{{value: "sip:smsc@ims.example.invalid"}},
+	}
+
+	if _, err := pool.SendVoWiFiSMSWithOptions(
+		context.Background(),
+		deviceID,
+		"55501",
+		"synthetic",
+		smscodec.SubmitOptions{},
+	); err == nil {
+		t.Fatal("SendVoWiFiSMSWithOptions() accepted non-numeric RP service-centre address")
+	}
+	if got := adapter.sendCalls.Load(); got != 0 {
+		t.Fatalf("messaging adapter calls=%d for invalid RP service-centre address, want 0", got)
 	}
 }

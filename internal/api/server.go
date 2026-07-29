@@ -38,6 +38,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 type SMSWithDevice struct {
@@ -1277,6 +1278,38 @@ func (s *Server) handleStats(c *gin.Context) {
 	})
 }
 
+func smsSubmissionResponseMessage(deliveryState string) string {
+	switch strings.ToLower(strings.TrimSpace(deliveryState)) {
+	case "delivered":
+		return "短信状态报告已确认收件终端收到"
+	case "acked":
+		return "短信中心已确认提交（不代表收件人已收到）"
+	case "delivery_pending":
+		return "短信中心已确认提交，等待最终投递状态"
+	case "delivery_unconfirmed":
+		return "短信中心已完成处理，但未确认收件终端收到"
+	case "failed", "timeout":
+		return "短信发送失败"
+	default:
+		return "短信已提交，等待运营商回执"
+	}
+}
+
+func normalizeSMSDeliveryState(deliveryState, fallback string) string {
+	normalized := strings.ToLower(strings.TrimSpace(deliveryState))
+	switch normalized {
+	case "pending", "partial_ack", "acked", "delivery_pending", "delivery_unconfirmed", "delivered", "failed", "timeout":
+		return normalized
+	}
+	fallback = strings.ToLower(strings.TrimSpace(fallback))
+	switch fallback {
+	case "pending", "partial_ack", "acked", "delivery_pending", "delivery_unconfirmed", "delivered", "failed", "timeout":
+		return fallback
+	default:
+		return "pending"
+	}
+}
+
 func (s *Server) handleSendSMS(c *gin.Context) {
 	type SendSMSRequest struct {
 		DeviceID string `json:"device_id"`
@@ -1337,7 +1370,7 @@ func (s *Server) handleSendSMS(c *gin.Context) {
 	imsi = worker.GetIMSI()
 	messageID := ""
 	partsTotal := 1
-	deliveryState := "acked"
+	deliveryState := ""
 
 	if s.pool.IsVoWiFiActive(deviceID) {
 		// VoWiFi 模式下使用 IMS Core 发送；短信历史由宿主侧 runtime event / failure recorder 入库。
@@ -1345,12 +1378,14 @@ func (s *Server) handleSendSMS(c *gin.Context) {
 		if outcome.PartsTotal > 0 {
 			partsTotal = outcome.PartsTotal
 		}
-		if strings.TrimSpace(outcome.DeliveryState) != "" {
-			deliveryState = strings.TrimSpace(outcome.DeliveryState)
-		}
 		messageID = strings.TrimSpace(outcome.MessageID)
+		fallbackState := "pending"
 		if err != nil {
-			_ = device.RecordVoWiFiSMSSendFailure(s.pool, deviceID, req.Phone, req.Message, time.Now())
+			fallbackState = "failed"
+		}
+		deliveryState = normalizeSMSDeliveryState(outcome.DeliveryState, fallbackState)
+		if err != nil {
+			_ = device.RecordVoWiFiSMSSendFailure(s.pool, deviceID, messageID, req.Phone, req.Message, time.Now())
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"status":         "error",
 				"message":        "VoWiFi 短信发送失败: " + err.Error(),
@@ -1381,11 +1416,12 @@ func (s *Server) handleSendSMS(c *gin.Context) {
 		if imsi != "" {
 			_ = db.SaveSMS(imsi, worker.ID, req.Phone, req.Message, 2, 2, time.Now())
 		}
+		deliveryState = "acked"
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":         "ok",
-		"message":        "短信发送成功",
+		"message":        smsSubmissionResponseMessage(deliveryState),
 		"device":         deviceID,
 		"phone":          req.Phone,
 		"message_id":     messageID,
@@ -1400,20 +1436,25 @@ func (s *Server) handleSMSDelivery(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "message_id 不能为空"})
 		return
 	}
-	if s.pool == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "message": "服务未就绪"})
+	status, err := db.GetSMSDeliveryStatus(messageID)
+	if err == nil {
+		parts := make([]gin.H, 0, len(status.Parts))
+		for _, part := range status.Parts {
+			parts = append(parts, gin.H{
+				"state":    strings.TrimSpace(part.State),
+				"rp_cause": part.RPCause,
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "delivery": gin.H{
+			"state":       strings.TrimSpace(status.State),
+			"acks":        status.Acks,
+			"parts_total": status.PartsTotal,
+			"parts":       parts,
+		}})
 		return
 	}
-	services := s.pool.GetAllVoWiFiApps()
-	for _, svc := range services {
-		if svc == nil {
-			continue
-		}
-		status, err := svc.GetSMSDeliveryStatus(messageID)
-		if err != nil {
-			continue
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "delivery": status})
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "短信投递状态查询失败"})
 		return
 	}
 	c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "未找到对应短信投递记录"})
@@ -1463,23 +1504,25 @@ func (s *Server) handleVoWiFiSendSMS(c *gin.Context) {
 	// Encoding (TPDU/RP-DATA construction) happens inside
 	// SendVoWiFiSMSWithOptions, not here -- see its doc comment.
 	outcome, err := s.pool.SendVoWiFiSMSWithOptions(c.Request.Context(), deviceID, req.To, req.Text, smscodec.SubmitOptions{Encoding: encoding})
+	deliveryState := normalizeSMSDeliveryState(outcome.DeliveryState, "pending")
 	if err != nil {
+		deliveryState = normalizeSMSDeliveryState(outcome.DeliveryState, "failed")
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"status":         "error",
 			"message":        "发送失败: " + err.Error(),
 			"message_id":     strings.TrimSpace(outcome.MessageID),
 			"parts_total":    outcome.PartsTotal,
-			"delivery_state": strings.TrimSpace(outcome.DeliveryState),
+			"delivery_state": deliveryState,
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":         "ok",
-		"message":        "IMS 短信发送成功",
+		"message":        smsSubmissionResponseMessage(outcome.DeliveryState),
 		"message_id":     strings.TrimSpace(outcome.MessageID),
 		"parts_total":    outcome.PartsTotal,
-		"delivery_state": strings.TrimSpace(outcome.DeliveryState),
+		"delivery_state": deliveryState,
 	})
 }
 

@@ -23,11 +23,13 @@ func (SMSReceived) isEvent() {}
 
 // SMSSent is emitted when an outgoing SMS is submitted over IMS.
 type SMSSent struct {
-	DevID      string
-	TargetURI  string
-	Content    string
-	Time       time.Time
-	TotalParts int
+	DevID         string
+	TargetURI     string
+	Content       string
+	Time          time.Time
+	MessageID     string
+	TotalParts    int
+	DeliveryState string
 }
 
 func (SMSSent) isEvent() {}

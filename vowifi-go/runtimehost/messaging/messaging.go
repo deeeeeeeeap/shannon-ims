@@ -21,6 +21,10 @@ type SMSPart struct {
 	// RP-ACK/RP-ERROR's type/cause, not decode a full TPDU) doesn't have to
 	// re-parse it back out of encoded bytes.
 	RPMR byte
+	// TPMR is the SMS-SUBMIT TP-Message-Reference requested back in a later
+	// SMS-STATUS-REPORT. It is metadata only; Body remains the wire source of
+	// truth.
+	TPMR byte
 	// Body is the complete RP-DATA(SUBMIT) octet string for this part,
 	// exactly as it should appear in the SIP MESSAGE body
 	// (Content-Type: application/vnd.3gpp.sms).
@@ -37,9 +41,10 @@ type USSDResult struct{}
 // --- Delivery types ---
 
 type DeliveryPartMatch struct {
-	MessageID string
-	PartNo    int
-	State     string
+	MessageID         string
+	PartNo            int
+	State             string
+	CorrelationMethod string
 }
 
 type DeliveryPartStatus struct {
@@ -80,6 +85,14 @@ type DeliveryStore interface {
 	RecomputeSMSDelivery(messageID string, at time.Time) error
 	UpdateSMSDeliveryState(messageID, state, lastError string, acks int, at time.Time) error
 	GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error)
+}
+
+// StatusReportStore is the optional final-recipient-report extension to
+// DeliveryStore. The TP-MR and recipient come from the inner
+// SMS-STATUS-REPORT; the outer RP-MR belongs only to the new downlink RP
+// transaction and must never be used for correlation.
+type StatusReportStore interface {
+	MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient string, tpMR int, state string, tpStatus int, at time.Time) (DeliveryPartMatch, error)
 }
 
 type Service interface {
