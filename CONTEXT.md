@@ -2,7 +2,9 @@
 
 This context names the runtime ownership concepts that keep one modem, one SWu
 tunnel, one IMS registration, and one messaging path coherent. The terms are
-also the migration vocabulary for the owner-first architecture blueprint.
+the accepted vocabulary for the owner-first architecture. They describe domain
+Modules and do not require same-named Go types, packages, Interfaces, or
+wrappers.
 
 ## Language
 
@@ -53,6 +55,27 @@ _Avoid_: retry timer, auto-start goroutine
 - **StatePublication** accepts state only from the current **RuntimeAttempt** or its claimed **RuntimeInstance**.
 - **Reconcile** may request a new **RuntimeAttempt**, but device/card eligibility remains supplied by the device Adapter.
 - Device Worker generation, **RuntimeAttempt** identity, RuntimeInstance-private generation, and ProtectedChannel SA generation are distinct domains.
+
+## Current implementation map
+
+- **RuntimeAttempt** is implemented by `internal/vowifihost.Manager`, `Store`,
+  and `LifecycleController`; its concrete tokens remain lifecycle generation and
+  startup epoch rather than a new `RuntimeAttempt` struct.
+- **StatePublication** and **Reconcile** are implemented by the same host
+  `Store`/`Manager`. Runtime publication checks the current epoch and claimed
+  instance. `BroadcastState` carries no state and only tells subscribers to
+  reread device facts.
+- **CarrierBehavior** is the concrete typed policy in
+  `vowifi-go/internal/vowifi/policy` and is resolved once when a runtime starts.
+- **SWUSession** is the unexported `swuSessionLease` in
+  `vowifi-go/runtimehost`; the local swu-go `Session` remains its protocol
+  Adapter.
+- **ProtectedChannel** is implemented by `ProtectedChannelOwner`, its
+  generation-bound lease/handle, and private UDP/TCP Implementation in
+  `vowifi-go/internal/vowifi/ipsec3gpp`.
+- **MessagingCapability** is the stop-safe SMS/USSD Interface on
+  `vowifi-go/runtimehost.Instance`; production callers do not receive the raw
+  messaging Adapter.
 
 ## Example dialogue
 

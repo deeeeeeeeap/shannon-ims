@@ -179,7 +179,7 @@ Shannon IMS 的隐私边界体现在运行方式中，而不是要求使用者�
 
 ### 发布候选稳定性基线
 
-`v0.1.0-rc.1` 将当前协议实现收口为可持续验证的 RC 基线：根模块和 `vowifi-go` 全量测试/vet、关键并发模块 race、前端 lint/typecheck/build、隐私扫描、运行时脚本测试以及 Linux amd64 归档 smoke 都进入 push/PR CI。发布包同时包含 `release-manifest.env`、运行时 manifest、归档内 `SHA256SUMS` 和独立 `.sha256` 文件。
+`v0.1.0-rc.1` 将当前协议实现收口为可持续验证的 RC 基线：根模块、`vowifi-go` 与 `third_party/swu-go` 三个 Go Module 的全量测试/vet、关键并发模块 race、前端 lint/typecheck/build、隐私扫描、运行时脚本测试以及 Linux amd64 归档 smoke 都进入 push/PR CI。发布包同时包含 `release-manifest.env`、运行时 manifest、归档内 `SHA256SUMS` 和独立 `.sha256` 文件。
 
 本轮只收紧 SA 所有权、测试夹具、持续验证和发布归档，不改变已验证的 IMS-AKA、AUTS、3GPP IPsec、短信或 eSIM 协议行为。详见 [RELEASE_NOTES.md](RELEASE_NOTES.md) 和 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
 
@@ -290,6 +290,7 @@ bash scripts/verify-release-bundle.sh \
 | <code>internal/sim</code> | UICC APDU 与 AKA 适配 |
 | <code>internal/db</code> | SQLite 模型、投递状态与迁移 |
 | <code>vowifi-go</code> | SWu、IMS、IPsec、SIP 与 SMS 核心 |
+| <code>third_party/swu-go</code> | 本地维护的 IKE、Child SA 与 ESP 协议 Adapter |
 | <code>third_party/sipgo</code> | 项目使用的 SIP transport 扩展 |
 | <code>web</code> | Vue 3 管理界面 |
 | <code>scripts</code> | 构建、安装与仓库检查工具 |
@@ -358,7 +359,7 @@ Modem access
 
 ### Release candidate stability baseline
 
-`v0.1.0-rc.1` is the continuously verifiable RC baseline. Push and pull-request CI now runs full tests and vet for both Go modules, race tests for critical concurrency packages, frontend lint/typecheck/build, privacy and runtime contract checks, plus a Linux amd64 release-bundle smoke test. Every archive carries `release-manifest.env`, the runtime manifest, in-bundle `SHA256SUMS`, and a detached `.sha256` file.
+`v0.1.0-rc.1` is the continuously verifiable RC baseline. Push and pull-request CI now runs full tests and vet for all three Go modules (root, `vowifi-go`, and `third_party/swu-go`), race tests for critical concurrency packages, frontend lint/typecheck/build, privacy and runtime contract checks, plus a Linux amd64 release-bundle smoke test. Every archive carries `release-manifest.env`, the runtime manifest, in-bundle `SHA256SUMS`, and a detached `.sha256` file.
 
 This hardening round changes SA ownership, stale test fixtures, continuous verification, and release packaging only. It does not change the validated IMS-AKA, AUTS, 3GPP IPsec, SMS, or eSIM protocol behavior. See [RELEASE_NOTES.md](RELEASE_NOTES.md) and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
 
@@ -462,9 +463,16 @@ go vet ./...
 (cd vowifi-go && go test ./... -count=1)
 (cd vowifi-go && go vet ./...)
 
+(cd third_party/swu-go && go test ./... -count=1)
+(cd third_party/swu-go && go vet ./...)
+
 go test -race \
   ./internal/apduarbiter \
+  ./internal/config \
   ./internal/device \
+  ./internal/esim \
+  ./internal/modem \
+  ./internal/notify \
   ./internal/vowifihost \
   ./pkg/logger \
   -count=1
@@ -472,8 +480,16 @@ go test -race \
 (cd vowifi-go && go test -race \
   ./internal/vowifi/ipsec3gpp \
   ./internal/vowifi/imscore \
+  ./runtimehost \
   ./runtimehost/simauth \
   ./runtimehost/voiceclient \
+  -count=1)
+
+(cd third_party/swu-go && go test -race \
+  ./pkg/crypto \
+  ./pkg/ikev2 \
+  ./pkg/ipsec \
+  ./pkg/swu \
   -count=1)
 
 npm ci --prefix web

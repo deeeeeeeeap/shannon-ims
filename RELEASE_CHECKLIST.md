@@ -3,7 +3,7 @@
 ## 发布前 / Before release
 
 - [ ] `config/config.yaml`、运行数据库、日志、抓包和 session secret 不在仓库或归档中。 / Runtime config, databases, logs, captures, and session secrets are absent from the repository and archive.
-- [ ] 根模块与 `vowifi-go` 的 `go test ./...`、`go vet ./...` 全部通过。 / Full test and vet pass for both Go modules.
+- [ ] 根模块、`vowifi-go` 与 `third_party/swu-go` 的 `go test ./...`、`go vet ./...` 全部通过。 / Full test and vet pass for all three Go modules.
 - [ ] `.github/workflows/ci.yml` 中列出的关键模块 `-race` 零告警。 / Critical race suites in CI report no warnings.
 - [ ] 前端在 `package-lock.json` 下完成 `npm ci`、lint、typecheck 和 build。 / Frontend install, lint, typecheck, and build pass from the lockfile.
 - [ ] 隐私扫描、Python 合约测试和全部 `scripts/tests/*` 发布/运行时测试通过。 / Privacy, Python contracts, and release/runtime script tests pass.

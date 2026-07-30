@@ -7,6 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "binary-release.yml"
+README = ROOT / "README.md"
+RELEASE_CHECKLIST = ROOT / "RELEASE_CHECKLIST.md"
 
 
 def workflow_job(content: str, name: str) -> str:
@@ -61,6 +63,56 @@ class CIWorkflowContractTest(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, content)
         self.assertNotIn("-skip", content)
+
+    def test_local_swu_module_has_test_race_and_vet_gates(self) -> None:
+        swu_test_step = """      - name: SWu module tests
+        working-directory: third_party/swu-go
+        run: go test ./... -count=1"""
+        swu_vet_step = """      - name: SWu module vet
+        working-directory: third_party/swu-go
+        run: go vet ./..."""
+        swu_race_step = """      - name: SWu critical race tests
+        working-directory: third_party/swu-go
+        run: >-
+          go test -race
+          ./pkg/crypto
+          ./pkg/ikev2
+          ./pkg/ipsec
+          ./pkg/swu
+          -count=1"""
+
+        ci_content = WORKFLOW.read_text(encoding="utf-8")
+        ci_go = workflow_job(ci_content, "go")
+        ci_race = workflow_job(ci_content, "race")
+        self.assertIn(swu_test_step, ci_go)
+        self.assertIn(swu_vet_step, ci_go)
+        self.assertIn(swu_race_step, ci_race)
+        self.assertIn("third_party/swu-go/go.sum", ci_go)
+        self.assertIn("third_party/swu-go/go.sum", ci_race)
+
+        release_content = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        release_validate = workflow_job(release_content, "validate")
+        self.assertIn(swu_test_step, release_validate)
+        self.assertIn(swu_vet_step, release_validate)
+        self.assertIn(swu_race_step, release_validate)
+        self.assertIn("third_party/swu-go/go.sum", release_validate)
+
+    def test_documented_local_validation_includes_swu_module(self) -> None:
+        readme = README.read_text(encoding="utf-8")
+        for fragment in (
+            "(cd third_party/swu-go && go test ./... -count=1)",
+            "(cd third_party/swu-go && go vet ./...)",
+            "(cd third_party/swu-go && go test -race \\",
+        ):
+            with self.subTest(fragment=fragment):
+                if fragment not in readme:
+                    self.fail(f"README missing local validation command: {fragment}")
+
+        checklist = RELEASE_CHECKLIST.read_text(encoding="utf-8")
+        if "third_party/swu-go" not in checklist:
+            self.fail("release checklist does not name the local swu-go module")
+        if "all three Go modules" not in checklist:
+            self.fail("release checklist does not require all three Go modules")
 
     def test_clean_checkout_go_validation_uses_built_frontend_assets(self) -> None:
         ci_content = WORKFLOW.read_text(encoding="utf-8")
