@@ -83,24 +83,41 @@ type SMS struct {
 	ID         uint      `gorm:"primaryKey" json:"id"`
 	MessageID  string    `gorm:"column:message_id;index" json:"message_id"`
 	IMSI       string    `gorm:"column:imsi;index:idx_sms_imsi_peer_ts,priority:1;index:idx_sms_imsi_ts,priority:1" json:"imsi"`
-	ICCID      string    `gorm:"column:iccid;index" json:"iccid"`
-	Peer       string    `gorm:"column:peer;index:idx_sms_imsi_peer_ts,priority:2" json:"peer"`
+	// The ICCID path had only a single-column index, so the live thread query
+	// (WHERE iccid=? AND peer=? ORDER BY timestamp DESC) filtered on iccid alone and
+	// then sorted every message for that SIM in memory. The IMSI equivalent below
+	// already had its composite index; ICCID is what the code actually queries by
+	// now, and it was the one without.
+	// Two composite indexes, mirroring the pair the IMSI column already had:
+	//   idx_sms_iccid_peer_ts  -> one conversation  (GetSMSByICCIDAndPeer)
+	//   idx_sms_iccid_ts       -> all SMS for a SIM (GetSMSByICCID, db.go ~1055)
+	// The second is not redundant with the first: `peer` sits between iccid and
+	// timestamp there, so a query without a peer filter cannot use it to satisfy
+	// ORDER BY timestamp and sorted in memory (measured).
+	//
+	// The bare `index` on iccid stays: several queries filter on iccid with no
+	// ordering at all, and SQLite is free to pick the narrowest index for those.
+	ICCID      string    `gorm:"column:iccid;index;index:idx_sms_iccid_peer_ts,priority:1;index:idx_sms_iccid_ts,priority:1" json:"iccid"`
+	Peer       string    `gorm:"column:peer;index:idx_sms_imsi_peer_ts,priority:2;index:idx_sms_iccid_peer_ts,priority:2" json:"peer"`
 	LocalPhone string    `gorm:"column:local_phone;index" json:"local_phone"`
 	Sender     string    `json:"sender"`
 	Recipient  string    `json:"recipient"`
 	Content    string    `json:"content"`
 	Type       int       `json:"type"`   // 1: 接收, 2: 发送
 	Status     int       `json:"status"` // 0: 未读, 1: 已读, 2: 已确认, 3: 发送失败, 4: 已提交待回执
-	Timestamp  time.Time `gorm:"index:idx_sms_imsi_peer_ts,priority:3,sort:desc;index:idx_sms_ts,sort:desc;index:idx_sms_imsi_ts,priority:2,sort:desc" json:"timestamp"`
+	Timestamp  time.Time `gorm:"index:idx_sms_imsi_peer_ts,priority:3,sort:desc;index:idx_sms_ts,sort:desc;index:idx_sms_imsi_ts,priority:2,sort:desc;index:idx_sms_iccid_peer_ts,priority:3,sort:desc;index:idx_sms_iccid_ts,priority:2,sort:desc" json:"timestamp"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
 type SMSContact struct {
 	IMSI          string    `gorm:"column:imsi;primaryKey;index:idx_sms_contact_imsi_last_ts,priority:1" json:"imsi"`
-	ICCID         string    `gorm:"column:iccid;index" json:"iccid"`
+	// Same asymmetry as SMS: the IMSI column had a composite index with
+	// last_timestamp, the ICCID column did not, so the thread-list query sorted in
+	// memory. This is the query behind the SMS page's conversation list.
+	ICCID         string    `gorm:"column:iccid;index;index:idx_sms_contact_iccid_last_ts,priority:1" json:"iccid"`
 	Peer          string    `gorm:"column:peer;primaryKey" json:"peer"`
 	LastSMSID     uint      `gorm:"column:last_sms_id" json:"last_sms_id"`
-	LastTimestamp time.Time `gorm:"column:last_timestamp;index:idx_sms_contact_imsi_last_ts,priority:2,sort:desc;index:idx_sms_contact_last_ts,sort:desc" json:"last_timestamp"`
+	LastTimestamp time.Time `gorm:"column:last_timestamp;index:idx_sms_contact_imsi_last_ts,priority:2,sort:desc;index:idx_sms_contact_last_ts,sort:desc;index:idx_sms_contact_iccid_last_ts,priority:2,sort:desc" json:"last_timestamp"`
 	LastContent   string    `gorm:"column:last_content" json:"last_content"`
 	LastType      int       `gorm:"column:last_type" json:"last_type"`
 	UnreadCount   int       `gorm:"column:unread_count" json:"unread_count"`

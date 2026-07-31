@@ -10,9 +10,21 @@ import (
 
 type TrafficMinute struct {
 	ID           uint      `gorm:"primaryKey" json:"id"`
-	PeriodStart  time.Time `gorm:"not null;uniqueIndex:uk_traffic_minute,priority:1;index:idx_traffic_minute_ps" json:"period_start"`
-	Resource     string    `gorm:"not null;size:32;uniqueIndex:uk_traffic_minute,priority:2;index:idx_traffic_minute_res_tag_dir_ps,priority:1" json:"resource"`
-	Tag          string    `gorm:"not null;size:128;uniqueIndex:uk_traffic_minute,priority:3;index:idx_traffic_minute_res_tag_dir_ps,priority:2" json:"tag"`
+	// idx_tm_res_tag_ps exists alongside idx_traffic_minute_res_tag_dir_ps, not
+	// instead of it.
+	//
+	// Note the older index's name is misleading: despite the "_ps" suffix it covers
+	// only (resource, tag, direction) -- no period_start column was ever declared for
+	// it. So GetLatestMinuteDeltas, which filters on (resource, tag) and orders by
+	// period_start DESC, could use it to filter but always sorted the matches in
+	// memory (measured: USE TEMP B-TREE FOR ORDER BY).
+	//
+	// This index adds the ordering column. It is kept separate rather than appending
+	// period_start to the old one because `direction` would sit between tag and
+	// period_start there, which still cannot satisfy the ORDER BY.
+	PeriodStart  time.Time `gorm:"not null;uniqueIndex:uk_traffic_minute,priority:1;index:idx_traffic_minute_ps;index:idx_tm_res_tag_ps,priority:3,sort:desc" json:"period_start"`
+	Resource     string    `gorm:"not null;size:32;uniqueIndex:uk_traffic_minute,priority:2;index:idx_traffic_minute_res_tag_dir_ps,priority:1;index:idx_tm_res_tag_ps,priority:1" json:"resource"`
+	Tag          string    `gorm:"not null;size:128;uniqueIndex:uk_traffic_minute,priority:3;index:idx_traffic_minute_res_tag_dir_ps,priority:2;index:idx_tm_res_tag_ps,priority:2" json:"tag"`
 	Direction    bool      `gorm:"not null;uniqueIndex:uk_traffic_minute,priority:4;index:idx_traffic_minute_res_tag_dir_ps,priority:3" json:"direction"`
 	TrafficBytes int64     `gorm:"not null" json:"traffic_bytes"`
 	CreatedAt    time.Time `json:"created_at"`
@@ -22,9 +34,14 @@ type TrafficMinute struct {
 func (TrafficMinute) TableName() string { return "traffic_minute" }
 
 type TrafficHour struct {
-	ID           uint      `gorm:"primaryKey" json:"id"`
-	PeriodStart  time.Time `gorm:"not null;uniqueIndex:uk_traffic_hour,priority:1;index:idx_traffic_hour_ps" json:"period_start"`
-	Resource     string    `gorm:"not null;size:32;uniqueIndex:uk_traffic_hour,priority:2;index:idx_traffic_hour_res_tag_dir_ps,priority:1" json:"resource"`
+	ID uint `gorm:"primaryKey" json:"id"`
+	// idx_th_res_ps serves queryTrafficRollupRows: WHERE resource=? AND period_start
+	// BETWEEN ? AND ? ORDER BY period_start -- the dashboard's 60s traffic-analysis
+	// poll. The ..._res_tag_dir_ps index cannot help: it holds only
+	// (resource, tag, direction) despite its name, so SQLite filtered on resource
+	// alone and sorted the matches in memory (measured).
+	PeriodStart  time.Time `gorm:"not null;uniqueIndex:uk_traffic_hour,priority:1;index:idx_traffic_hour_ps;index:idx_th_res_ps,priority:2" json:"period_start"`
+	Resource     string    `gorm:"not null;size:32;uniqueIndex:uk_traffic_hour,priority:2;index:idx_traffic_hour_res_tag_dir_ps,priority:1;index:idx_th_res_ps,priority:1" json:"resource"`
 	Tag          string    `gorm:"not null;size:128;uniqueIndex:uk_traffic_hour,priority:3;index:idx_traffic_hour_res_tag_dir_ps,priority:2" json:"tag"`
 	Direction    bool      `gorm:"not null;uniqueIndex:uk_traffic_hour,priority:4;index:idx_traffic_hour_res_tag_dir_ps,priority:3" json:"direction"`
 	TrafficBytes int64     `gorm:"not null" json:"traffic_bytes"`
@@ -35,9 +52,10 @@ type TrafficHour struct {
 func (TrafficHour) TableName() string { return "traffic_hour" }
 
 type TrafficDay struct {
-	ID           uint      `gorm:"primaryKey" json:"id"`
-	PeriodStart  time.Time `gorm:"not null;uniqueIndex:uk_traffic_day,priority:1;index:idx_traffic_day_ps" json:"period_start"`
-	Resource     string    `gorm:"not null;size:32;uniqueIndex:uk_traffic_day,priority:2;index:idx_traffic_day_res_tag_dir_ps,priority:1" json:"resource"`
+	ID uint `gorm:"primaryKey" json:"id"`
+	// Same range-scan pattern as TrafficHour; this table serves the week/month ranges.
+	PeriodStart  time.Time `gorm:"not null;uniqueIndex:uk_traffic_day,priority:1;index:idx_traffic_day_ps;index:idx_td_res_ps,priority:2" json:"period_start"`
+	Resource     string    `gorm:"not null;size:32;uniqueIndex:uk_traffic_day,priority:2;index:idx_traffic_day_res_tag_dir_ps,priority:1;index:idx_td_res_ps,priority:1" json:"resource"`
 	Tag          string    `gorm:"not null;size:128;uniqueIndex:uk_traffic_day,priority:3;index:idx_traffic_day_res_tag_dir_ps,priority:2" json:"tag"`
 	Direction    bool      `gorm:"not null;uniqueIndex:uk_traffic_day,priority:4;index:idx_traffic_day_res_tag_dir_ps,priority:3" json:"direction"`
 	TrafficBytes int64     `gorm:"not null" json:"traffic_bytes"`
