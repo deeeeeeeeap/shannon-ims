@@ -137,7 +137,7 @@ watch(scanState, (next) => {
       <div class="bg-gray-50 dark:bg-white/5 rounded-lg p-4 mb-4 border border-gray-100 dark:border-white/5">
         <div class="flex justify-between items-center mb-2">
           <span class="font-medium text-gray-700 dark:text-gray-200">当前模式</span>
-          <span class="px-2 py-0.5 rounded text-xs font-medium"            :class="currentSelection?.mode === 'automatic' ? 'bg-blue-100 text-blue-700 dark:bg-blue-500/20 dark:text-blue-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300'">
+          <span class="px-2 py-0.5 rounded text-xs font-medium"            :class="currentSelection?.mode === 'automatic' ? 'bg-primary-100 text-primary-700 dark:bg-primary-500/20 dark:text-primary-300' : 'bg-warning-100 text-warning-700 dark:bg-warning-500/20 dark:text-warning-300'">
             {{ currentSelection?.mode === 'automatic' ? '自动' : '手动锁定' }}
           </span>
         </div>
@@ -157,7 +157,7 @@ watch(scanState, (next) => {
       </div>
 
       <div v-if="scanning || scanMessage || scanError" class="mb-4 rounded-lg border px-3 py-2 text-xs"
-        :class="scanError ? (scanRetryable ? 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300' : 'border-red-200 bg-red-50 text-red-700 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300') : 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300'">
+        :class="scanError ? (scanRetryable ? 'border-warning-200 bg-warning-50 text-warning-700 dark:border-warning-500/20 dark:bg-warning-500/10 dark:text-warning-300' : 'border-danger-200 bg-danger-50 text-danger-700 dark:border-danger-500/20 dark:bg-danger-500/10 dark:text-danger-300') : 'border-primary-200 bg-primary-50 text-primary-700 dark:border-primary-500/20 dark:bg-primary-500/10 dark:text-primary-300'">
         {{ scanError || scanMessage }}
       </div>
 
@@ -169,8 +169,8 @@ watch(scanState, (next) => {
           <div>
             <div class="font-medium text-gray-900 dark:text-white flex items-center gap-2">
               {{ c.operator_name || c.short_name || '未知网络' }}
-              <span v-if="c.status === 'current'" class="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 font-bold border border-emerald-200 dark:border-emerald-500/30">当前</span>
-              <span v-else-if="c.status === 'forbidden'" class="text-[10px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-300 font-bold border border-red-200 dark:border-red-500/30">禁用</span>
+              <span v-if="c.status === 'current'" class="text-[10px] px-1.5 py-0.5 rounded-full bg-success-100 text-success-700 dark:bg-success-500/20 dark:text-success-300 font-bold border border-success-200 dark:border-success-500/30">当前</span>
+              <span v-else-if="c.status === 'forbidden'" class="text-[10px] px-1.5 py-0.5 rounded-full bg-danger-100 text-danger-700 dark:bg-danger-500/20 dark:text-danger-300 font-bold border border-danger-200 dark:border-danger-500/30">禁用</span>
             </div>
             <div class="text-xs text-gray-500 dark:text-gray-400 font-mono mt-0.5">
               {{ c.plmn }} • {{ ratDisplay(c) }}
@@ -186,7 +186,7 @@ watch(scanState, (next) => {
       <div v-else-if="scanning" class="py-8 text-center text-gray-500 flex flex-col items-center justify-center space-y-3">
         <span>正在搜索周围网络，这可能需要 1-3 分钟...</span>
       </div>
-      <div v-else-if="scanRetryable" class="py-8 text-center text-amber-600 dark:text-amber-300 flex flex-col items-center justify-center space-y-3">
+      <div v-else-if="scanRetryable" class="py-8 text-center text-warning-600 dark:text-warning-300 flex flex-col items-center justify-center space-y-3">
         <span>{{ scanMessage || '扫描超时或模组忙，请稍后重试' }}</span>
       </div>
     </div>

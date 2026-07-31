@@ -143,7 +143,7 @@ async function onAirplaneToggle(rawVal: string | number | boolean) {
   <div>
     <!-- 标题行 -->
     <div class="flex items-center gap-3 mb-4">
-      <div class="w-10 h-10 rounded-xl bg-violet-50 dark:bg-violet-500/10 flex items-center justify-center text-violet-600 dark:text-violet-400">
+      <div class="w-10 h-10 rounded-xl bg-primary-50 dark:bg-primary-500/10 flex items-center justify-center text-primary-600 dark:text-primary-400">
         <el-icon size="22"><Sim24Regular /></el-icon>
       </div>
       <div>
@@ -158,7 +158,7 @@ async function onAirplaneToggle(rawVal: string | number | boolean) {
     </div>
 
     <!-- 离线提示（有 ICCID 但设备离线） -->
-    <div v-show="iccid && !deviceOnline" class="mb-3 px-3 py-2 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 text-xs text-yellow-700 dark:text-yellow-300">
+    <div v-show="iccid && !deviceOnline" class="mb-3 px-3 py-2 rounded-lg bg-warning-50 dark:bg-warning-900/20 text-xs text-warning-700 dark:text-warning-300">
       设备离线，策略仅展示，切换操作已禁用
     </div>
 
@@ -194,7 +194,7 @@ async function onAirplaneToggle(rawVal: string | number | boolean) {
         <!-- 开启网络 -->
         <div
           class="ui-panel-muted p-3 space-y-1"
-          :class="local.network_enabled ? 'border border-emerald-300 bg-emerald-50/50 dark:bg-emerald-900/20' : ''"
+          :class="local.network_enabled ? 'border border-success-300 bg-success-50/50 dark:bg-success-900/20' : ''"
         >
           <div class="flex items-center justify-between">
             <div>
@@ -238,7 +238,7 @@ async function onAirplaneToggle(rawVal: string | number | boolean) {
         <!-- 飞行模式 -->
         <div
           class="ui-panel-muted p-3 space-y-1"
-          :class="local.airplane_enabled ? 'border border-sky-300 bg-sky-50/50 dark:bg-sky-900/20' : ''"
+          :class="local.airplane_enabled ? 'border border-primary-300 bg-primary-50/50 dark:bg-primary-900/20' : ''"
         >
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2">

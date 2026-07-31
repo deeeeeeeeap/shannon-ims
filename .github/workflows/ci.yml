@@ -115,7 +115,7 @@ jobs:
           -count=1
 
   frontend:
-    name: Frontend lint, typecheck, and build
+    name: Frontend lint, typecheck, test, and build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -136,6 +136,9 @@ jobs:
 
       - name: Typecheck frontend
         run: npm run typecheck --prefix web
+
+      - name: Frontend contract and security tests
+        run: npm test --prefix web
 
       - name: Build frontend
         run: npm run build --prefix web

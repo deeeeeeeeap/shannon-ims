@@ -41,3 +41,16 @@ declare module '*.css' {
   const content: string
   export default content
 }
+
+// echarts 6 ships no type declarations for its per-module subpaths, only for the
+// 'echarts/charts' and 'echarts/components' buckets. TrafficAnalysisPanel imports
+// the subpaths instead because the buckets bundle every chart type and component
+// (measured: 746 KB / 47% larger).
+//
+// These modules export nothing — each registers itself by calling use(install) on
+// import — so an empty declaration is the accurate shape, not a placeholder.
+declare module 'echarts/lib/chart/line'
+declare module 'echarts/lib/component/grid'
+declare module 'echarts/lib/component/tooltip'
+declare module 'echarts/lib/component/legend'
+declare module 'echarts/lib/component/dataZoom'

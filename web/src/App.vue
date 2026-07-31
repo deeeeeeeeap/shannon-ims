@@ -38,7 +38,7 @@ const shell = computed(() =>
 </script>
 
 <template>
-  <div class="h-screen w-screen overflow-hidden bg-gray-50 dark:bg-[#101014] text-gray-900 dark:text-gray-100 font-sans selection:bg-indigo-500 selection:text-white transition-colors duration-300">
+  <div class="h-screen w-screen overflow-hidden bg-gray-50 dark:bg-[#101014] text-gray-900 dark:text-gray-100 font-sans selection:bg-primary-500 selection:text-white transition-colors duration-300">
     <Suspense>
       <template #default>
         <component :is="shell" :is-dark="isDark" @toggle-theme="toggleTheme" />
@@ -52,7 +52,9 @@ const shell = computed(() =>
 </template>
 
 <style>
-/* Custom Scrollbar */
+/* Custom scrollbar. The thumb colours come from --ui-scrollbar-* (style.css) so
+   the light/dark pair is declared with the other surface tokens rather than as a
+   second theme fork here. */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -61,16 +63,10 @@ const shell = computed(() =>
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: var(--ui-scrollbar-thumb);
   border-radius: 4px;
 }
-.dark ::-webkit-scrollbar-thumb {
-  background: #334155;
-}
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
-}
-.dark ::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+  background: var(--ui-scrollbar-thumb-hover);
 }
 </style>

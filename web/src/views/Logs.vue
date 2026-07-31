@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import PageHeader from '../components/PageHeader.vue'
+import StatusLight from '../components/StatusLight.vue'
 import { ArrowDownload24Regular, Delete24Regular, Pause24Regular, Play24Regular } from '@vicons/fluent'
 import { useLogsStore } from '../stores/logs'
 import { useEventStream } from '../composables/useEventStream'
@@ -113,14 +114,21 @@ function exportLogs() {
 }
 
 // 日志级别颜色
+// Level colours are tuned for the near-black log surface below, which is why they
+// are 300/400 stops rather than the 500s used elsewhere: a 500 on #000 sits at the
+// low end of comfortable contrast, and this pane is read for minutes at a time.
+//
+// error and fatal deliberately differ by weight and background, not just by one
+// step of red -- two adjacent red stops are nearly indistinguishable in a scrolling
+// stream, and telling them apart is the point.
 function getLevelClass(level: string): string {
   switch (level.toLowerCase()) {
-    case 'debug': return 'text-purple-500'
-    case 'info': return 'text-blue-500'
-    case 'warn': return 'text-yellow-500'
-    case 'error': return 'text-red-500'
-    case 'fatal': return 'text-red-600 font-bold'
-    default: return 'text-gray-500'
+    case 'debug': return 'text-violet-300'
+    case 'info': return 'text-sky-300'
+    case 'warn': return 'text-amber-300'
+    case 'error': return 'text-red-400 font-bold'
+    case 'fatal': return 'text-red-200 font-bold bg-red-900/50 rounded px-1'
+    default: return 'text-gray-400'
   }
 }
 
@@ -190,17 +198,23 @@ watch(levelFilter, () => {
     <!-- 连接状态 -->
     <div class="flex items-center gap-4 mb-4">
       <div class="flex items-center gap-2">
-        <span class="w-2 h-2 rounded-full" :class="connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'" />
+        <!-- Reuses StatusLight so the stream indicator matches every other status
+             dot. Not animated: a live stream is a steady state, and the previous
+             pulse-while-connected meant the one moment worth noticing -- the
+             connection dropping -- was signalled by motion STOPPING. -->
+        <StatusLight :tone="connected ? 'success' : 'danger'" size="md" :animated="false" />
         <span class="text-sm text-gray-500">{{ connected ? '已连接' : '未连接' }}</span>
       </div>
       <span class="text-sm text-gray-400">{{ logs.length }} 条日志</span>
-      <span v-if="!connected && lastConnectError" class="text-sm text-red-500 truncate" :title="lastConnectError">{{ lastConnectError }}</span>
+      <span v-if="!connected && lastConnectError" class="text-sm text-danger-600 dark:text-danger-400 truncate" :title="lastConnectError">{{ lastConnectError }}</span>
       <div class="flex-1" />
       <el-checkbox v-model="autoScroll" label="自动追尾" />
     </div>
 
+    <!-- Solid, not glass: this page is read continuously, and a translucent panel
+         over the page gradient costs contrast for no benefit here. -->
     <!-- 过滤器 -->
-    <div class="ui-card p-4 mb-4">
+    <div class="ui-panel-solid p-4 mb-4">
       <div class="flex flex-wrap items-center gap-4">
         <el-select v-model="levelFilter" placeholder="日志级别" class="w-32">
           <el-option label="全部" value="all" />
@@ -220,7 +234,7 @@ watch(levelFilter, () => {
     </div>
 
     <!-- 日志列表 -->
-    <div class="ui-card overflow-hidden">
+    <div class="ui-card-solid overflow-hidden">
       <div
         ref="logContainer"
         class="h-[60vh] overflow-auto font-mono text-sm bg-gray-900 dark:bg-black text-gray-100 p-4"
@@ -235,9 +249,12 @@ watch(levelFilter, () => {
         >
           <span class="text-gray-500">[{{ formatDateTime(log.time) }}]</span>
           <span class="font-bold ml-1 inline-block w-14" :class="getLevelClass(log.level)">{{ log.level.toUpperCase().padEnd(5) }}</span>
-          <span class="text-cyan-400 inline-block w-48 truncate align-bottom" :title="log.caller">{{ log.caller }}</span>
+          <!-- Caller is context, not the message: kept dim on purpose so the eye
+               lands on the text. Not the accent colour -- the accent marks things
+               you can act on, and this is a source location. -->
+          <span class="text-gray-500 inline-block w-48 truncate align-bottom" :title="log.caller">{{ log.caller }}</span>
           <span class="text-gray-100 ml-1">{{ log.message }}</span>
-          <span v-if="log.fields" class="text-amber-300/70 ml-1">{{ log.fields }}</span>
+          <span v-if="log.fields" class="text-gray-400 ml-1">{{ log.fields }}</span>
         </div>
       </div>
     </div>

@@ -3,11 +3,26 @@ import { createPinia } from 'pinia'
 import router from './router'
 import App from './App.vue'
 import { debugCollector } from './debug/collector'
-import 'element-plus/dist/index.css'
-// Element Plus: 暗色主题变量（全局需要）
+// Element Plus component styles are injected per component by ElementPlusResolver
+// (see vite.config.ts importStyle: 'css'), so the 341.8 KB full index.css is not
+// imported here. These two are global rather than per-component and still are:
+//   base.css      resets and shared tokens every component builds on
+//   css-vars.css  the dark-theme variable overrides
+import 'element-plus/theme-chalk/base.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
+
+// These three are called as functions (ElMessage 144x, ElMessageBox 19x, ElLoading
+// 2x) rather than written as tags, so the component resolver never sees them and
+// cannot inject their styles. Without these imports the toasts and confirm dialogs
+// render unstyled -- and only at the moment they appear, which is exactly the kind
+// of breakage a build check cannot catch.
+import 'element-plus/theme-chalk/el-message.css'
+import 'element-plus/theme-chalk/el-message-box.css'
+import 'element-plus/theme-chalk/el-loading.css'
+// el-overlay backs the message box's modal layer.
+import 'element-plus/theme-chalk/el-overlay.css'
+
 import './style.css'
-import { ElLoading } from 'element-plus'
 
 let bootFinished = false
 let bootErrorOverlay: HTMLDivElement | null = null
@@ -115,11 +130,6 @@ window.addEventListener('unhandledrejection', (e) => {
   }
 })
 
-function loadFonts() {
-  import('vfonts/FiraSans.css')
-  import('vfonts/FiraCode.css')
-}
-
 const app = createApp(App)
 
 app.config.errorHandler = (err) => {
@@ -129,9 +139,18 @@ app.config.errorHandler = (err) => {
   }
 }
 
+// No app.use(ElLoading) here.
+//
+// It registered the v-loading directive globally, and importing ElLoading from
+// 'element-plus' at module scope pulled the entire 757 KB library into the
+// first-paint bundle -- on a login screen that renders no el-* component at all.
+//
+// The directive is used in exactly one place (TrafficAnalysisPanel, itself lazily
+// loaded), and ElementPlusResolver already resolves `v-loading` automatically: see
+// the GlobalDirectives entry in src/components.d.ts, which the plugin generates.
+// So the registration was redundant and the import cost was the only effect.
 app.use(createPinia())
 app.use(router)
-app.use(ElLoading)
 
 router.onError((err) => {
   showBootError(err, { force: true })
@@ -139,10 +158,3 @@ router.onError((err) => {
 
 app.mount('#app')
 bootFinished = true
-
-if ('requestIdleCallback' in window) {
-  const win = window as Window & { requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number }
-  win.requestIdleCallback?.(loadFonts, { timeout: 2000 })
-} else {
-  setTimeout(loadFonts, 0)
-}

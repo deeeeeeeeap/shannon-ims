@@ -14,6 +14,7 @@ import ListSkeleton from '../components/ListSkeleton.vue'
 import RefreshButton from '../components/RefreshButton.vue'
 import type { DeviceMgmtListItem, SMSMessage } from '../types/api'
 import { Delete24Regular, Mail24Regular, Send24Regular } from '@vicons/fluent'
+import { smsDeliveryPresentation } from '../domain/smsDelivery'
 import { RecycleScroller } from 'vue-virtual-scroller'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
 
@@ -815,7 +816,10 @@ async function confirmDeleteThread(thread: SmsThread) {
       @retry="refreshAll"
     />
 
-    <div class="flex-1 ui-card overflow-hidden relative">
+    <!-- Solid surface: a conversation pane is read continuously, so translucency
+         over the page gradient costs text contrast for no benefit. It also removes a
+         per-frame blur behind a list that scrolls. -->
+    <div class="flex-1 ui-card-solid overflow-hidden relative">
       <div v-if="loading && threads.length === 0" class="absolute inset-0 z-20 flex items-center justify-center bg-white/50 dark:bg-black/20 backdrop-blur-sm">
         <el-icon class="is-loading" size="28"><Loading /></el-icon>
       </div>
@@ -832,7 +836,7 @@ async function confirmDeleteThread(thread: SmsThread) {
               type="button"
               class="w-full flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-left transition-all"
               :class="selectedDevice === d.id
-                ? 'border-indigo-200 dark:border-indigo-500/30 bg-indigo-50/70 dark:bg-indigo-500/10'
+                ? 'border-primary-200 dark:border-primary-500/30 bg-primary-50/70 dark:bg-primary-500/10'
                 : 'border-transparent hover:bg-gray-50/60 dark:hover:bg-white/5'"
               @click="void handleSelectDevice(d.id)"
             >
@@ -840,7 +844,7 @@ async function confirmDeleteThread(thread: SmsThread) {
                 <div class="text-sm font-bold text-gray-800 dark:text-gray-100 truncate">{{ d.label }}</div>
                 <div class="text-xs text-gray-400 truncate">{{ d.id === 'all' ? '汇总所有设备短信' : d.id }}</div>
               </div>
-              <span v-if="d.id !== 'all'" class="w-2 h-2 rounded-full" :class="d.healthy ? 'bg-green-500' : 'bg-red-500'" />
+              <span v-if="d.id !== 'all'" class="w-2 h-2 rounded-full" :class="d.healthy ? 'bg-success-500' : 'bg-danger-500'" />
             </button>
           </div>
         </div>
@@ -888,7 +892,7 @@ async function confirmDeleteThread(thread: SmsThread) {
                       <div class="min-w-0">
                         <div class="flex items-center gap-2">
                           <div class="font-extrabold text-gray-900 dark:text-white truncate">{{ t.peer }}</div>
-                          <span v-if="isUnread(t)" class="w-2 h-2 rounded-full bg-indigo-500" />
+                          <span v-if="isUnread(t)" class="w-2 h-2 rounded-full bg-primary-500" />
                         </div>
                         <div class="text-xs text-gray-500 dark:text-gray-400 truncate mt-1">{{ t.lastMessage }}</div>
                       </div>
@@ -986,10 +990,22 @@ async function confirmDeleteThread(thread: SmsThread) {
                         {{ m.device_name }}
                       </span>
                       <span class="text-[11px] text-gray-400 font-mono">{{ new Date(m.timestamp).toLocaleString() }}</span>
-                      <span v-if="m.type === 2 && m.status === 5" class="text-green-500 text-xs" title="状态报告已确认收件终端收到">✓</span>
-                      <span v-else-if="m.type === 2 && m.status === 2" class="text-blue-500 text-xs" title="短信中心已确认提交，不代表收件人已收到">↑</span>
-                      <span v-else-if="m.type === 2 && m.status === 3" class="text-red-500 text-xs" title="发送失败">✗</span>
-                      <span v-else-if="m.type === 2 && m.status === 4" class="text-amber-500 text-xs" title="已提交，等待运营商回执">…</span>
+                      <!-- Delivery state comes from domain/smsDelivery, the one place
+                           encoding that SMSC acceptance (↑) is NOT delivery (✓). It
+                           also supplies the accessible name: the two glyphs read as
+                           equally "done" at this size, and a bare `title` is
+                           surfaced inconsistently by screen readers.
+                           Bound once via v-for rather than called per attribute. -->
+                      <template v-for="d in [smsDeliveryPresentation(m.type, m.status)]" :key="d.kind">
+                        <span
+                          v-if="d.kind !== 'none'"
+                          class="text-xs"
+                          :class="d.toneClass"
+                          :title="d.description"
+                          role="img"
+                          :aria-label="d.description"
+                        >{{ d.glyph }}</span>
+                      </template>
                       <el-button
                         v-if="!isNarrowLayout && (m.type !== 2 || !m.device_name)"
                         text
@@ -1008,7 +1024,7 @@ async function confirmDeleteThread(thread: SmsThread) {
                       class="px-5 py-4 rounded-2xl text-sm leading-[1.75] shadow-sm border"
                       :class="m.type === 1
                         ? 'bg-white/90 dark:bg-white/5 text-gray-700 dark:text-gray-200 border-gray-100 dark:border-white/10'
-                        : 'bg-indigo-50 dark:bg-indigo-500/10 text-gray-800 dark:text-gray-100 border-indigo-100 dark:border-indigo-500/20'"
+                        : 'bg-primary-50 dark:bg-primary-500/10 text-gray-800 dark:text-gray-100 border-primary-100 dark:border-primary-500/20'"
                     >
                       {{ m.content }}
                     </div>

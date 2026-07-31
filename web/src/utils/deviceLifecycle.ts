@@ -50,6 +50,17 @@ export function lifecycleStatusLabel(phase?: DeviceLifecyclePhase) {
   }
 }
 
+/**
+ * Collapses the nine lifecycle phases into one label plus a tone.
+ *
+ * `animated` means "this state is in motion, keep watching" -- transitional phases
+ * only. Steady states, online and offline alike, do not pulse.
+ *
+ * The steady online case used to return `animated: true`, which made every healthy
+ * device in a list pulse forever. That is the opposite of what a pulse is for: with
+ * everything blinking there was no idle baseline for a real transition to stand out
+ * against, and a rebooting device looked the same as a working one.
+ */
 export function primaryLifecycleStatus(device: DeviceLike | null | undefined) {
   const phase = device?.lifecycle_phase
   if (isRecoveryPhase(phase)) {
@@ -64,5 +75,5 @@ export function primaryLifecycleStatus(device: DeviceLike | null | undefined) {
   if (!isControlOnline(device)) {
     return { label: '恢复中', tag: 'warning' as const, tone: 'warning' as const, animated: true }
   }
-  return { label: '在线', tag: 'success' as const, tone: 'success' as const, animated: true }
+  return { label: '在线', tag: 'success' as const, tone: 'success' as const, animated: false }
 }

@@ -2,6 +2,7 @@
 import { computed, ref, shallowRef, watchEffect } from 'vue'
 import ErrorState from './ErrorState.vue'
 import RefreshButton from './RefreshButton.vue'
+import { useColorScheme } from '../composables/useColorScheme'
 import type { AppError } from '../types/domain'
 import type { TrafficAnalysis, TrafficRange } from '../services/traffic'
 
@@ -19,17 +20,6 @@ type EChartsCoreModule = {
 
 type EChartsRendererModule = {
   CanvasRenderer?: unknown
-}
-
-type EChartsChartsModule = {
-  LineChart?: unknown
-}
-
-type EChartsComponentsModule = {
-  GridComponent?: unknown
-  TooltipComponent?: unknown
-  LegendComponent?: unknown
-  DataZoomComponent?: unknown
 }
 
 type VueEChartsModule = {
@@ -93,26 +83,30 @@ async function ensureChartLoaded() {
       chartLoading.value = true
       chartLoadError.value = null
       chartInitPromise = (async () => {
-        const [core, renderers, charts, comps, vueEcharts] = await Promise.all([
+        // Per-module subpaths, not the 'echarts/charts' / 'echarts/components'
+        // buckets. The buckets pull in every chart type and every component;
+        // this panel needs exactly one chart and four components, and a measured
+        // build of both shapes put the bucket form 746 KB (47%) larger.
+        //
+        // These five subpaths are SELF-REGISTERING: each calls use(install)
+        // internally on import, which is why they are side-effect imports and
+        // are absent from the core.use([...]) call below. Only the renderer
+        // still has to be registered by hand, because echarts 6 exposes no
+        // per-renderer subpath in its exports map.
+        const [core, renderers, vueEcharts] = await Promise.all([
           import('echarts/core'),
           import('echarts/renderers'),
-          import('echarts/charts'),
-          import('echarts/components'),
-          import('vue-echarts')
+          import('vue-echarts'),
+          import('echarts/lib/chart/line'),
+          import('echarts/lib/component/grid'),
+          import('echarts/lib/component/tooltip'),
+          import('echarts/lib/component/legend'),
+          import('echarts/lib/component/dataZoom')
         ])
         const coreMod = core as unknown as EChartsCoreModule
         const rendererMod = renderers as unknown as EChartsRendererModule
-        const chartMod = charts as unknown as EChartsChartsModule
-        const compMod = comps as unknown as EChartsComponentsModule
         const vueEchartsMod = vueEcharts as unknown as VueEChartsModule
-        coreMod.use([
-          rendererMod.CanvasRenderer,
-          chartMod.LineChart,
-          compMod.GridComponent,
-          compMod.TooltipComponent,
-          compMod.LegendComponent,
-          compMod.DataZoomComponent
-        ])
+        coreMod.use([rendererMod.CanvasRenderer])
         VChartComp.value = vueEchartsMod.default
       })()
     }
@@ -212,6 +206,31 @@ const panelClass = computed(() => (
     : 'ui-card p-6 overflow-hidden'
 ))
 
+const { isDark } = useColorScheme()
+
+// ECharts draws to a canvas, so it cannot read the --ui-* variables or respond to
+// the `dark:` utilities the rest of the panel uses -- the axis and label colours
+// have to be passed in as literals.
+//
+// Previously one set of literals served both themes, and they were picked for the
+// dark background: gray-600 axes and gray-700 gridlines over white read as heavy,
+// and the gray-400 legend text fell short of comfortable contrast on white. These
+// two sets fix that by tracking the theme instead.
+const chartColors = computed(() => (isDark.value
+  ? {
+      axisLine: '#4b5563',
+      splitLine: '#374151',
+      legendText: '#9ca3af',
+      tooltipCrossLabel: '#6a7985',
+    }
+  : {
+      axisLine: '#cbd5e1',
+      splitLine: '#e2e8f0',
+      legendText: '#4b5563',
+      tooltipCrossLabel: '#64748b',
+    }
+))
+
 const chartOption = computed(() => {
   const snapshot = chartSeriesSnapshot.value
   if (!snapshot || !hasChartData.value) return null
@@ -220,11 +239,13 @@ const chartOption = computed(() => {
   const maxBytes = Math.max(0, ...totalBytesByTs)
   const unit = pickUnit(maxBytes)
 
+  const colors = chartColors.value
+
   if (props.mode === 'device') {
     return {
       tooltip: {
         trigger: 'axis',
-        axisPointer: { type: 'cross', label: { backgroundColor: '#6a7985' } },
+        axisPointer: { type: 'cross', label: { backgroundColor: colors.tooltipCrossLabel } },
         formatter: (params: unknown) => {
           const list: TooltipParam[] = Array.isArray(params)
             ? params.filter((item): item is TooltipParam => !!item && typeof item === 'object')
@@ -251,15 +272,15 @@ const chartOption = computed(() => {
           type: 'category',
           boundaryGap: false,
           data: timestamps,
-          axisLine: { lineStyle: { color: '#4b5563' } }
+          axisLine: { lineStyle: { color: colors.axisLine } }
         }
       ],
       yAxis: [
         {
           type: 'value',
           name: `流量 (${unit.label})`,
-          splitLine: { lineStyle: { color: '#374151', type: 'dashed', opacity: 0.3 } },
-          axisLine: { lineStyle: { color: '#4b5563' } }
+          splitLine: { lineStyle: { color: colors.splitLine, type: 'dashed', opacity: 0.3 } },
+          axisLine: { lineStyle: { color: colors.axisLine } }
         }
       ],
       dataZoom: [
@@ -308,7 +329,7 @@ const chartOption = computed(() => {
   return {
     tooltip: {
       trigger: 'axis',
-      axisPointer: { type: 'cross', label: { backgroundColor: '#6a7985' } },
+      axisPointer: { type: 'cross', label: { backgroundColor: colors.tooltipCrossLabel } },
       formatter: (params: unknown) => {
         const list: TooltipParam[] = Array.isArray(params)
           ? params.filter((item): item is TooltipParam => !!item && typeof item === 'object')
@@ -349,7 +370,7 @@ const chartOption = computed(() => {
     legend: {
       type: 'scroll',
       data: ['总流量', ...devices],
-      textStyle: { color: '#9ca3af' },
+      textStyle: { color: colors.legendText },
       top: 0,
       left: 10,
       right: 10,
@@ -367,15 +388,15 @@ const chartOption = computed(() => {
         type: 'category',
         boundaryGap: false,
         data: timestamps,
-        axisLine: { lineStyle: { color: '#4b5563' } }
+        axisLine: { lineStyle: { color: colors.axisLine } }
       }
     ],
     yAxis: [
       {
         type: 'value',
         name: `流量 (${unit.label})`,
-        splitLine: { lineStyle: { color: '#374151', type: 'dashed', opacity: 0.3 } },
-        axisLine: { lineStyle: { color: '#4b5563' } }
+        splitLine: { lineStyle: { color: colors.splitLine, type: 'dashed', opacity: 0.3 } },
+        axisLine: { lineStyle: { color: colors.axisLine } }
       }
     ],
     dataZoom: [

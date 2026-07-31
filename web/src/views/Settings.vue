@@ -324,9 +324,9 @@ onBeforeUnmount(() => {
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
       <!-- Security Card -->
       <div class="ui-card p-8 relative overflow-hidden group">
-         <div class="absolute top-0 right-0 w-40 h-40 bg-indigo-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>
+         <div class="absolute top-0 right-0 w-40 h-40 bg-primary-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>
          <div class="flex items-center gap-3 mb-6 relative z-10">
-            <div class="w-12 h-12 rounded-xl bg-indigo-50 dark:bg-indigo-500/10 flex items-center justify-center text-indigo-600 dark:text-indigo-400">
+            <div class="w-12 h-12 rounded-xl bg-primary-50 dark:bg-primary-500/10 flex items-center justify-center text-primary-600 dark:text-primary-400">
                <el-icon size="24"><Key24Regular /></el-icon>
             </div>
             <div>
@@ -359,10 +359,10 @@ onBeforeUnmount(() => {
 
       <!-- System Info Card -->
       <div class="ui-card p-8 relative overflow-hidden group">
-         <div class="absolute top-0 right-0 w-40 h-40 bg-green-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>
+         <div class="absolute top-0 right-0 w-40 h-40 bg-success-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>
 
          <div class="flex items-center gap-3 mb-6 relative z-10">
-            <div class="w-12 h-12 rounded-xl bg-green-50 dark:bg-green-500/10 flex items-center justify-center text-green-600 dark:text-green-400">
+            <div class="w-12 h-12 rounded-xl bg-success-50 dark:bg-success-500/10 flex items-center justify-center text-success-600 dark:text-success-400">
                <el-icon size="24"><Server24Regular /></el-icon>
             </div>
             <div>
@@ -382,22 +382,22 @@ onBeforeUnmount(() => {
                 </div>
               </FieldRow>
             </div>
-            <div v-if="updateInfo?.has_update" class="p-4 bg-amber-50 dark:bg-amber-500/10 rounded-lg border border-amber-200 dark:border-amber-500/20">
-               <div class="flex items-center gap-2 text-amber-800 dark:text-amber-200 mb-2 font-bold text-[13px]">
+            <div v-if="updateInfo?.has_update" class="p-4 bg-warning-50 dark:bg-warning-500/10 rounded-lg border border-warning-200 dark:border-warning-500/20">
+               <div class="flex items-center gap-2 text-warning-800 dark:text-warning-200 mb-2 font-bold text-[13px]">
                  <el-icon><Alert24Regular /></el-icon>发现新版本: {{ updateInfo.latest_version }}
                </div>
-               <div class="text-xs text-amber-700 dark:text-amber-300/80 mb-4 whitespace-pre-wrap max-h-32 overflow-y-auto pr-2 custom-scrollbar">
+               <div class="text-xs text-warning-700 dark:text-warning-300/80 mb-4 whitespace-pre-wrap max-h-32 overflow-y-auto pr-2 custom-scrollbar">
                  {{ updateInfo.release_note || '暂无更新说明' }}
                </div>
                <el-button type="warning" :loading="applyingUpdate" @click="doApplyUpdate" class="w-full !border-0">
                  立即更新并重启
                </el-button>
             </div>
-            <div v-else-if="updateInfo && !updateInfo.enabled" class="p-4 bg-blue-50 dark:bg-blue-500/10 rounded-lg border border-blue-200 dark:border-blue-500/20">
-               <div class="flex items-center gap-2 text-blue-800 dark:text-blue-200 mb-1 font-bold text-[13px]">
+            <div v-else-if="updateInfo && !updateInfo.enabled" class="p-4 bg-primary-50 dark:bg-primary-500/10 rounded-lg border border-primary-200 dark:border-primary-500/20">
+               <div class="flex items-center gap-2 text-primary-800 dark:text-primary-200 mb-1 font-bold text-[13px]">
                  自动更新已安全停用
                </div>
-               <div class="text-xs text-blue-700 dark:text-blue-300/80">
+               <div class="text-xs text-primary-700 dark:text-primary-300/80">
                  {{ updateInfo.reason || '请使用经过校验的 Shannon IMS Release 或部署包更新。' }}
                </div>
             </div>
@@ -414,7 +414,7 @@ onBeforeUnmount(() => {
               <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                 <div class="min-w-0">
                   <div class="flex items-center gap-3">
-                    <div class="w-9 h-9 rounded-xl bg-blue-50 dark:bg-blue-500/10 flex items-center justify-center text-blue-600 dark:text-blue-400">
+                    <div class="w-9 h-9 rounded-xl bg-primary-50 dark:bg-primary-500/10 flex items-center justify-center text-primary-600 dark:text-primary-400">
                       <el-icon size="18"><DocumentText24Regular /></el-icon>
                     </div>
                     <div>
@@ -439,11 +439,11 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="notify-card ui-card p-8 relative overflow-hidden group lg:col-span-2">
-         <div class="absolute top-0 right-0 w-40 h-40 bg-purple-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>
+         <div class="absolute top-0 right-0 w-40 h-40 bg-violet-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>
 
          <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6 relative z-10">
             <div class="flex items-center gap-3">
-               <div class="w-12 h-12 rounded-xl bg-purple-50 dark:bg-purple-500/10 flex items-center justify-center text-purple-600 dark:text-purple-400">
+               <div class="w-12 h-12 rounded-xl bg-violet-50 dark:bg-violet-500/10 flex items-center justify-center text-violet-600 dark:text-violet-400">
                   <el-icon size="24"><Alert24Regular /></el-icon>
                </div>
                <div>
@@ -523,10 +523,10 @@ onBeforeUnmount(() => {
                     <el-input v-model="feishuForm.chat_ids" :disabled="!feishuForm.enabled" placeholder="多个群组用英文逗号分隔" />
                     <div class="text-[10px] text-gray-400 mt-1">飞书群聊的 Chat ID (oc_xxxx)，可通过飞书开放平台 API 获取，支持逗号分隔多个群组。</div>
                   </div>
-                  <div class="p-3 rounded-xl bg-blue-50/50 dark:bg-blue-500/5 text-xs text-blue-600 dark:text-blue-400/80 leading-relaxed border border-blue-100/50 dark:border-blue-500/10">
+                  <div class="p-3 rounded-xl bg-primary-50/50 dark:bg-primary-500/5 text-xs text-primary-600 dark:text-primary-400/80 leading-relaxed border border-primary-100/50 dark:border-primary-500/10">
                     <strong>配置说明：</strong>
                     <ol class="list-decimal ml-4 mt-1 space-y-1">
-                      <li>在<a href="https://open.feishu.cn" target="_blank" class="underline hover:text-blue-700">飞书开放平台</a>创建自建应用，启用「机器人」能力</li>
+                      <li>在<a href="https://open.feishu.cn" target="_blank" class="underline hover:text-primary-700">飞书开放平台</a>创建自建应用，启用「机器人」能力</li>
                       <li>在「事件与回调 → 事件配置」中选择「使用长连接接收事件」</li>
                       <li>添加 <code>im:message</code> 和 <code>im:message:send_as_bot</code> 权限</li>
                     </ol>
@@ -564,9 +564,9 @@ onBeforeUnmount(() => {
                       <el-input v-model="qqForm.direct_ids" :disabled="!qqForm.enabled" placeholder="用户 OpenID，多个使用逗号分隔" />
                     </div>
                   </div>
-                  <div class="p-3 rounded-xl bg-amber-50/50 dark:bg-amber-500/5 text-xs text-amber-700 dark:text-amber-400/80 leading-relaxed border border-amber-100/50 dark:border-amber-500/10">
+                  <div class="p-3 rounded-xl bg-warning-50/50 dark:bg-warning-500/5 text-xs text-warning-700 dark:text-warning-400/80 leading-relaxed border border-warning-100/50 dark:border-warning-500/10">
                     <ol class="list-decimal ml-4 mt-1 space-y-1">
-                      <li>QQbot申请地址：<a href="https://q.qq.com/qqbot/openclaw/index.html" target="_blank" class="underline hover:text-amber-800">官方控制台</a></li>
+                      <li>QQbot申请地址：<a href="https://q.qq.com/qqbot/openclaw/index.html" target="_blank" class="underline hover:text-warning-800">官方控制台</a></li>
                       <li>向机器人发送消息后，去系统日志查看 OpenID，填入后 Bot 只对匹配的会话进行回复和推送。</li>
                     </ol>
                   </div>

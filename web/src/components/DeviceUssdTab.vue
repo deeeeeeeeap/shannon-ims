@@ -133,8 +133,8 @@ function clearHistory() {
       </div>
       <!-- 多轮会话状态指示 -->
       <div v-if="isMultiRound" class="flex items-center gap-2">
-        <span class="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800 px-2.5 py-1 rounded-full">
-          <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
+        <span class="inline-flex items-center gap-1.5 text-xs font-medium text-success-600 dark:text-success-400 bg-success-50 dark:bg-success-900/30 border border-success-200 dark:border-success-800 px-2.5 py-1 rounded-full">
+          <span class="w-1.5 h-1.5 bg-success-500 rounded-full animate-pulse"></span>
           多轮会话中
         </span>
         <el-button size="small" type="warning" plain @click="cancelSession" :disabled="sending">取消会话</el-button>
@@ -148,9 +148,9 @@ function clearHistory() {
       </div>
       <div v-for="(msg, i) in history" :key="i" class="flex w-full" :class="msg.type === 'req' ? 'justify-end' : 'justify-start'">
         <!-- 请求记录（右侧气泡） -->
-        <div v-if="msg.type === 'req'" class="max-w-[80%] bg-indigo-500 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm">
+        <div v-if="msg.type === 'req'" class="max-w-[80%] bg-primary-500 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm">
           <div class="text-sm break-words">{{ msg.content }}</div>
-          <div class="text-[10px] text-indigo-100 mt-1 text-right">{{ new Date(msg.ts).toLocaleTimeString() }}</div>
+          <div class="text-[10px] text-primary-100 mt-1 text-right">{{ new Date(msg.ts).toLocaleTimeString() }}</div>
         </div>
         <!-- 系统消息（居中） -->
         <div v-else-if="msg.type === 'sys'" class="w-full text-center">
@@ -158,7 +158,7 @@ function clearHistory() {
         </div>
 
         <!-- 响应/错误记录（左侧气泡） -->
-        <div v-else class="max-w-[80%] rounded-2xl rounded-tl-sm px-4 py-2.5 shadow-sm" :class="msg.type === 'err' ? 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border border-red-100 dark:border-red-900/50' : 'bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-white/5'">
+        <div v-else class="max-w-[80%] rounded-2xl rounded-tl-sm px-4 py-2.5 shadow-sm" :class="msg.type === 'err' ? 'bg-danger-50 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 border border-danger-100 dark:border-danger-900/50' : 'bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-white/5'">
           <div class="text-sm whitespace-pre-wrap break-words font-mono">{{ msg.content }}</div>
           <div class="text-[10px] mt-1 text-gray-400 flex items-center gap-2">
             <span>{{ new Date(msg.ts).toLocaleTimeString() }}</span>
@@ -171,9 +171,9 @@ function clearHistory() {
       <div v-if="sending" class="flex w-full justify-start mt-2">
         <div class="max-w-[80%] bg-white dark:bg-gray-800 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm border border-gray-100 dark:border-white/5 flex items-center gap-2">
           <div class="flex space-x-1">
-            <div class="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-            <div class="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-            <div class="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce"></div>
+            <div class="w-1.5 h-1.5 bg-primary-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+            <div class="w-1.5 h-1.5 bg-primary-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+            <div class="w-1.5 h-1.5 bg-primary-400 rounded-full animate-bounce"></div>
           </div>
           <span class="text-xs text-gray-400 ml-1">等待网络响应...</span>
         </div>

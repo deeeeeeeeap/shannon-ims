@@ -94,8 +94,8 @@ watch(
           type="button"
           class="w-full text-left p-3 rounded-xl border"
           :class="[
-            d.degraded ? 'border-amber-200 bg-amber-50 cursor-not-allowed opacity-85' : '',
-            !d.degraded && discoveryIdentity(addSelected) === discoveryIdentity(d) ? 'border-indigo-300 bg-indigo-50' : '',
+            d.degraded ? 'border-warning-200 bg-warning-50 cursor-not-allowed opacity-85' : '',
+            !d.degraded && discoveryIdentity(addSelected) === discoveryIdentity(d) ? 'border-primary-300 bg-primary-50' : '',
             !d.degraded && discoveryIdentity(addSelected) !== discoveryIdentity(d) ? 'border-gray-200 hover:bg-gray-50' : ''
           ]"
           :aria-disabled="!!d.degraded"
@@ -108,7 +108,7 @@ watch(
           <div class="text-xs text-gray-500 mt-0.5 truncate">
             {{ d.control_path }} · AT: {{ d.at_port || '--' }} · IMEI: {{ d.imei || '--' }} · USB: {{ d.usb_path || '--' }}
           </div>
-          <div v-if="d.degraded" class="text-xs text-amber-700 mt-1">
+          <div v-if="d.degraded" class="text-xs text-warning-700 mt-1">
             无法读取 IMEI（控制口可能挂死），暂不可添加。
           </div>
         </button>
@@ -128,7 +128,7 @@ watch(
           <el-tag v-if="isMBIMBackendOnly" size="small" type="success">仅 MBIM 后端</el-tag>
         </div>
       </div>
-      <div v-if="isQMIBackendOnly" class="text-xs text-emerald-700">
+      <div v-if="isQMIBackendOnly" class="text-xs text-success-700">
         此类 WWAN QMI 设备运行后端固定为 QMI；AT 口仍会保留给 AT 终端。
       </div>
     </div>

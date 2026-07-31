@@ -1,6 +1,47 @@
+/* Inter, self-hosted. This console manages local hardware over localhost, so a
+   webfont fetched from fonts.googleapis.com made first paint depend on internet
+   access and disclosed to a third party when the operator opened the page.
+   SIL Open Font License 1.1 -- see public/fonts/Inter-LICENSE.txt.
+
+   One variable file covers 100-900, so the 600 and 700 weights the UI uses are
+   real weights rather than a browser-synthesised smear. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/InterVariable.woff2') format('woff2');
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Element Plus ships a blue primary (#409eff). Left alone, an el-button and a
+   Tailwind `bg-primary-500` button sitting next to each other render as two
+   different accents. Overriding the --el-color-primary ramp here points both at
+   the same indigo, so the accent is defined once.
+   The light-* stops are what Element Plus uses for hover/disabled/plain fills,
+   so all five have to move together or those states fall back to blue. */
+:root {
+  --el-color-primary: #6366f1;
+  --el-color-primary-light-3: #8b8ff5;
+  --el-color-primary-light-5: #a5a8f8;
+  --el-color-primary-light-7: #c0c2fa;
+  --el-color-primary-light-8: #cdcffb;
+  --el-color-primary-light-9: #e7e8fd;
+  --el-color-primary-dark-2: #4f46e5;
+}
+
+html.dark {
+  --el-color-primary: #818cf8;
+  --el-color-primary-light-3: #6b76e8;
+  --el-color-primary-light-5: #565fd0;
+  --el-color-primary-light-7: #3f47a8;
+  --el-color-primary-light-8: #343b8f;
+  --el-color-primary-light-9: #292f75;
+  --el-color-primary-dark-2: #a5b4fc;
+}
 
 /* 修复 Tailwind preflight 对 button 背景的重置。
    仅作用于“实心按钮”，避免把 plain/text/link 按钮误刷成色块。 */
@@ -43,6 +84,27 @@ body {
   --ui-border: rgba(226, 232, 240, 0.9);
   --ui-border-muted: rgba(226, 232, 240, 0.55);
   --ui-backdrop: blur(18px);
+
+  /* Opaque surfaces for data-dense views (log streams, message lists, device
+     tables). The translucent surfaces above sit over the page gradient, which
+     costs text contrast -- acceptable on an overview card, not on a table the
+     operator reads for minutes at a time. Same shape as the glass variants so a
+     view can switch by class alone. */
+  --ui-surface-solid: #ffffff;
+  --ui-surface-solid-muted: #f8fafc;
+  --ui-border-solid: #e2e8f0;
+
+  /* Accent, tracking the Tailwind `primary` ramp (indigo). Exposed as variables
+     so plain CSS blocks and Element Plus overrides use the same value the
+     utility classes do, instead of re-hardcoding a hex. */
+  --ui-accent: #6366f1;
+  --ui-accent-strong: #4f46e5;
+  --ui-accent-soft: rgba(99, 102, 241, 0.12);
+  --ui-accent-ring: rgba(99, 102, 241, 0.18);
+  --ui-accent-contrast: #ffffff;
+
+  --ui-scrollbar-thumb: #cbd5e1;
+  --ui-scrollbar-thumb-hover: #94a3b8;
   --ui-radius-sm: 10px;
   --ui-radius-md: 14px;
   --ui-radius-lg: 16px;
@@ -52,8 +114,8 @@ body {
   --ui-shadow-lg: 0 18px 50px rgba(15, 23, 42, 0.14);
   --ui-btn-shadow: 0 2px 8px rgba(15, 23, 42, 0.08), 0 1px 3px rgba(15, 23, 42, 0.05);
   --ui-btn-shadow-hover: 0 4px 12px rgba(15, 23, 42, 0.11), 0 2px 5px rgba(15, 23, 42, 0.06);
-  --ui-btn-primary-shadow: 0 6px 16px rgba(37, 99, 235, 0.22), 0 2px 6px rgba(15, 23, 42, 0.08);
-  --ui-btn-primary-shadow-hover: 0 8px 20px rgba(37, 99, 235, 0.26), 0 3px 8px rgba(15, 23, 42, 0.10);
+  --ui-btn-primary-shadow: 0 6px 16px rgba(99, 102, 241, 0.22), 0 2px 6px rgba(15, 23, 42, 0.08);
+  --ui-btn-primary-shadow-hover: 0 8px 20px rgba(99, 102, 241, 0.26), 0 3px 8px rgba(15, 23, 42, 0.10);
 }
 
 html.dark {
@@ -62,8 +124,26 @@ html.dark {
   --ui-surface-muted: rgba(255, 255, 255, 0.05);
   --ui-border: rgba(255, 255, 255, 0.08);
   --ui-border-muted: rgba(255, 255, 255, 0.12);
-  --ui-btn-primary-shadow: 0 6px 16px rgba(59, 130, 246, 0.28), 0 2px 6px rgba(15, 23, 42, 0.18);
-  --ui-btn-primary-shadow-hover: 0 8px 20px rgba(59, 130, 246, 0.32), 0 3px 8px rgba(15, 23, 42, 0.22);
+
+  /* Not pure black: #16161c keeps a visible step between page background
+     (#101014, set in index.html) and an opaque panel sitting on it. */
+  --ui-surface-solid: #16161c;
+  --ui-surface-solid-muted: #1b1b22;
+  --ui-border-solid: rgba(255, 255, 255, 0.1);
+
+  /* Lifted one stop for dark backgrounds: indigo-500 on #101014 is too dim to
+     carry an active state. */
+  --ui-accent: #818cf8;
+  --ui-accent-strong: #a5b4fc;
+  --ui-accent-soft: rgba(129, 140, 248, 0.16);
+  --ui-accent-ring: rgba(129, 140, 248, 0.22);
+  --ui-accent-contrast: #1e1b4b;
+
+  --ui-scrollbar-thumb: #334155;
+  --ui-scrollbar-thumb-hover: #475569;
+
+  --ui-btn-primary-shadow: 0 6px 16px rgba(99, 102, 241, 0.28), 0 2px 6px rgba(15, 23, 42, 0.18);
+  --ui-btn-primary-shadow-hover: 0 8px 20px rgba(99, 102, 241, 0.32), 0 3px 8px rgba(15, 23, 42, 0.22);
 }
 
 .el-button:not(.is-text):not(.is-link) {
@@ -161,8 +241,56 @@ html.dark {
   box-shadow: var(--ui-shadow-sm);
 }
 
+/* Opaque counterparts of .ui-card / .ui-panel, for views where reading accuracy
+   beats depth: log streams, message lists, device tables. No backdrop-filter --
+   dropping it is the point, and it also removes a per-frame blur behind content
+   that scrolls. */
+.ui-card-solid {
+  background: var(--ui-surface-solid);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.ui-panel-solid {
+  background: var(--ui-surface-solid);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.ui-panel-solid-muted {
+  background: var(--ui-surface-solid-muted);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-lg);
+}
+
 .animate-pulse-slow {
   animation: pulse 8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Honour the OS "reduce motion" setting. This UI runs continuous animations --
+   the status dot pings on a loop and cards lift on hover -- which is exactly the
+   kind of sustained movement that setting exists to stop. Colour and layout are
+   untouched, so nothing becomes unreadable; only the movement stops.
+   Durations are 0.01ms rather than 0 so animationend/transitionend still fire and
+   any handler waiting on them does not hang. */
+@media (prefers-reduced-motion: reduce) {
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* The lift is the whole point of this class, so drop the transform outright
+     rather than making it instant. */
+  .ui-card-hover:hover {
+    transform: none;
+  }
 }
 
 @keyframes pulse {
@@ -181,14 +309,14 @@ html.dark {
 
 .el-menu {
   --el-menu-bg-color: transparent;
-  --el-menu-hover-bg-color: rgba(59, 130, 246, 0.08);
-  --el-menu-active-color: #2563eb;
+  --el-menu-hover-bg-color: var(--ui-accent-soft);
+  --el-menu-active-color: var(--ui-accent-strong);
   --el-menu-text-color: #334155;
 }
 
 .dark .el-menu {
-  --el-menu-hover-bg-color: rgba(99, 102, 241, 0.12);
-  --el-menu-active-color: #93c5fd;
+  --el-menu-hover-bg-color: var(--ui-accent-soft);
+  --el-menu-active-color: var(--ui-accent-strong);
   --el-menu-text-color: rgba(255, 255, 255, 0.72);
 }
 
@@ -200,11 +328,7 @@ html.dark {
 }
 
 .el-menu-item.is-active {
-  background: rgba(59, 130, 246, 0.12);
-}
-
-.dark .el-menu-item.is-active {
-  background: rgba(99, 102, 241, 0.16);
+  background: var(--ui-accent-soft);
 }
 
 .el-dialog.glass-modal {

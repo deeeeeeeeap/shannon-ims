@@ -76,7 +76,9 @@ const secondaryStatus = (d: DeviceMgmtListItem) => {
 </script>
 
 <template>
-  <div class="ui-card p-5">
+  <!-- Solid surface: this list is the working area of the device page, scanned
+       repeatedly while diagnosing, so contrast beats depth here. -->
+  <div class="ui-card-solid p-5">
     <div class="flex items-center gap-3 mb-4">
       <el-input v-model="modelQuery" placeholder="搜索设备 / ICCID / IMEI / 网卡" />
     </div>
@@ -118,7 +120,7 @@ const secondaryStatus = (d: DeviceMgmtListItem) => {
             type="button"
             class="w-full h-full text-left p-3 rounded-xl border transition-all"
             :class="selectedId === d.id
-              ? 'border-indigo-200 dark:border-indigo-500/30 bg-indigo-50/70 dark:bg-indigo-500/10'
+              ? 'border-primary-200 dark:border-primary-500/30 bg-primary-50/70 dark:bg-primary-500/10'
               : 'border-gray-100 dark:border-white/10 hover:bg-gray-50/60 dark:hover:bg-white/5'"
             @click="emit('select-device', d.id)"
           >

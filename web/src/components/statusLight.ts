@@ -4,18 +4,22 @@ export type StatusLightSize = 'sm' | 'md'
 export function statusLightToneClass(tone: StatusLightTone) {
   switch (tone) {
     case 'success':
-      return 'bg-green-500'
+      return 'bg-success-500'
     case 'warning':
-      return 'bg-amber-500'
+      return 'bg-warning-500'
     case 'danger':
-      return 'bg-red-500'
+      return 'bg-danger-500'
     case 'neutral':
       return 'bg-gray-400'
   }
 }
 
+// The two sizes were inverted since the initial release: 'md' returned w-1.5
+// (6px) and 'sm' returned w-2 (8px), so asking for the larger dot produced the
+// smaller one. DeviceCard passes size="md" for its prominent per-device light and
+// was getting the 6px dot.
 export function statusLightSizeClass(size: StatusLightSize) {
-  return size === 'md' ? 'w-1.5 h-1.5' : 'w-2 h-2'
+  return size === 'md' ? 'w-2.5 h-2.5' : 'w-1.5 h-1.5'
 }
 
 export function statusLightAnimatedClass(animated = true) {

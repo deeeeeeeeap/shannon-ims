@@ -507,7 +507,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
           <div class="flex items-center gap-1.5">
             <el-icon size="16"><Earth24Regular /></el-icon>
             <span class="font-medium">漫游前置代理</span>
-            <span v-if="upstreamStore.proxies.length > 0" class="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white bg-blue-500 rounded-full shadow-sm ml-0.5">
+            <span v-if="upstreamStore.proxies.length > 0" class="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white bg-primary-500 rounded-full shadow-sm ml-0.5">
               {{ upstreamStore.proxies.length }}
             </span>
           </div>
@@ -518,7 +518,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
           <div class="flex items-center gap-1.5">
             <el-icon size="16"><Router24Regular /></el-icon>
             <span class="font-medium">本地出站代理</span>
-            <span v-if="instances.length > 0" class="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white bg-blue-500 rounded-full shadow-sm ml-0.5">
+            <span v-if="instances.length > 0" class="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold leading-none text-white bg-primary-500 rounded-full shadow-sm ml-0.5">
               {{ instances.length }}
             </span>
           </div>
@@ -541,7 +541,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
       <div class="ui-card p-6">
         <div class="flex items-center justify-between mb-4">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white flex items-center justify-center shadow-lg shadow-violet-500/25">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-fuchsia-500 text-white flex items-center justify-center shadow-lg shadow-primary-500/25">
               <el-icon size="20"><Earth24Regular /></el-icon>
             </div>
             <div>
@@ -570,7 +570,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
             class="ui-panel-muted p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3"
           >
             <div class="flex items-center gap-3 min-w-0">
-              <span class="w-2.5 h-2.5 rounded-full shrink-0" :class="proxy.enabled ? 'bg-green-500' : 'bg-gray-300'" />
+              <span class="w-2.5 h-2.5 rounded-full shrink-0" :class="proxy.enabled ? 'bg-success-500' : 'bg-gray-300'" />
               <div class="min-w-0">
                 <div class="font-bold text-gray-900 dark:text-white truncate">{{ proxy.name || proxy.id }}</div>
                 <div class="text-xs text-gray-500 mt-0.5 truncate">
@@ -584,7 +584,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
               <el-tag size="small" :type="proxy.enabled ? 'success' : 'info'">
                 {{ proxy.enabled ? '已启用' : '已禁用' }}
               </el-tag>
-              <div class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-blue-50 text-blue-600 border border-blue-200/60 dark:bg-blue-900/20 dark:text-blue-400 dark:border-blue-800/40">
+              <div class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-primary-50 text-primary-600 border border-primary-200/60 dark:bg-primary-900/20 dark:text-primary-400 dark:border-primary-800/40">
                 <el-icon size="14"><Link24Regular /></el-icon>
                 <span>{{ proxy.ruleCount }} 个国家规则</span>
               </div>
@@ -626,7 +626,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
       <div class="ui-card p-6">
         <div class="flex items-center justify-between mb-4">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 text-white flex items-center justify-center shadow-lg shadow-indigo-500/25">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-500 text-white flex items-center justify-center shadow-lg shadow-primary-500/25">
               <el-icon size="20"><Router24Regular /></el-icon>
             </div>
             <div>
@@ -651,13 +651,13 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
             class="ui-panel-muted p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3"
           >
             <div class="flex items-center gap-3 min-w-0">
-              <span class="w-2.5 h-2.5 rounded-full shrink-0" :class="inst.status.running ? 'bg-green-500' : 'bg-gray-300'" />
+              <span class="w-2.5 h-2.5 rounded-full shrink-0" :class="inst.status.running ? 'bg-success-500' : 'bg-gray-300'" />
               <div class="min-w-0">
                 <div class="font-bold text-gray-900 dark:text-white truncate">{{ inst.name || inst.id }}</div>
                 <div class="text-xs text-gray-500 mt-0.5 truncate">
                   {{ formatModeLabel(inst.mode) }} · {{ inst.listen_addr }}:{{ inst.listen_port }} · 绑定: {{ devices.find(d => d.id === inst.device_id)?.name || inst.device_id }}
                 </div>
-                <div v-if="inst.status.last_error" class="text-xs text-red-500 mt-1 truncate">
+                <div v-if="inst.status.last_error" class="text-xs text-danger-500 mt-1 truncate">
                   {{ inst.status.last_error }}
                 </div>
               </div>
@@ -706,7 +706,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
       <div class="space-y-6 pb-6">
         <div class="space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800">
-            <div class="w-1 h-4 bg-indigo-500 rounded-full"></div>
+            <div class="w-1 h-4 bg-primary-500 rounded-full"></div>
             <h3 class="text-sm font-bold text-gray-900 dark:text-gray-100">基础设置</h3>
           </div>
 
@@ -762,7 +762,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
 
         <div class="space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800">
-            <div class="w-1 h-4 bg-amber-500 rounded-full"></div>
+            <div class="w-1 h-4 bg-warning-500 rounded-full"></div>
             <h3 class="text-sm font-bold text-gray-900 dark:text-gray-100">认证设置</h3>
           </div>
 
@@ -800,7 +800,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
       <div class="space-y-6 pb-6">
         <div class="space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800">
-            <div class="w-1 h-4 bg-violet-500 rounded-full"></div>
+            <div class="w-1 h-4 bg-primary-500 rounded-full"></div>
             <h3 class="text-sm font-bold text-gray-900 dark:text-gray-100">代理信息</h3>
           </div>
 
@@ -832,7 +832,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
 
         <div class="space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800">
-            <div class="w-1 h-4 bg-amber-500 rounded-full"></div>
+            <div class="w-1 h-4 bg-warning-500 rounded-full"></div>
             <h3 class="text-sm font-bold text-gray-900 dark:text-gray-100">鉴权设置（可选）</h3>
           </div>
 
@@ -866,7 +866,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
         <!-- 已配置国家规则 -->
         <div class="space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800">
-            <div class="w-1 h-4 bg-green-500 rounded-full"></div>
+            <div class="w-1 h-4 bg-success-500 rounded-full"></div>
             <h3 class="text-sm font-bold text-gray-900 dark:text-gray-100">已路由到该代理的国家</h3>
           </div>
 
@@ -883,7 +883,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
               class="ui-panel-muted p-3 flex items-center justify-between rounded-lg"
             >
               <div class="flex items-center gap-2 min-w-0">
-                <span class="w-2 h-2 rounded-full bg-green-500 shrink-0"></span>
+                <span class="w-2 h-2 rounded-full bg-success-500 shrink-0"></span>
                 <div class="min-w-0">
                   <div class="text-sm font-medium text-gray-900 dark:text-white truncate">
                     {{ rule.country_code }} · {{ rule.country_name || rule.country_code }}
@@ -901,7 +901,7 @@ usePollingScheduler(() => fetchUpstream({ silent: true }), 10000, {
         <!-- 添加国家规则 -->
         <div class="space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800">
-            <div class="w-1 h-4 bg-blue-500 rounded-full"></div>
+            <div class="w-1 h-4 bg-primary-500 rounded-full"></div>
             <h3 class="text-sm font-bold text-gray-900 dark:text-gray-100">添加国家规则</h3>
           </div>
 

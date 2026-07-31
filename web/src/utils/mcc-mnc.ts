@@ -1,9 +1,11 @@
+// country_code is intentionally absent: nothing outside this module ever read it,
+// so the bundled table drops the column. (Proxy.vue's country_code belongs to the
+// unrelated upstream-proxy rule type in types/api.ts.)
 export type MccMncRow = {
   mcc: string
   mnc: string
   iso: string
   country: string
-  country_code: string
   network: string
 }
 
@@ -13,14 +15,18 @@ export type ServingOperatorLike = {
   mnc?: string
 }
 
-const TABLE_URL = 'https://raw.githubusercontent.com/musalbas/mcc-mnc-table/refs/heads/master/mcc-mnc-table.json'
-const STORAGE_KEY = 'go-4gproxy:mcc-mnc-table:v1'
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
-
-type CachePayload = {
-  fetched_at: number
-  rows: MccMncRow[]
-}
+// Served from our own origin, not raw.githubusercontent.com.
+//
+// This console manages local hardware over localhost, so reaching out to GitHub to
+// render an operator name meant the feature silently degraded to bare PLMN digits
+// on any air-gapped or firewalled deployment -- and disclosed to a third party when
+// the operator opened the device page. The table is now a build asset
+// (web/public/data/, 172 KB, 2126 rows, generated from the same upstream source).
+//
+// The localStorage cache and its TTL are gone with the network request: a
+// same-origin static file is already served from the HTTP cache, so a second layer
+// only added a way for the two to disagree.
+const TABLE_URL = '/data/mcc-mnc-table.json'
 
 let indexPromise: Promise<Map<string, MccMncRow>> | null = null
 
@@ -49,7 +55,6 @@ function buildIndex(rows: MccMncRow[]): Map<string, MccMncRow> {
         mnc,
         iso: normalizeCode(r?.iso).toLowerCase(),
         country: normalizeCode(r?.country),
-        country_code: normalizeCode(r?.country_code),
         network: normalizeCode(r?.network)
       })
       continue
@@ -60,27 +65,6 @@ function buildIndex(rows: MccMncRow[]): Map<string, MccMncRow> {
     }
   }
   return idx
-}
-
-function readCache(): CachePayload | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    const data = JSON.parse(raw) as CachePayload
-    if (!data || !Array.isArray(data.rows) || typeof data.fetched_at !== 'number') return null
-    return data
-  } catch {
-    return null
-  }
-}
-
-function writeCache(rows: MccMncRow[]) {
-  try {
-    const payload: CachePayload = { fetched_at: Date.now(), rows }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
-  } catch {
-    // Ignore cache write failures (private mode/quota/security policy).
-  }
 }
 
 async function fetchRows(): Promise<MccMncRow[]> {
@@ -100,30 +84,27 @@ async function fetchRows(): Promise<MccMncRow[]> {
       mnc,
       iso: typeof r.iso === 'string' ? r.iso : '',
       country: typeof r.country === 'string' ? r.country : '',
-      country_code: typeof r.country_code === 'string' ? r.country_code : '',
       network: typeof r.network === 'string' ? r.network : ''
     })
   }
   return out
 }
 
+/**
+ * Loads the PLMN table once per page and memoises the result.
+ *
+ * On failure it resolves to an empty Map rather than rejecting: callers use the
+ * index only to prettify a PLMN code, and every one of them already falls back to
+ * showing the raw digits. A missing operator name must never take out the device
+ * page around it.
+ */
 export async function getMccMncIndex(): Promise<Map<string, MccMncRow>> {
   if (indexPromise) return indexPromise
   indexPromise = (async () => {
-    const cache = readCache()
-    const now = Date.now()
-    if (cache && cache.rows.length > 0 && now - cache.fetched_at < CACHE_TTL_MS) {
-      return buildIndex(cache.rows)
-    }
     try {
-      const rows = await fetchRows()
-      if (rows.length > 0) writeCache(rows)
-      return buildIndex(rows)
+      return buildIndex(await fetchRows())
     } catch {
-      if (cache && cache.rows.length > 0) {
-        return buildIndex(cache.rows)
-      }
-      return new Map()
+      return new Map<string, MccMncRow>()
     }
   })()
   return indexPromise

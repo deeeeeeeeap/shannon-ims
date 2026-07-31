@@ -9,6 +9,20 @@ import StatusLight from './StatusLight.vue'
 import OperatorSelectionDialog from './OperatorSelectionDialog.vue'
 import { Settings24Regular } from '@vicons/fluent'
 import type { StatusLightTone } from './statusLight'
+import {
+  SIGNAL_BAR_COUNT,
+  hasValidSignalDbm,
+  signalBarClass,
+  signalBars,
+  signalQualityLabel,
+  signalToneClass,
+} from '../domain/signalQuality'
+import {
+  hasRuntimeFault,
+  readinessStages,
+  readinessStatus,
+  readinessSummary,
+} from '../domain/vowifiReadiness'
 
 const props = defineProps<{
   device: DeviceOverviewItem | null
@@ -49,75 +63,44 @@ const showVowifiDetail = ref(false)
 
 // ---- VoWiFi 模式计算属性 ----
 
-const readinessItems = computed(() => {
-  const rt = props.device?.vowifi_runtime
-  return [
-    { key: 'SIM',    ready: rt?.sim_ready },
-    { key: 'Access', ready: rt?.access_ready },
-    { key: 'Tunnel', ready: rt?.tunnel_ready },
-    { key: 'IMS',    ready: rt?.ims_ready },
-    { key: 'SMS',    ready: rt?.sms_ready },
-  ]
-})
+// Readiness comes from domain/vowifiReadiness so the chain order and the
+// stalled/progressing distinction are defined in exactly one place.
+//
+// The local version graded with some()/every(), which collapsed "stopped at
+// Tunnel" and "stopped at SMS" into the same "partial" -- and those need different
+// operator responses. It also listed unready stages unordered, so the chain's
+// direction was invisible.
+const readinessItems = computed(() => readinessStages(props.device?.vowifi_runtime))
 
-// 'ok' | 'partial' | 'off'
-const vowifiStatus = computed<'ok' | 'partial' | 'off'>(() => {
-  const rt = props.device?.vowifi_runtime
-  if (!rt) return 'off'
-  const all = [rt.sim_ready, rt.access_ready, rt.tunnel_ready, rt.ims_ready, rt.sms_ready]
-  if (all.every(Boolean)) return 'ok'
-  if (all.some(Boolean)) return 'partial'
-  return 'off'
-})
+// 'ready' | 'progressing' | 'stalled' | 'off'
+const vowifiStatus = computed(() => readinessStatus(props.device?.vowifi_runtime))
 
-// 未就绪的环节名称列表
-const notReadyNames = computed(() =>
-  readinessItems.value.filter(i => !i.ready).map(i => i.key)
-)
+// Names the stage to act on, e.g. "受阻于 隧道就绪（2/5）".
+const vowifiSummary = computed(() => readinessSummary(props.device?.vowifi_runtime))
 
-// 有错误时自动展开
-const hasError = computed(() =>
-  !!(props.device?.vowifi_runtime?.last_error_class || props.device?.vowifi_runtime?.last_reason)
+// Auto-expands the detail block when the runtime reported a fault.
+const hasError = computed(() => hasRuntimeFault(props.device?.vowifi_runtime))
+
+// A partly-up chain is mid-transition; ready and off are both steady states.
+const vowifiInFlux = computed(() =>
+  vowifiStatus.value === 'progressing' || vowifiStatus.value === 'stalled'
 )
 
 // ---- 窝蜂模式计算属性 ----
 
-function hasValidSignalDbm(dbm: number | null | undefined): dbm is number {
-  return typeof dbm === 'number' && Number.isFinite(dbm) && dbm !== 0 && dbm !== -999
-}
-
-// 0-5 格
-const signalLevel = computed<number>(() => {
-  const dbm = props.device?.modem?.signal_dbm
-  if (!hasValidSignalDbm(dbm)) return 0
-  if (dbm >= -75)  return 5
-  if (dbm >= -85)  return 4
-  if (dbm >= -95)  return 3
-  if (dbm >= -105) return 2
-  return 1
-})
-
-const signalColor = computed<'green' | 'amber' | 'red' | 'gray'>(() => {
-  const dbm = props.device?.modem?.signal_dbm
-  if (!hasValidSignalDbm(dbm)) return 'gray'
-  if (dbm >= -85)  return 'green'
-  if (dbm >= -100) return 'amber'
-  return 'red'
-})
-
-const signalColorClass = computed(() => ({
-  green: 'text-emerald-500 dark:text-emerald-400',
-  amber: 'text-amber-500 dark:text-amber-400',
-  red:   'text-red-500 dark:text-red-400',
-  gray:  'text-gray-400 dark:text-gray-500',
-}[signalColor.value]))
-
-const signalBarColor = computed(() => ({
-  green: 'bg-emerald-500',
-  amber: 'bg-amber-500',
-  red:   'bg-red-500',
-  gray:  'bg-gray-300 dark:bg-gray-600',
-}[signalColor.value]))
+// Signal grading comes from domain/signalQuality. The rating and the colours are
+// shared with DeviceCard: the two used to grade independently (-85 here vs -70
+// there), so one device could read green on its detail page and amber on the
+// dashboard at the same instant.
+//
+// The meter still draws SIGNAL_BAR_COUNT bars, and the count is imported rather
+// than written as a literal so the template cannot drift from the domain module.
+const signalDbm = computed(() => props.device?.modem?.signal_dbm)
+const signalLevel = computed(() => signalBars(signalDbm.value))
+const signalColorClass = computed(() => signalToneClass(signalDbm.value))
+const signalBarColor = computed(() => signalBarClass(signalDbm.value))
+const signalLabel = computed(() => signalQualityLabel(signalDbm.value))
+const signalHasReading = computed(() => hasValidSignalDbm(signalDbm.value))
 
 const flightModeEnabled = computed(() => {
   if (props.device?.vowifi_active) return true
@@ -125,9 +108,21 @@ const flightModeEnabled = computed(() => {
   return mode === 0 || mode === 4
 })
 
+// `stalled` is danger rather than warning: the chain is half up AND the runtime
+// reported a fault, so waiting will not fix it. `progressing` stays warning
+// because it may still complete on its own.
 const vowifiStatusTone = computed<StatusLightTone>(() => {
-  if (vowifiStatus.value === 'partial') return 'warning'
-  return vowifiStatus.value === 'ok' ? 'success' : 'danger'
+  switch (vowifiStatus.value) {
+    case 'ready':
+      return 'success'
+    case 'progressing':
+      return 'warning'
+    case 'stalled':
+      return 'danger'
+    case 'off':
+    default:
+      return 'neutral'
+  }
 })
 
 const flightModeStatusText = computed(() => {
@@ -145,6 +140,14 @@ const cellularStatusTone = computed<StatusLightTone>(() => {
   if (!controlOnline.value) return 'danger'
   return isRegistered.value ? 'success' : 'warning'
 })
+
+// Pulses while the radio is still working towards a registration -- recovering, or
+// online but not yet registered. Successful registration is a steady state and used
+// to be the one thing that pulsed, which is backwards.
+const cellularInFlux = computed(() =>
+  isRecoveryPhase(props.device?.lifecycle_phase) ||
+  (controlOnline.value && !isRegistered.value)
+)
 
 const cellularStatusText = computed(() => {
   const phaseText = lifecycleStatusLabel(props.device?.lifecycle_phase)
@@ -175,41 +178,57 @@ const networkPanelMessage = computed(() => {
       <template v-if="device?.vowifi_enabled">
 
         <!-- Hero pill -->
+        <!-- Four states, not three. `stalled` (half up + runtime fault) now reads
+             as danger instead of sharing amber with `progressing`, because waiting
+             will not clear it. `off` is neutral rather than red: never started is
+             not the same as broken. -->
         <div
           class="flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 mb-3 border"
           :class="{
-            'bg-emerald-50 border-emerald-200 dark:bg-emerald-500/10 dark:border-emerald-500/25': vowifiStatus === 'ok',
-            'bg-amber-50 border-amber-200 dark:bg-amber-500/10 dark:border-amber-500/25':         vowifiStatus === 'partial',
-            'bg-red-50 border-red-200 dark:bg-red-500/10 dark:border-red-500/25':                 vowifiStatus === 'off',
+            'bg-success-50 border-success-200 dark:bg-success-500/10 dark:border-success-500/25': vowifiStatus === 'ready',
+            'bg-warning-50 border-warning-200 dark:bg-warning-500/10 dark:border-warning-500/25': vowifiStatus === 'progressing',
+            'bg-danger-50 border-danger-200 dark:bg-danger-500/10 dark:border-danger-500/25': vowifiStatus === 'stalled',
+            'bg-gray-50 border-gray-200 dark:bg-white/5 dark:border-white/10': vowifiStatus === 'off',
           }"
         >
-          <!-- 状态点 -->
-          <StatusLight :tone="vowifiStatusTone" size="sm" :animated="vowifiStatus !== 'off'" />
+          <!-- Pulses only mid-transition: a settled chain, ready or off, should not
+               compete for attention. -->
+          <StatusLight :tone="vowifiStatusTone" size="sm" :animated="vowifiInFlux" />
           <div class="min-w-0">
             <div class="text-sm font-bold leading-tight" :class="{
-              'text-emerald-700 dark:text-emerald-300': vowifiStatus === 'ok',
-              'text-amber-700 dark:text-amber-300':     vowifiStatus === 'partial',
-              'text-red-700 dark:text-red-300':         vowifiStatus === 'off',
+              'text-success-700 dark:text-success-300': vowifiStatus === 'ready',
+              'text-warning-700 dark:text-warning-300': vowifiStatus === 'progressing',
+              'text-danger-700 dark:text-danger-300': vowifiStatus === 'stalled',
+              'text-gray-600 dark:text-gray-300': vowifiStatus === 'off',
             }">
-              <template v-if="vowifiStatus === 'ok'">WiFi-Calling · 全部就绪</template>
-              <template v-else-if="vowifiStatus === 'partial'">{{ notReadyNames.join(' · ') }} 未就绪</template>
+              <template v-if="vowifiStatus === 'ready'">WiFi-Calling · 全部就绪</template>
+              <!-- Names the blocking stage. The old text listed every unready stage
+                   unordered ("IMS · SMS 未就绪"), which hid the fact that IMS is
+                   what SMS is waiting on. -->
+              <template v-else-if="vowifiInFlux">{{ vowifiSummary }}</template>
               <template v-else>VoWiFi 未连接</template>
             </div>
-            <div v-if="vowifiStatus === 'partial' && device?.vowifi_runtime?.last_reason"
-              class="text-xs text-amber-600 dark:text-amber-400 mt-0.5 truncate">
+            <div v-if="vowifiInFlux && device?.vowifi_runtime?.last_reason"
+              class="text-xs mt-0.5 truncate"
+              :class="vowifiStatus === 'stalled' ? 'text-danger-600 dark:text-danger-400' : 'text-warning-600 dark:text-warning-400'">
               {{ device.vowifi_runtime.last_reason }}
             </div>
           </div>
         </div>
 
-        <!-- Readiness 进度条 -->
-        <div class="mb-3">
+        <!-- Readiness chain: SIM -> Access -> Tunnel -> IMS -> SMS, left to right.
+             The order is the information. Previously every unready segment was
+             painted the same red, which implied five independent failures; in fact
+             only the FIRST one is a failure and the rest are simply blocked behind
+             it. So the blocking stage is marked and the ones after it are left
+             muted. -->
+        <div class="mb-3" role="group" :aria-label="`VoWiFi 就绪链：${vowifiSummary}`">
           <div class="flex gap-1 mb-1">
             <div
               v-for="item in readinessItems" :key="item.key"
-              class="flex-1 h-1.5 rounded-full"
-              :class="item.ready === true  ? 'bg-emerald-500 dark:bg-emerald-400'
-                    : item.ready === false ? 'bg-red-500 dark:bg-red-400'
+              class="flex-1 h-1.5 rounded-full transition-colors"
+              :class="item.ready ? 'bg-success-500 dark:bg-success-400'
+                    : item.blocking ? (vowifiStatus === 'stalled' ? 'bg-danger-500 dark:bg-danger-400' : 'bg-warning-500 dark:bg-warning-400')
                     : 'bg-gray-200 dark:bg-white/10'"
             />
           </div>
@@ -217,7 +236,10 @@ const networkPanelMessage = computed(() => {
             <span
               v-for="item in readinessItems" :key="item.key"
               class="flex-1 text-center text-[10px]"
-              :class="item.ready === false ? 'text-red-500 dark:text-red-400 font-bold' : 'text-gray-400 dark:text-gray-500'"
+              :class="item.blocking ? (vowifiStatus === 'stalled' ? 'text-danger-600 dark:text-danger-400 font-bold' : 'text-warning-600 dark:text-warning-400 font-bold')
+                    : item.ready ? 'text-gray-500 dark:text-gray-400'
+                    : 'text-gray-400 dark:text-gray-600'"
+              :title="`${item.label}${item.ready ? '：已就绪' : item.blocking ? '：当前受阻' : '：等待前序环节'}`"
             >{{ item.key }}</span>
           </div>
         </div>
@@ -245,18 +267,18 @@ const networkPanelMessage = computed(() => {
         <!-- 运营商 hero（与 VoWiFi pill 统一样式） -->
         <div class="flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 mb-3 border"
           :class="isRegistered
-            ? 'bg-emerald-50 border-emerald-200 dark:bg-emerald-500/10 dark:border-emerald-500/25'
+            ? 'bg-success-50 border-success-200 dark:bg-success-500/10 dark:border-success-500/25'
             : controlOnline
-              ? 'bg-amber-50 border-amber-200 dark:bg-amber-500/10 dark:border-amber-500/25'
+              ? 'bg-warning-50 border-warning-200 dark:bg-warning-500/10 dark:border-warning-500/25'
               : 'bg-gray-100 border-gray-200 dark:bg-white/5 dark:border-white/10'"
         >
-          <StatusLight :tone="cellularStatusTone" size="sm" :animated="isRegistered" />
+          <StatusLight :tone="cellularStatusTone" size="sm" :animated="cellularInFlux" />
           <div class="flex-1 min-w-0">
             <div class="text-sm font-bold leading-tight"
               :class="isRegistered
-                ? 'text-emerald-700 dark:text-emerald-300'
+                ? 'text-success-700 dark:text-success-300'
                 : controlOnline
-                  ? 'text-amber-700 dark:text-amber-300'
+                  ? 'text-warning-700 dark:text-warning-300'
                   : 'text-gray-500 dark:text-gray-400'"
             >
               <template v-if="isRegistered">
@@ -278,11 +300,14 @@ const networkPanelMessage = computed(() => {
           <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1.5">信号强度</div>
           <div class="flex items-center gap-3">
             <div>
-              <div class="flex items-baseline gap-1">
+              <div class="flex items-baseline gap-1.5">
                 <span class="text-2xl font-extrabold tabular-nums leading-none" :class="signalColorClass">
-                  {{ device?.modem?.signal_dbm ?? '--' }}
+                  {{ signalHasReading ? signalDbm : '--' }}
                 </span>
                 <span class="text-xs text-gray-400">dBm</span>
+                <!-- -80 dBm means nothing without a scale. The word rating is also
+                     the accessible text for the bar meter, which is aria-hidden. -->
+                <span class="text-[11px] font-semibold" :class="signalColorClass">{{ signalLabel }}</span>
               </div>
               <div class="text-[10px] text-gray-400 mt-1">
                 RSRP {{ device?.modem?.signal_rsrp ?? '--' }}
@@ -295,11 +320,20 @@ const networkPanelMessage = computed(() => {
                 </template>
               </div>
             </div>
-            <!-- 信号格 -->
-            <div class="flex items-end gap-0.5 ml-auto" style="height: 28px">
-              <div v-for="i in 5" :key="i"
+            <!-- Bar count comes from the domain module, not a literal: it used to
+                 be a hardcoded 5 against a 5-level scale, and now that grading is
+                 shared with DeviceCard a literal here would silently leave the last
+                 bar permanently dark. The meter is aria-hidden because signalLabel
+                 states the same rating in words. -->
+            <div
+              class="flex items-end gap-0.5 ml-auto"
+              style="height: 28px"
+              :title="signalHasReading ? signalLabel : '无信号读数'"
+              aria-hidden="true"
+            >
+              <div v-for="i in SIGNAL_BAR_COUNT" :key="i"
                 class="w-1.5 rounded-sm"
-                :style="{ height: (i * 18 + 10) + '%' }"
+                :style="{ height: (i * 22 + 12) + '%' }"
                 :class="i <= signalLevel ? signalBarColor : 'bg-gray-200 dark:bg-white/10'"
               />
             </div>

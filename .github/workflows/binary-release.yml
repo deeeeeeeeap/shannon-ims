@@ -121,7 +121,7 @@ jobs:
           bash scripts/tests/verify-release-bundle_test.sh
 
   frontend:
-    name: Frontend lint, typecheck, and build
+    name: Frontend lint, typecheck, test, and build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -140,6 +140,7 @@ jobs:
           npm ci --prefix web
           npm run lint --prefix web
           npm run typecheck --prefix web
+          npm test --prefix web
           npm run build --prefix web
 
       - name: Upload frontend dist

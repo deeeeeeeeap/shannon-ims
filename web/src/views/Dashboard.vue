@@ -92,22 +92,31 @@ onMounted(() => {
       </template>
     </PageHeader>
 
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+    <!-- These counts change on a 5s poll with no user action behind them, so a
+         screen reader would never learn a device went offline. aria-live="polite"
+         announces the change at the next pause instead of interrupting. -->
+    <div
+      class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6"
+      role="status"
+      aria-live="polite"
+    >
       <div class="ui-panel p-4">
         <div class="text-xs text-gray-400">设备总数</div>
         <div class="text-2xl font-extrabold mt-1">{{ totalCount }}</div>
       </div>
       <div class="ui-panel p-4">
         <div class="text-xs text-gray-400">在线</div>
-        <div class="text-2xl font-extrabold mt-1 text-green-600 dark:text-green-400">{{ onlineCount }}</div>
+        <div class="text-2xl font-extrabold mt-1 text-success-600 dark:text-success-400">{{ onlineCount }}</div>
       </div>
       <div class="ui-panel p-4">
         <div class="text-xs text-gray-400">离线</div>
-        <div class="text-2xl font-extrabold mt-1 text-red-600 dark:text-red-400">{{ offlineCount }}</div>
+        <div class="text-2xl font-extrabold mt-1 text-danger-600 dark:text-danger-400">{{ offlineCount }}</div>
       </div>
       <div class="ui-panel p-4">
         <div class="text-xs text-gray-400">最近刷新</div>
-        <div class="text-sm font-mono mt-2 text-gray-600 dark:text-gray-300">
+        <!-- The timestamp ticks every poll; announcing it would talk over the
+             counts above, which are the part worth hearing. -->
+        <div class="text-sm font-mono mt-2 text-gray-600 dark:text-gray-300" aria-hidden="true">
           {{ lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString() : '--:--:--' }}
         </div>
       </div>

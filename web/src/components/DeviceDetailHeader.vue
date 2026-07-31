@@ -44,7 +44,7 @@ const emit = defineEmits<{
           <el-icon><ArrowSync24Regular /></el-icon>
           切换 IP
         </el-button>
-        <el-button :loading="rebooting" @click="emit('reboot-modem')" class="ui-glass-border !border-0 hover:!text-red-600">
+        <el-button :loading="rebooting" @click="emit('reboot-modem')" class="ui-glass-border !border-0 hover:!text-danger-600">
           <el-icon><Power24Regular /></el-icon>
           重启模组
         </el-button>

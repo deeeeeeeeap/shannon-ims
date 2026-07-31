@@ -311,7 +311,7 @@ async function deleteProfile(iccid: string, name: string, aidHex: string) {
       inputErrorMessage: `请输入 ${last4} 以确认`,
       inputPlaceholder: `输入 ${last4}`,
       type: 'error',
-      confirmButtonClass: '!bg-red-600 !border-red-600 hover:!bg-red-700'
+      confirmButtonClass: '!bg-danger-600 !border-danger-600 hover:!bg-danger-700'
     }
   ).catch(() => ({ value: '' }))
   if (input !== last4) return
@@ -492,7 +492,7 @@ onBeforeUnmount(() => {
       <div v-if="chipInfo" class="ui-panel-muted p-4 relative">
       <div class="flex items-center justify-between gap-3 mb-3">
         <div class="flex items-center gap-3 min-w-0">
-          <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white text-xs font-bold flex items-center justify-center shadow-lg shadow-emerald-500/25">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-success-500 to-primary-600 text-white text-xs font-bold flex items-center justify-center shadow-lg shadow-success-500/25">
             ESIM
           </div>
           <div>
@@ -545,10 +545,10 @@ onBeforeUnmount(() => {
             <template v-for="eid in chipInfo.eids" :key="eid.eid">
               <span v-if="eid.eid === group.eid" class="inline-flex flex-col items-end gap-1">
                 <span class="inline-flex items-center gap-1">
-                  <span class="w-2 h-2 rounded-full" :class="eid.free_nvram_bytes > 100000 ? 'bg-green-500' : 'bg-yellow-500'" />
+                  <span class="w-2 h-2 rounded-full" :class="eid.free_nvram_bytes > 100000 ? 'bg-success-500' : 'bg-warning-500'" />
                   可用 {{ eid.free_nvram }}
                 </span>
-                <span v-if="recentSpaceDelta && normalizeAidHex(group.aid_hex) === recentSpaceDelta.aidHex" class="text-[11px] text-emerald-600 dark:text-emerald-400">
+                <span v-if="recentSpaceDelta && normalizeAidHex(group.aid_hex) === recentSpaceDelta.aidHex" class="text-[11px] text-success-600 dark:text-success-400">
                   {{ recentSpaceDelta.message }}
                 </span>
               </span>
@@ -596,7 +596,7 @@ onBeforeUnmount(() => {
             <!-- 正常显示模式 -->
             <template v-if="renaming !== p.iccid">
               <div class="flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full flex-shrink-0" :class="p.state === 1 ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" />
+                <span class="w-2 h-2 rounded-full flex-shrink-0" :class="p.state === 1 ? 'bg-success-500' : 'bg-gray-300 dark:bg-gray-600'" />
                 <span class="font-medium text-sm text-gray-900 dark:text-white truncate">{{ p.name || p.iccid }}</span>
                 <el-tag size="small" :type="p.state === 1 ? 'success' : 'info'" class="flex-shrink-0">
                   {{ p.state_text }}
@@ -710,7 +710,7 @@ onBeforeUnmount(() => {
       <!-- 下载新 Profile -->
       <div v-if="chipInfo" class="ui-panel-muted p-4">
       <div class="flex items-center gap-2 mb-3">
-        <div class="w-7 h-7 rounded-lg bg-indigo-50 dark:bg-indigo-500/10 flex items-center justify-center text-indigo-600 dark:text-indigo-400">
+        <div class="w-7 h-7 rounded-lg bg-primary-50 dark:bg-primary-500/10 flex items-center justify-center text-primary-600 dark:text-primary-400">
           <el-icon size="16"><Add24Regular /></el-icon>
         </div>
         <div class="text-sm font-bold text-gray-900 dark:text-white">下载新 Profile</div>
@@ -755,7 +755,7 @@ onBeforeUnmount(() => {
           :duration="8"
           :stroke-width="10"
         />
-        <div class="text-xs" :class="downloadError ? 'text-red-500' : 'text-gray-500 dark:text-gray-400'">
+        <div class="text-xs" :class="downloadError ? 'text-danger-500' : 'text-gray-500 dark:text-gray-400'">
           {{ downloadError || downloadMsg }}
         </div>
       </div>
