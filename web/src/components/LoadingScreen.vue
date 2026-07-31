@@ -6,42 +6,77 @@ defineProps({
   },
   subtitle: {
     type: String,
-    default: '首次打开会稍慢，资源缓存后会更快'
+    default: ''
   }
 })
 </script>
 
 <template>
-  <div class="min-h-[260px] w-full flex items-center justify-center">
-    <div class="w-full max-w-md rounded-2xl border border-white/10 bg-white/5 dark:bg-white/5 backdrop-blur-xl p-6 shadow-2xl">
-      <div class="flex items-center gap-3">
-        <div class="w-11 h-11 rounded-2xl bg-gradient-to-br from-primary-500 to-violet-600 text-white text-sm font-extrabold flex items-center justify-center shadow-lg shadow-primary-500/25">
-          VH
-        </div>
-        <div class="min-w-0">
-          <div class="text-base font-extrabold text-gray-900 dark:text-white truncate">{{ title }}</div>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 truncate">{{ subtitle }}</div>
-        </div>
-      </div>
-
-      <div class="mt-5 flex items-center gap-3">
-        <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 tracking-wide">loading</div>
-        <div class="h-2 flex-1 rounded-full bg-gray-200/50 dark:bg-white/10 overflow-hidden relative">
-          <div class="absolute inset-0 -translate-x-[60%] bg-gradient-to-r from-transparent via-white/35 to-transparent animate-[loader-shimmer_1.05s_ease-in-out_infinite]"></div>
-        </div>
-        <div class="w-4 h-4 rounded-full border-2 border-white/25 border-t-white animate-spin"></div>
-      </div>
-    </div>
+  <!-- A loading state flashes past on every route change, so it should be quiet.
+       This replaced a panel with a gradient "VH" tile, shadow-2xl, a shimmer sweep
+       and a spinner all at once -- four effects competing for a moment that lasts
+       under a second, and carrying the old brand mark. -->
+  <div class="loading-screen" role="status" aria-live="polite">
+    <div class="loading-bar" aria-hidden="true"><span /></div>
+    <p class="loading-title">{{ title }}</p>
+    <p v-if="subtitle" class="loading-subtitle">{{ subtitle }}</p>
   </div>
 </template>
 
-<style>
-@keyframes loader-shimmer {
-  0% {
-    transform: translateX(-60%);
-  }
-  100% {
-    transform: translateX(60%);
+<style scoped>
+.loading-screen {
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2rem 1rem;
+}
+
+/* An indeterminate track: it says "working" without implying a percentage the app
+   does not know. */
+.loading-bar {
+  width: 8rem;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--ui-border-solid);
+  overflow: hidden;
+}
+
+.loading-bar span {
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--ui-accent);
+  animation: loading-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes loading-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+
+.loading-title {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--ui-text-muted);
+}
+
+.loading-subtitle {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--ui-text-faint);
+}
+
+/* Reduced motion: hold the bar still and let the text carry the state, rather than
+   animating at a slower speed that still moves. */
+@media (prefers-reduced-motion: reduce) {
+  .loading-bar span {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
   }
 }
 </style>

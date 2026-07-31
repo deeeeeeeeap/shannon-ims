@@ -1,16 +1,16 @@
 openapi: 3.0.3
 info:
-  title: VoHive Main API
+  title: Shannon IMS Main API
   version: 1.0.0-main
   description: |
-    VoHive 主服务控制面 API。
+    Shannon IMS 主服务控制面 API。
     - 服务器前缀：`/api`
     - 登录方式：`POST /auth/login`
     - 受保护接口统一使用 `Authorization: Bearer <token>`
     - 文档页面：`GET /docs`
 servers:
   - url: /api
-    description: VoHive main API prefix
+    description: Shannon IMS main API prefix
 security:
   - BearerAuth: []
 tags:

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import axios, { type AxiosInstance } from 'axios'
 import { debugCollector } from '../debug/collector'
+import { noteBackendFailure, noteBackendSuccess } from '../composables/useBackendReachability'
 
 export const api: AxiosInstance = axios.create({
   baseURL: '/api'
@@ -9,6 +10,10 @@ export const api: AxiosInstance = axios.create({
 function isWebsheetRequestURL(raw: unknown) {
   if (typeof raw !== 'string' || raw === '') return false
   try {
+    // The base only exists so a relative URL can be parsed for its pathname; it is
+    // never fetched. `.invalid` is reserved by RFC 2606 precisely so it cannot
+    // resolve. Left un-rebranded on purpose: this is a parser sentinel, not a name
+    // anyone sees.
     const path = new URL(raw, 'http://vohive.invalid').pathname
     return /^\/(?:api\/)?websheets(?:\/|$)/.test(path)
   } catch {
@@ -68,9 +73,23 @@ export const useAuthStore = defineStore('auth', {
 })
 
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    noteBackendSuccess()
+    return response
+  },
   (error) => {
     debugCollector.recordApiError(error)
+
+    // A response with a status means the server answered -- 4xx/5xx are application
+    // outcomes, not connectivity failures. Only a request that never got a response
+    // (network error, timeout, refused) counts against reachability, otherwise the
+    // header indicator would read "down" every time an API legitimately said no.
+    if (error?.response) {
+      noteBackendSuccess()
+    } else {
+      noteBackendFailure()
+    }
+
     if (error?.response?.status === 401) {
       try {
         const current = String(window.location.hash || '').replace(/^#/, '') || '/'

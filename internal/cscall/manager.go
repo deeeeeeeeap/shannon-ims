@@ -407,6 +407,10 @@ func (m *Manager) detectLocalIP(targetIP string) string {
 func (m *Manager) buildLocalSDP(ip string, port int) string {
 	// SDP 提供 PCMU(0) 编解码
 	// o= 字段中的 session-id 和 version 必须是数字 (RFC 4566)
+	//
+	// The "s=VoHive CS Call" session name is deliberately not rebranded: this is a
+	// line in an SDP body sent to the carrier, not UI text. Rebranding it would
+	// change bytes on the wire that current call flows were validated with.
 	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 	sessionVersion := fmt.Sprintf("%d", rand.Int31())
 	return fmt.Sprintf(

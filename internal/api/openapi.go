@@ -150,7 +150,7 @@ const apiDocsHTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>VoHive API Docs</title>
+  <title>Shannon IMS API Docs</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" type="image/png" sizes="32x32" href="/api/docs/assets/favicon-32x32.png" />
   <link rel="icon" type="image/png" sizes="16x16" href="/api/docs/assets/favicon-16x16.png" />
@@ -307,9 +307,9 @@ const apiDocsHTML = `<!doctype html>
   <div class="page">
     <section class="hero">
       <div>
-        <div class="eyebrow">VoHive OpenAPI</div>
+        <div class="eyebrow">Shannon IMS OpenAPI</div>
         <h1>主服务 API 文档</h1>
-        <p class="subtitle">文档页会直接读取当前浏览器里的 VoHive 登录 token，并自动注入到 Swagger UI 的请求里。你可以在这里浏览接口、查看 schema、直接试调用。</p>
+        <p class="subtitle">文档页会直接读取当前浏览器里的 Shannon IMS 登录 token，并自动注入到 Swagger UI 的请求里。你可以在这里浏览接口、查看 schema、直接试调用。</p>
       </div>
       <div class="hero-actions">
         <a class="btn btn-secondary" href="/#/settings">返回系统设置</a>
@@ -358,7 +358,7 @@ const apiDocsHTML = `<!doctype html>
         setStatus(
           'error',
           '当前还没有可用的登录 token',
-          reason + '\n\n请先在 VoHive Web 控制台完成登录，然后重新打开这个页面。',
+          reason + '\n\n请先在 Shannon IMS Web 控制台完成登录，然后重新打开这个页面。',
           ['文档页本身公开可访问', 'OpenAPI 规格仍需 Bearer 鉴权']
         );
       }
@@ -422,7 +422,7 @@ const apiDocsHTML = `<!doctype html>
               try {
                 window.ui.preauthorizeApiKey('BearerAuth', token);
               } catch (err) {
-                console.warn('[VoHive Docs] preauthorizeApiKey failed', err);
+                console.warn('[Shannon IMS Docs] preauthorizeApiKey failed', err);
               }
               try {
                 window.ui.authActions.authorize({
@@ -437,7 +437,7 @@ const apiDocsHTML = `<!doctype html>
                   }
                 });
               } catch (err) {
-                console.warn('[VoHive Docs] authActions.authorize failed', err);
+                console.warn('[Shannon IMS Docs] authActions.authorize failed', err);
               }
             }
           });

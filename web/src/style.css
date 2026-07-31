@@ -92,7 +92,10 @@ body {
      view can switch by class alone. */
   --ui-surface-solid: #ffffff;
   --ui-surface-solid-muted: #f8fafc;
-  --ui-border-solid: #e2e8f0;
+  --ui-border-solid: #e5e7eb;
+  /* Hover/active edge. Panels signal interactivity by darkening their border
+     rather than lifting off the page. */
+  --ui-border-strong: #d1d5db;
 
   /* Accent, tracking the Tailwind `primary` ramp (indigo). Exposed as variables
      so plain CSS blocks and Element Plus overrides use the same value the
@@ -105,13 +108,35 @@ body {
 
   --ui-scrollbar-thumb: #cbd5e1;
   --ui-scrollbar-thumb-hover: #94a3b8;
-  --ui-radius-sm: 10px;
-  --ui-radius-md: 14px;
-  --ui-radius-lg: 16px;
-  --ui-radius-xl: 20px;
-  --ui-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
-  --ui-shadow-md: 0 12px 30px rgba(15, 23, 42, 0.10);
-  --ui-shadow-lg: 0 18px 50px rgba(15, 23, 42, 0.14);
+
+  /* Text ramp. Three weights of emphasis is enough for this UI, and naming them
+     stops each view from picking its own gray-400/500/600 by feel. */
+  --ui-text: #111827;
+  --ui-text-muted: #6b7280;
+  --ui-text-faint: #9ca3af;
+
+  /* Status edges: a 2px strip on a panel's leading edge. Muted on purpose -- these
+     appear on every row of a list, so a saturated 500 would turn a healthy fleet
+     into a stripe of colour. */
+  --ui-success-edge: #34d399;
+  --ui-warning-edge: #fbbf24;
+  --ui-danger-edge: #f87171;
+  /* Three radius steps, not four, and tightened.
+     The old ramp ran 10/14/16/20px -- 14 and 16 are indistinguishable in use, and
+     20px on a full-width panel is what makes a dense console read as a pile of
+     rounded tiles. Controls get 6, containers 8, and the one-off large surfaces
+     (login panel, dialogs) get 12. */
+  --ui-radius-sm: 6px;
+  --ui-radius-md: 8px;
+  --ui-radius-lg: 12px;
+  --ui-radius-xl: 12px;
+  /* Shadows are for things that genuinely float above the page -- dialogs,
+     dropdowns, toasts. Panels that sit IN the layout get a border instead.
+     The old md/lg (0 12px 30px / 0 18px 50px) lifted every panel off the
+     background, which is the "collection of tiles" look. */
+  --ui-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --ui-shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06);
+  --ui-shadow-lg: 0 12px 32px rgba(15, 23, 42, 0.12);
   --ui-btn-shadow: 0 2px 8px rgba(15, 23, 42, 0.08), 0 1px 3px rgba(15, 23, 42, 0.05);
   --ui-btn-shadow-hover: 0 4px 12px rgba(15, 23, 42, 0.11), 0 2px 5px rgba(15, 23, 42, 0.06);
   --ui-btn-primary-shadow: 0 6px 16px rgba(99, 102, 241, 0.22), 0 2px 6px rgba(15, 23, 42, 0.08);
@@ -129,7 +154,8 @@ html.dark {
      (#101014, set in index.html) and an opaque panel sitting on it. */
   --ui-surface-solid: #16161c;
   --ui-surface-solid-muted: #1b1b22;
-  --ui-border-solid: rgba(255, 255, 255, 0.1);
+  --ui-border-solid: rgba(255, 255, 255, 0.09);
+  --ui-border-strong: rgba(255, 255, 255, 0.16);
 
   /* Lifted one stop for dark backgrounds: indigo-500 on #101014 is too dim to
      carry an active state. */
@@ -141,6 +167,14 @@ html.dark {
 
   --ui-scrollbar-thumb: #334155;
   --ui-scrollbar-thumb-hover: #475569;
+
+  --ui-text: #f3f4f6;
+  --ui-text-muted: rgba(255, 255, 255, 0.62);
+  --ui-text-faint: rgba(255, 255, 255, 0.42);
+
+  --ui-success-edge: #10b981;
+  --ui-warning-edge: #f59e0b;
+  --ui-danger-edge: #ef4444;
 
   --ui-btn-primary-shadow: 0 6px 16px rgba(99, 102, 241, 0.28), 0 2px 6px rgba(15, 23, 42, 0.18);
   --ui-btn-primary-shadow-hover: 0 8px 20px rgba(99, 102, 241, 0.32), 0 3px 8px rgba(15, 23, 42, 0.22);
@@ -208,37 +242,40 @@ html.dark {
   backdrop-filter: var(--ui-backdrop);
 }
 
+/* Panels are defined by their edge, not by floating. Dropping the drop shadow and
+   the blur is most of what separates a dense console from a deck of cards. */
 .ui-card {
-  background: var(--ui-surface);
-  border: 1px solid var(--ui-border);
-  backdrop-filter: var(--ui-backdrop);
-  border-radius: var(--ui-radius-xl);
-  box-shadow: var(--ui-shadow-md);
+  background: var(--ui-surface-solid);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-md);
 }
 
+/* Interactive panels shift their border and background rather than lifting.
+   The old version translated -4px and swapped to the heaviest shadow, so hovering
+   a device grid made the whole page twitch. */
 .ui-card-hover {
-  transition: transform 200ms ease, box-shadow 200ms ease;
+  transition: border-color 140ms ease, background-color 140ms ease;
 }
 
 .ui-card-hover:hover {
-  transform: translateY(-4px);
-  box-shadow: var(--ui-shadow-lg);
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-solid-muted);
 }
 
 .ui-panel {
-  background: var(--ui-surface);
-  border: 1px solid var(--ui-border);
-  backdrop-filter: var(--ui-backdrop);
-  border-radius: var(--ui-radius-lg);
-  box-shadow: var(--ui-shadow-sm);
+  background: var(--ui-surface-solid);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-md);
 }
 
+/* The recessed variant: a region INSIDE a panel, so it reads as inset rather than
+   as another card stacked on top. No border on all four sides -- the tonal
+   difference is enough, and a second border is what creates the boxes-in-boxes
+   look. */
 .ui-panel-muted {
-  background: var(--ui-surface-muted);
-  border: 1px solid var(--ui-border-muted);
-  backdrop-filter: var(--ui-backdrop);
-  border-radius: var(--ui-radius-lg);
-  box-shadow: var(--ui-shadow-sm);
+  background: var(--ui-surface-solid-muted);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-sm);
 }
 
 /* Opaque counterparts of .ui-card / .ui-panel, for views where reading accuracy

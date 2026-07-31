@@ -6,14 +6,47 @@ defineProps<{
 </script>
 
 <template>
-  <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6 sm:mb-8">
-    <div>
-      <!-- h1, not h2: this is the only page-level heading each view renders, and
-           starting the document outline at h2 leaves a screen reader with no top
-           level to navigate to. -->
-      <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-gray-900 to-gray-600 dark:from-white dark:to-gray-400">{{ title }}</h1>
-      <p v-if="subtitle" class="text-gray-500 dark:text-gray-400 mt-1">{{ subtitle }}</p>
+  <!-- The title was 30px, bold, and filled with a gradient via background-clip:text
+       on every single page. At that size it competed with the data underneath, and
+       the gradient added nothing an operator could read. It is now 17px semibold
+       with the subtitle on the same line, and a rule underneath ties it to the
+       content rather than leaving it floating in whitespace. -->
+  <div class="page-header">
+    <div class="min-w-0">
+      <div class="flex items-baseline gap-2.5 flex-wrap">
+        <h1 class="page-header-title">{{ title }}</h1>
+        <p v-if="subtitle" class="page-header-subtitle">{{ subtitle }}</p>
+      </div>
     </div>
-    <slot name="actions" />
+    <div class="flex items-center gap-2 flex-shrink-0">
+      <slot name="actions" />
+    </div>
   </div>
 </template>
+
+<style scoped>
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.875rem;
+  margin-bottom: 1.25rem;
+  border-bottom: 1px solid var(--ui-border-solid);
+  flex-wrap: wrap;
+}
+
+.page-header-title {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ui-text);
+  margin: 0;
+}
+
+.page-header-subtitle {
+  font-size: 0.8125rem;
+  color: var(--ui-text-muted);
+  margin: 0;
+}
+</style>

@@ -27,7 +27,7 @@ const metaText = computed(() => {
 </script>
 
 <template>
-  <div class="p-6 bg-danger-50/70 dark:bg-danger-500/10 rounded-2xl border border-danger-100 dark:border-danger-500/20">
+  <div class="p-6 bg-danger-50/70 dark:bg-danger-500/10 rounded-lg border border-danger-100 dark:border-danger-500/20">
     <div class="flex items-start justify-between gap-4">
       <div class="min-w-0">
         <div class="text-sm font-extrabold text-danger-700 dark:text-danger-300">{{ title || '加载失败' }}</div>

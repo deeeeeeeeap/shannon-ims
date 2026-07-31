@@ -804,12 +804,13 @@ onBeforeUnmount(() => {
   animation: esim-sweep 2.1s ease-in-out infinite;
 }
 
+/* Was a hardcoded teal from the pre-rebrand palette. */
 .esim-dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 9999px;
-  background: #14b8a6;
-  opacity: 0.3;
+  background: var(--ui-accent);
+  opacity: 0.35;
   animation: esim-dot-bounce 1.1s ease-in-out infinite;
 }
 

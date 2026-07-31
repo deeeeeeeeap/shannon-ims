@@ -7,6 +7,9 @@ import LoadingScreen from '../components/LoadingScreen.vue'
 import ErrorBoundary from '../components/ErrorBoundary.vue'
 import SwitchDark from '../components/SwitchDark.vue'
 import SidebarNav, { type SidebarMenuItem } from '../components/SidebarNav.vue'
+import StatusLight from '../components/StatusLight.vue'
+import { useBackendReachability } from '../composables/useBackendReachability'
+import type { StatusLightTone } from '../components/statusLight'
 import { debugCollector } from '../debug/collector'
 import {
   Mail24Regular,
@@ -120,6 +123,22 @@ watch(
 )
 
 const activePath = computed(() => route.path)
+
+const { state: backendState, label: backendStateLabel } = useBackendReachability()
+
+const backendTone = computed<StatusLightTone>(() => {
+  switch (backendState.value) {
+    case 'ok':
+      return 'success'
+    case 'degraded':
+      return 'warning'
+    case 'down':
+      return 'danger'
+    case 'unknown':
+    default:
+      return 'neutral'
+  }
+})
 </script>
 
 <template>
@@ -168,15 +187,17 @@ const activePath = computed(() => route.path)
           </el-button>
         </div>
 
-        <div class="flex items-center gap-3">
-          <SwitchDark :is-dark="isDark" @toggle="(e) => emit('toggle-theme', e)" />
-
-          <div class="hidden sm:flex items-center justify-center w-7 h-7 rounded-full bg-success-50 dark:bg-success-500/10 border border-success-100 dark:border-success-500/20 shadow-sm">
-            <span class="relative flex h-2 w-2">
-              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-success-400 opacity-75"></span>
-              <span class="relative inline-flex rounded-full h-2 w-2 bg-success-500"></span>
-            </span>
+        <div class="flex items-center gap-2.5">
+          <!-- Replaces a permanently ping-ing green dot in a circular frame that was
+               wired to nothing at all -- it looked like a health indicator and
+               indicated nothing, while animating forever. This one reports the real
+               backend reachability and is static, so motion stays meaningful. -->
+          <div class="hidden sm:flex items-center gap-1.5" :title="backendStateLabel">
+            <StatusLight :tone="backendTone" size="sm" :animated="false" />
+            <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ backendStateLabel }}</span>
           </div>
+
+          <SwitchDark :is-dark="isDark" @toggle="(e) => emit('toggle-theme', e)" />
         </div>
       </el-header>
 

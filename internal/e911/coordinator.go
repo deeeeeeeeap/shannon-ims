@@ -100,6 +100,13 @@ func (c *Coordinator) StartWebsheet(ctx context.Context, deviceID string) (websh
 	return session.Info(), nil
 }
 
+// displayName is the fallback label sent to the carrier's E911 websheet.
+//
+// The "VoHive" strings here are deliberately NOT rebranded to Shannon IMS. This
+// value leaves the device and reaches carrier-side registration, and the current
+// text is what the working 310/240 and 234/15 flows were validated with. Renaming
+// it is an unverified change to data a third party consumes, which is a different
+// class of edit from renaming what the local UI displays.
 func displayName(w *device.Worker) string {
 	if w == nil {
 		return "VoHive"

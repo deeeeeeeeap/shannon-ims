@@ -110,12 +110,12 @@ func main() {
 	slog.SetDefault(appSlog)
 	sip.SetDefaultLogger(appSlog)
 	runtimehost.SetLogger(logger.ZapLogger())
-	logger.Info("VoHive 模组管理器启动中...")
+	logger.Info("Shannon IMS 模组管理器启动中...")
 
 	appLifecycle.Go(func(ctx context.Context) {
 		disclaimer := `
 ======================================================================
-【VoHive 免责与使用声明】
+【Shannon IMS 免责与使用声明】
 1. 本软件仅供个人技术测试与研究交流，严禁任何商业用途。
 2. 严禁将本软件用于任何非法或违规场景。
 3. 本软件涉及底层通信操作，因测试产生的硬件、资费或网络风险由用户自行承担。

@@ -92,33 +92,34 @@ onMounted(() => {
       </template>
     </PageHeader>
 
-    <!-- These counts change on a 5s poll with no user action behind them, so a
-         screen reader would never learn a device went offline. aria-live="polite"
-         announces the change at the next pause instead of interrupting. -->
-    <div
-      class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6"
-      role="status"
-      aria-live="polite"
-    >
-      <div class="ui-panel p-4">
-        <div class="text-xs text-gray-400">设备总数</div>
-        <div class="text-2xl font-extrabold mt-1">{{ totalCount }}</div>
+    <!-- One strip, not four cards.
+         These are three related numbers plus a timestamp; giving each its own
+         bordered panel with a 24px extrabold figure made four competing focal
+         points out of a single summary. They now share one row, divided rather than
+         boxed, at a size that reads as a readout instead of a headline.
+
+         aria-live: the counts change on a 5s poll with no user action behind them,
+         so without it a screen reader never learns a device dropped. -->
+    <div class="stat-strip" role="status" aria-live="polite">
+      <div class="stat">
+        <span class="stat-label">设备总数</span>
+        <span class="stat-value">{{ totalCount }}</span>
       </div>
-      <div class="ui-panel p-4">
-        <div class="text-xs text-gray-400">在线</div>
-        <div class="text-2xl font-extrabold mt-1 text-success-600 dark:text-success-400">{{ onlineCount }}</div>
+      <div class="stat">
+        <span class="stat-label">在线</span>
+        <span class="stat-value text-success-600 dark:text-success-400">{{ onlineCount }}</span>
       </div>
-      <div class="ui-panel p-4">
-        <div class="text-xs text-gray-400">离线</div>
-        <div class="text-2xl font-extrabold mt-1 text-danger-600 dark:text-danger-400">{{ offlineCount }}</div>
+      <div class="stat">
+        <span class="stat-label">离线</span>
+        <span class="stat-value" :class="offlineCount > 0 ? 'text-danger-600 dark:text-danger-400' : ''">{{ offlineCount }}</span>
       </div>
-      <div class="ui-panel p-4">
-        <div class="text-xs text-gray-400">最近刷新</div>
-        <!-- The timestamp ticks every poll; announcing it would talk over the
-             counts above, which are the part worth hearing. -->
-        <div class="text-sm font-mono mt-2 text-gray-600 dark:text-gray-300" aria-hidden="true">
+      <!-- aria-hidden: the clock ticks every poll and would talk over the counts,
+           which are the part worth announcing. -->
+      <div class="stat stat-timestamp" aria-hidden="true">
+        <span class="stat-label">最近刷新</span>
+        <span class="stat-value stat-value-clock">
           {{ lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString() : '--:--:--' }}
-        </div>
+        </span>
       </div>
     </div>
 
@@ -139,8 +140,9 @@ onMounted(() => {
 
     <EmptyState v-else-if="devices.length === 0" title="暂无设备接入" subtitle="请先在设备管理中添加或接管设备" />
 
-    <!-- Grid View -->
-    <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-5">
+    <!-- gap-3, not gap-5. With panels this size a 20px gutter reads as a scatter of
+         separate objects; 12px lets the grid read as one block of devices. -->
+    <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-3">
       <DeviceCard
         v-for="dev in devices"
         :key="dev.id"
@@ -151,7 +153,7 @@ onMounted(() => {
 
     <TrafficAnalysisPanel
       v-if="devices.length > 0 || !loading"
-      class="mt-8"
+      class="mt-6"
       :analysis="analysis"
       :loading="analysisLoading"
       :error="analysisError"
@@ -163,3 +165,65 @@ onMounted(() => {
     />
   </div>
 </template>
+
+<style scoped>
+/* Divided, not boxed: one bordered container with internal rules, so the four
+   figures read as one summary line. */
+.stat-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-md);
+  background: var(--ui-surface-solid);
+  margin-bottom: 1.25rem;
+  overflow: hidden;
+}
+
+.stat {
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.stat + .stat {
+  border-left: 1px solid var(--ui-border-solid);
+}
+
+.stat-label {
+  font-size: 0.6875rem;
+  color: var(--ui-text-faint);
+}
+
+/* tabular-nums so a count changing from 9 to 10 does not shift the layout. */
+.stat-value {
+  font-size: 1.125rem;
+  font-weight: 550;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  color: var(--ui-text);
+}
+
+.stat-value-clock {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  color: var(--ui-text-muted);
+  font-feature-settings: 'tnum';
+}
+
+/* Two columns on narrow screens; the timestamp is the first thing to go. */
+@media (max-width: 640px) {
+  .stat-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stat:nth-child(3) {
+    border-left: 0;
+  }
+
+  .stat:nth-child(n + 3) {
+    border-top: 1px solid var(--ui-border-solid);
+  }
+}
+</style>

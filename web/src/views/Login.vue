@@ -22,13 +22,12 @@ async function handleLogin() {
     return
   }
   loading.value = true
-  // Mock delay for feel
-  await new Promise<void>(r => setTimeout(r, 600))
+  // No artificial delay here. There used to be a 600ms sleep labelled "mock delay
+  // for feel", which only made signing in slower.
   const success = await auth.login(form.value.username, form.value.password)
   loading.value = false
 
   if (success) {
-    ElMessage.success('欢迎回来')
     const q = typeof route.query.redirect === 'string' ? route.query.redirect : ''
     let redirect = q ? decodeURIComponent(q) : ''
     if (!redirect) {
@@ -55,61 +54,169 @@ async function handleLogin() {
 </script>
 
 <template>
-  <div class="relative w-full h-full flex items-center justify-center overflow-hidden">
-    <div class="absolute -top-32 -left-32 w-[520px] h-[520px] rounded-full bg-primary-500/15 dark:bg-primary-500/20 blur-[120px] animate-pulse-slow" />
-    <div class="absolute -bottom-32 -right-32 w-[520px] h-[520px] rounded-full bg-violet-500/15 dark:bg-violet-500/20 blur-[120px] animate-pulse-slow" style="animation-delay: 2s" />
-
-    <div class="relative w-full max-w-md p-1">
-      <div class="relative bg-white/70 dark:bg-[#141418]/70 backdrop-blur-xl border border-gray-100 dark:border-white/10 rounded-2xl p-8 shadow-2xl overflow-hidden group">
-        <div class="absolute inset-0 bg-gradient-to-br from-primary-500/8 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none" />
-
-        <div class="text-center mb-10 relative z-10">
-          <div class="w-20 h-20 bg-gradient-to-tr from-primary-500 to-violet-600 rounded-2xl mx-auto flex items-center justify-center text-white text-2xl font-bold shadow-lg shadow-primary-500/20 mb-6 transform group-hover:scale-105 transition-transform duration-300">
-            VH
+  <!-- Deliberately plain.
+       This screen used to carry two 520px pulsing blur orbs, a gradient-filled
+       wordmark, a gradient logo tile that scaled on hover, and a gradient submit
+       button with shadow-2xl. None of it told the operator anything, and the
+       combination is what reads as generic. What is left is a single framed panel,
+       one accent (the submit button), and type doing the hierarchy. -->
+  <div class="w-full h-full flex items-center justify-center px-6">
+    <div class="w-full max-w-sm">
+      <div class="login-panel">
+        <div class="mb-8">
+          <div class="flex items-baseline gap-2">
+            <h1 class="text-xl font-semibold tracking-tight text-gray-900 dark:text-gray-50">Shannon</h1>
+            <span class="text-xl font-light tracking-tight text-gray-400 dark:text-gray-500">IMS</span>
           </div>
-          <h2 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-gray-900 to-gray-600 dark:from-white dark:to-gray-400">
-            VoHive
-          </h2>
-          <p class="text-gray-500 dark:text-gray-400 text-sm mt-3 tracking-wide">4G 模组管理后台</p>
+          <p class="mt-1.5 text-[13px] text-gray-500 dark:text-gray-400">VoWiFi 设备管理控制台</p>
         </div>
 
-        <form @submit.prevent="handleLogin" class="space-y-6 relative z-10">
-          <div class="space-y-2">
-            <div class="relative">
-              <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400 dark:text-gray-500">
-                <Person24Regular class="w-5 h-5" />
-              </div>
-              <input                v-model="form.username"                class="w-full bg-white/70 dark:bg-black/20 border border-gray-200 dark:border-white/10 rounded-lg py-3 pl-10 pr-4 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/25 focus:border-primary-500/40 transition-all font-mono text-sm"
-                placeholder="用户名"
-                type="text"
-              />
-            </div>
-          </div>
+        <form class="space-y-3" @submit.prevent="handleLogin">
+          <label class="login-field">
+            <span class="login-field-icon"><Person24Regular /></span>
+            <input
+              v-model="form.username"
+              type="text"
+              autocomplete="username"
+              placeholder="用户名"
+              aria-label="用户名"
+            />
+          </label>
 
-          <div class="space-y-2">
-            <div class="relative">
-              <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400 dark:text-gray-500">
-                <LockClosed24Regular class="w-5 h-5" />
-              </div>
-              <input                v-model="form.password"                class="w-full bg-white/70 dark:bg-black/20 border border-gray-200 dark:border-white/10 rounded-lg py-3 pl-10 pr-4 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/25 focus:border-primary-500/40 transition-all font-mono text-sm"
-                placeholder="密码"
-                type="password"
-              />
-            </div>
-          </div>
+          <label class="login-field">
+            <span class="login-field-icon"><LockClosed24Regular /></span>
+            <input
+              v-model="form.password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="密码"
+              aria-label="密码"
+            />
+          </label>
 
-          <button            type="submit"            :disabled="loading"
-            class="w-full bg-gradient-to-r from-primary-600 to-violet-600 hover:from-primary-500 hover:to-violet-500 text-white font-bold py-3 px-4 rounded-lg shadow-lg shadow-primary-600/30 flex items-center justify-center gap-2 transform active:scale-95 transition-all duration-200 disabled:opacity-70 disabled:cursor-not-allowed"
-          >
-            <span v-if="loading" class="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
-            <span v-else>登录</span>
-            <ArrowRight24Regular v-if="!loading" class="w-5 h-5" />
+          <button type="submit" class="login-submit" :disabled="loading">
+            <span v-if="loading" class="login-spinner" aria-hidden="true" />
+            <span>{{ loading ? '登录中' : '登录' }}</span>
+            <ArrowRight24Regular v-if="!loading" class="login-submit-arrow" aria-hidden="true" />
           </button>
         </form>
       </div>
-      <div class="text-center mt-6">
-        <p class="text-gray-500 text-xs">VoHive &copy; 2026</p>
-      </div>
+
+      <p class="mt-5 text-center text-[11px] text-gray-400 dark:text-gray-500 tabular-nums">
+        Shannon IMS &middot; 2026
+      </p>
     </div>
   </div>
 </template>
+
+<style scoped>
+/* One border, one radius step, no blur. The panel reads as a single surface
+   rather than a card floating over decoration. */
+.login-panel {
+  background: var(--ui-surface-solid);
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-lg);
+  padding: 2rem;
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.login-field {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  height: 2.75rem;
+  padding: 0 0.875rem;
+  border: 1px solid var(--ui-border-solid);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface-solid-muted);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+/* focus-within, not focus: the ring belongs to the whole field so the icon is
+   inside it. */
+.login-field:focus-within {
+  border-color: var(--ui-accent);
+  box-shadow: 0 0 0 3px var(--ui-accent-soft);
+}
+
+.login-field-icon {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--ui-text-faint);
+}
+
+.login-field-icon :deep(svg) {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+
+.login-field input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 0.875rem;
+  color: inherit;
+}
+
+.login-field input::placeholder {
+  color: var(--ui-text-faint);
+}
+
+.login-submit {
+  width: 100%;
+  height: 2.75rem;
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border: 0;
+  border-radius: var(--ui-radius-sm);
+  background: var(--ui-accent);
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 140ms ease;
+}
+
+.login-submit:hover:not(:disabled) {
+  background: var(--ui-accent-strong);
+}
+
+.login-submit:focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 2px;
+}
+
+.login-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.login-submit-arrow {
+  width: 1rem;
+  height: 1rem;
+}
+
+.login-spinner {
+  width: 0.875rem;
+  height: 0.875rem;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: login-spin 600ms linear infinite;
+}
+
+@keyframes login-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-spinner {
+    animation-duration: 2s;
+  }
+}
+</style>

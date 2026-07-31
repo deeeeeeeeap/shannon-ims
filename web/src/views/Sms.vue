@@ -1021,7 +1021,7 @@ async function confirmDeleteThread(thread: SmsThread) {
                       </el-button>
                     </div>
                     <div
-                      class="px-5 py-4 rounded-2xl text-sm leading-[1.75] shadow-sm border"
+                      class="px-5 py-4 rounded-lg text-sm leading-[1.75] shadow-sm border"
                       :class="m.type === 1
                         ? 'bg-white/90 dark:bg-white/5 text-gray-700 dark:text-gray-200 border-gray-100 dark:border-white/10'
                         : 'bg-primary-50 dark:bg-primary-500/10 text-gray-800 dark:text-gray-100 border-primary-100 dark:border-primary-500/20'"

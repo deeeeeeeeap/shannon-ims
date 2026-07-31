@@ -110,7 +110,7 @@ function clearATHistory() {
       <div v-for="(h, i) in atHistory" :key="h.ts + h.cmd + i" class="flex flex-col gap-2 w-full">
         <!-- 请求记录（右侧气泡） -->
         <div class="flex w-full justify-end">
-          <div class="max-w-[80%] bg-primary-500 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm">
+          <div class="max-w-[80%] bg-primary-500 text-white rounded-lg rounded-tr-sm px-4 py-2.5 shadow-sm">
             <div class="text-sm font-mono break-words">{{ h.cmd }}</div>
             <div class="text-[10px] text-primary-100 mt-1 text-right">{{ new Date(h.ts).toLocaleTimeString() }}</div>
           </div>
@@ -118,7 +118,7 @@ function clearATHistory() {
 
         <!-- 响应/错误记录（左侧气泡） -->
         <div class="flex w-full justify-start">
-          <div class="max-w-[80%] rounded-2xl rounded-tl-sm px-4 py-2.5 shadow-sm" :class="!h.ok ? 'bg-danger-50 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 border border-danger-100 dark:border-danger-900/50' : 'bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-white/5'">
+          <div class="max-w-[80%] rounded-lg rounded-tl-sm px-4 py-2.5 shadow-sm" :class="!h.ok ? 'bg-danger-50 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 border border-danger-100 dark:border-danger-900/50' : 'bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-white/5'">
             <div class="text-sm whitespace-pre-wrap break-words font-mono">{{ h.response }}</div>
             <div class="text-[10px] mt-1 text-gray-400 flex items-center gap-2">
               <span>{{ new Date(h.ts).toLocaleTimeString() }}</span>
@@ -130,7 +130,7 @@ function clearATHistory() {
 
       <!-- 发送中等待状态（左侧呼吸气泡） -->
       <div v-if="atSending" class="flex w-full justify-start mt-2">
-        <div class="max-w-[80%] bg-white dark:bg-gray-800 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm border border-gray-100 dark:border-white/5 flex items-center gap-2">
+        <div class="max-w-[80%] bg-white dark:bg-gray-800 rounded-lg rounded-tl-sm px-4 py-3 shadow-sm border border-gray-100 dark:border-white/5 flex items-center gap-2">
           <div class="flex space-x-1">
             <div class="w-1.5 h-1.5 bg-primary-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
             <div class="w-1.5 h-1.5 bg-primary-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>

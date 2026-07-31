@@ -33,10 +33,14 @@ defineEmits<{ (e: 'logout'): void }>()
 
 <template>
   <div class="h-full relative sidebar-shell">
+    <!-- The wordmark carries the brand, not a gradient tile. The mark shown when
+         collapsed is a plain monogram in the accent colour; at full width the name
+         is set in two weights instead of being filled with a gradient. -->
     <div class="px-4 flex items-center" :class="[headerClass, collapsed ? 'justify-center px-0' : '']">
-      <div class="sidebar-brand-icon">V</div>
-      <div v-if="!collapsed" class="ml-3">
-        <div class="sidebar-brand-title">VoHive</div>
+      <div v-if="collapsed" class="sidebar-monogram">S</div>
+      <div v-else class="sidebar-wordmark">
+        <span class="sidebar-wordmark-name">Shannon</span>
+        <span class="sidebar-wordmark-suffix">IMS</span>
       </div>
     </div>
 
@@ -82,42 +86,43 @@ defineEmits<{ (e: 'logout'): void }>()
   --sidebar-menu-active-ring: var(--ui-accent-ring);
 }
 
-/* Was "Space Grotesk", which came from the Google Fonts link that has been
-   removed; with no webfont behind it the name silently resolved to whatever
-   sans-serif the OS picked. Inter at 700 with tighter tracking carries the
-   wordmark instead, and it is a weight the bundled variable font really has. */
-.sidebar-brand-title {
-  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 1.62rem;
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1;
+/* Two weights of one typeface, no gradient fill and no drop shadow. The previous
+   version painted the name with a linear-gradient through background-clip:text and
+   sat it next to a gradient tile with a coloured glow -- a lot of effect for a
+   six-letter word, and the single loudest "generic dashboard" cue in the shell. */
+.sidebar-wordmark {
   display: flex;
-  align-items: center;
-  min-height: 1.75rem;
-  background: linear-gradient(135deg, var(--ui-accent), #a855f7);
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  filter: drop-shadow(0 2px 8px var(--ui-accent-ring));
+  align-items: baseline;
+  gap: 0.3rem;
   white-space: nowrap;
-  padding-right: 4px;
+  min-width: 0;
 }
 
-.sidebar-brand-icon {
-  width: 1.62rem;
-  height: 1.62rem;
-  border-radius: 0.5rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.sidebar-wordmark-name {
+  font-size: 0.98rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--ui-text);
+}
+
+.sidebar-wordmark-suffix {
+  font-size: 0.98rem;
+  font-weight: 300;
+  letter-spacing: 0.02em;
+  color: var(--ui-text-faint);
+}
+
+.sidebar-monogram {
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: var(--ui-radius-sm);
+  display: grid;
+  place-items: center;
   flex-shrink: 0;
-  background: linear-gradient(135deg, var(--ui-accent), #a855f7);
-  color: #fff;
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 0.84rem;
-  font-weight: 700;
-  box-shadow: 0 6px 14px var(--ui-accent-ring);
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+  font-size: 0.78rem;
+  font-weight: 600;
 }
 
 .sidebar-menu-label {

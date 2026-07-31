@@ -6,16 +6,45 @@ defineProps<{
 </script>
 
 <template>
-  <div class="p-12 text-center rounded-2xl border border-dashed border-gray-300 dark:border-gray-700 ui-surface-muted">
-    <div class="mx-auto w-12 h-12 rounded-2xl bg-gray-100/80 dark:bg-white/5 flex items-center justify-center text-gray-500 dark:text-gray-300">
-      <slot name="icon">
-        <span class="text-xl font-bold">∅</span>
-      </slot>
-    </div>
-    <div class="mt-4 text-sm font-bold text-gray-700 dark:text-gray-200">{{ title }}</div>
-    <div v-if="subtitle" class="mt-1 text-xs text-gray-400">{{ subtitle }}</div>
-    <div class="mt-5 flex items-center justify-center gap-2">
+  <!-- Was a 48px dashed-border box with a large centred set-theory glyph in a
+       rounded tile. The glyph carried no meaning and the dashed frame drew as much
+       attention as real content. An empty list should be quiet: say what is missing
+       and offer the action, nothing more. -->
+  <div class="empty-state">
+    <p class="empty-state-title">{{ title }}</p>
+    <p v-if="subtitle" class="empty-state-subtitle">{{ subtitle }}</p>
+    <div class="empty-state-actions">
       <slot name="actions" />
     </div>
   </div>
 </template>
+
+<style scoped>
+.empty-state {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+}
+
+.empty-state-title {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--ui-text-muted);
+}
+
+.empty-state-subtitle {
+  margin: 0.375rem 0 0;
+  font-size: 0.75rem;
+  color: var(--ui-text-faint);
+}
+
+/* Collapses to nothing when the slot is unused, so an empty state with no action
+   does not reserve a gap. */
+.empty-state-actions:not(:empty) {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+</style>

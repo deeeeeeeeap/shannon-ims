@@ -91,6 +91,11 @@ type Registrar struct {
 }
 
 // NewRegistrar 创建 Linphone 注册服务
+//
+// The User-Agent string is deliberately left as "VoHive/1.0" and not rebranded:
+// it is a SIP header sent to the carrier's P-CSCF, not UI text. Registration was
+// validated against live networks with this exact value, and a P-CSCF may treat a
+// different UA differently. Changing it means re-validating on real hardware.
 func NewRegistrar(cfg Config) (*Registrar, error) {
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgent("VoHive/1.0"),
