@@ -26,6 +26,15 @@ type secureStreamMessagingConn interface {
 	WriteServerFlow([]byte) (int, error)
 }
 
+// Done reports termination of the authenticated messaging channel. Callers
+// capture this before handing the client to its lifecycle owner.
+func (c *Client) Done() <-chan struct{} {
+	if c.secure != nil {
+		return c.secure.done
+	}
+	return c.stopDone
+}
+
 // AttachSecureStreamMessaging binds messaging to the already-authenticated
 // protected TCP flows. The connection supplies message framing because a TCP
 // Read is not a SIP message boundary, and supplies the terminating-flow writer
@@ -147,9 +156,7 @@ func (t *secureMessagingTransport) RoundTrip(ctx context.Context, req *sip.Reque
 	}()
 
 	payload := []byte(req.String())
-	t.writeMu.Lock()
-	n, writeErr := t.conn.Write(payload)
-	t.writeMu.Unlock()
+	n, writeErr := t.writeRequest(ctx, payload)
 	if writeErr != nil {
 		return nil, writeErr
 	}
@@ -165,6 +172,36 @@ func (t *secureMessagingTransport) RoundTrip(ctx context.Context, req *sip.Reque
 	case <-t.done:
 		return nil, net.ErrClosed
 	}
+}
+
+func (t *secureMessagingTransport) writeRequest(ctx context.Context, payload []byte) (int, error) {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	deadline, _ := ctx.Deadline()
+	if err := t.conn.SetWriteDeadline(deadline); err != nil {
+		return 0, err
+	}
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = t.conn.SetWriteDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		// Join cancellation before clearing the deadline or allowing another
+		// request to write; an old callback must not time out a later send.
+		if !stopCancel() {
+			<-cancelDone
+		}
+		_ = t.conn.SetWriteDeadline(time.Time{})
+	}()
+	n, err := t.conn.Write(payload)
+	if ctx.Err() != nil {
+		return n, ctx.Err()
+	}
+	return n, err
 }
 
 func (t *secureMessagingTransport) Close() error {
@@ -263,6 +300,10 @@ func (t *secureMessagingTransport) readLoop() {
 }
 
 func (t *secureMessagingTransport) deliverResponse(response *sip.Response) {
+	// Provisional responses must not consume the one-slot final response mailbox.
+	if response.StatusCode < 200 {
+		return
+	}
 	key, err := secureMessagingTransactionKey(response)
 	if err != nil {
 		return

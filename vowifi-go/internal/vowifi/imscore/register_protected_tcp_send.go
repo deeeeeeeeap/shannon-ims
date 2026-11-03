@@ -184,9 +184,9 @@ func runProtectedTCPAuthenticatedRegister(
 		return nil, handled, err
 	}
 	if finalRes.StatusCode != sip.StatusOK {
-		err = newProtectedPhaseError(protectedPhaseStageResponse, fmt.Errorf(
-			"status=%d result=%s",
-			finalRes.StatusCode, registerStatusResult(finalRes.StatusCode)))
+		err = newProtectedPhaseError(protectedPhaseStageResponse, &registrarAttemptError{
+			statusCode: finalRes.StatusCode, reason: registerStatusResult(finalRes.StatusCode),
+		})
 		return nil, handled, err
 	}
 

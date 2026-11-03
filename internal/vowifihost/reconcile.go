@@ -27,7 +27,14 @@ func (m *Manager) DesiredRecoverable(deviceID string) bool {
 		return false
 	}
 	store := m.RuntimeStore()
-	return !store.Active(deviceID) && !store.Starting(deviceID)
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	return desiredRecoverableSlot(store.slots[deviceID])
+}
+
+func desiredRecoverableSlot(slot *runtimeSlot) bool {
+	return slot == nil || (!slot.starting && (slot.instance == nil ||
+		(slot.state.LastErrorClass != "" && slot.state.LastErrorClass != "canceled" && !slot.state.IMSReady)))
 }
 
 func (m *Manager) ScheduleDesiredRecover(ctx context.Context, req DesiredRecoverRequest) bool {
@@ -74,7 +81,7 @@ func (m *Manager) ScheduleDesiredRecover(ctx context.Context, req DesiredRecover
 		}
 		switch result {
 		case desiredRecoverSucceeded:
-			logger.Info("VoWiFi desired recover succeeded", "event", "VOWIFI_DESIRED_RECOVER_SUCCESS", "device", deviceID)
+			logger.Info("VoWiFi desired recover admitted", "event", "VOWIFI_DESIRED_RECOVER_ADMITTED", "device", deviceID)
 		case desiredRecoverPolicyBlocked:
 			logger.Warn("VoWiFi desired recover stopped by policy", "event", "VOWIFI_DESIRED_RECOVER_SKIPPED_POLICY", "device", deviceID)
 		case desiredRecoverFailed:

@@ -108,9 +108,10 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 			return messaging.SendOutcome{}, fmt.Errorf("构建 RP-DATA 失败: %w", err)
 		}
 		parts = append(parts, messaging.SMSPart{
-			RPMR: mr,
-			TPMR: mr,
-			Body: body,
+			ServiceCentre: smsc,
+			RPMR:          mr,
+			TPMR:          mr,
+			Body:          body,
 		})
 	}
 

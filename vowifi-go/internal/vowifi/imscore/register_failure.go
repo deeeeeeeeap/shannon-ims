@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -19,23 +20,50 @@ type safeRegisterFailureError struct {
 	cause  error
 	status int
 	result string
+	// stage names the post-auth step that failed, empty when the failure happened
+	// before authentication. Always a closed-enum value -- see
+	// canonicalProtectedPhaseStage -- because this string is logged.
+	stage string
 }
 
 func (e *safeRegisterFailureError) Error() string {
+	if e.stage != "" {
+		return fmt.Sprintf("IMS REGISTER failed: status=%d result=%s stage=%s", e.status, e.result, e.stage)
+	}
 	return fmt.Sprintf("IMS REGISTER failed: status=%d result=%s", e.status, e.result)
+}
+
+// Stage exposes the failing post-auth stage for diagnostics.
+func (e *safeRegisterFailureError) Stage() string {
+	if e == nil {
+		return ""
+	}
+	return e.stage
 }
 
 func (e *safeRegisterFailureError) Unwrap() error {
 	return e.cause
 }
 
+// Preserve the protocol phase independently of the status/cause. A protected
+// failure may still be a cancellation, a deadline, or an explicit SIP rejection.
 func newSafeRegisterFailure(err error) error {
 	if err == nil {
 		return nil
 	}
+	return classifyRegisterFailure(err)
+}
+
+func classifyRegisterFailure(err error) *safeRegisterFailureError {
 	status := 0
 	result := "network_failure"
+	stage := ""
+
 	var attemptErr *registrarAttemptError
+	var phaseErr *protectedPhaseError
+	if errors.As(err, &phaseErr) {
+		stage = phaseErr.Stage()
+	}
 	switch {
 	case errors.As(err, &attemptErr):
 		status = attemptErr.statusCode
@@ -45,15 +73,18 @@ func newSafeRegisterFailure(err error) error {
 		}
 	case errors.Is(err, context.Canceled):
 		result = "canceled"
-	case errors.Is(err, context.DeadlineExceeded):
+	// Both deadline sentinels: context cancellation and socket read deadlines are
+	// separate error values and either one means the same thing to a reader.
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
 		result = "no_sip_response"
-	case registerErrorReachedAuthPhase(err):
+	case phaseErr != nil || registerErrorReachedAuthPhase(err):
 		result = "auth_phase_reached"
 	}
 	return &safeRegisterFailureError{
 		cause:  err,
 		status: status,
 		result: canonicalRegisterDiagnosticResult(result),
+		stage:  canonicalProtectedPhaseStage(stage),
 	}
 }
 

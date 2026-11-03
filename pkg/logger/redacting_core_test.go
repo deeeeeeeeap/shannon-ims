@@ -26,6 +26,19 @@ func TestRedactingCorePreservesSafePeerCounter(t *testing.T) {
 	}
 }
 
+func TestRedactingCoreRemovesEncodedPDUFields(t *testing.T) {
+	core, observed := observer.New(zap.DebugLevel)
+	log := zap.New(newRedactingCore(core))
+	log.Info("diagnostic", zap.String("pdu_hex", "abcd"), zap.String("tpdu_hex", "cdef"), zap.Int("pdu_len", 2))
+	fields := observed.All()[0].ContextMap()
+	if fields["pdu_hex"] == "abcd" || fields["tpdu_hex"] == "cdef" {
+		t.Fatal("encoded message content was logged")
+	}
+	if fields["pdu_len"] != int64(2) {
+		t.Fatal("safe length was redacted")
+	}
+}
+
 func TestRedactingCoreRemovesSensitiveMessagesAndFields(t *testing.T) {
 	core, observed := observer.New(zap.DebugLevel)
 	log := zap.New(newRedactingCore(core))

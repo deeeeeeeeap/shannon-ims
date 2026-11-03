@@ -2,6 +2,7 @@ package voiceclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -60,22 +61,143 @@ type smsRPAckTask struct {
 	inReplyTo string
 }
 
+// smsReportShape is the de-identified structure of a rejected RP-DATA: which
+// message type it claims to be and how long it is. No user data, no addresses.
+type smsReportShape struct {
+	rpMTI    int
+	tpduKind string
+	tpSRQ    bool
+	tpMMS    bool
+	bodyLen  int
+	tpduLen  int
+}
+
+// describeSMSReportShape walks just far enough into the envelope to name the TPDU
+// type, without validating it. Deliberately tolerant: it runs on bodies the strict
+// parser already rejected, so it must not reject them again -- an unparseable
+// envelope still yields a useful "how far did we get" answer.
+func describeSMSReportShape(body []byte) smsReportShape {
+	shape := smsReportShape{rpMTI: -1, tpduKind: "unknown", bodyLen: len(body)}
+	if len(body) == 0 {
+		shape.tpduKind = "empty"
+		return shape
+	}
+	shape.rpMTI = int(body[0] & 0x07)
+
+	// Same envelope walk as classifySMSStatusReport: RP-MTI, RP-MR, then two
+	// length-prefixed addresses, then the user-data length.
+	offset := 2
+	for field := 0; field < 2; field++ {
+		if offset >= len(body) {
+			shape.tpduKind = "truncated_address"
+			return shape
+		}
+		offset += 1 + int(body[offset])
+	}
+	if offset >= len(body) {
+		shape.tpduKind = "no_user_data"
+		return shape
+	}
+	offset++ // skip the RP user-data length octet
+	if offset >= len(body) {
+		shape.tpduKind = "no_tpdu"
+		return shape
+	}
+
+	tpdu := body[offset:]
+	shape.tpduLen = len(tpdu)
+	shape.tpduKind = smsTPDUKindFromFirstOctet(tpdu[0])
+	shape.tpSRQ = tpdu[0]&0x20 != 0
+	shape.tpMMS = tpdu[0]&0x04 != 0
+	return shape
+}
+
+// smsTPDUKindFromFirstOctet names the TP-MTI for a network-to-MS TPDU
+// (TS 23.040 table 9.2.3.1). Closed set.
+func smsTPDUKindFromFirstOctet(first byte) string {
+	switch first & 0x03 {
+	case 0x00:
+		return "sms_deliver"
+	case 0x01:
+		return "sms_submit_report"
+	case 0x02:
+		return "sms_status_report"
+	default:
+		return "reserved"
+	}
+}
+
+// boundedSMSRejectReason maps a parser error to a closed enum. The error strings
+// are ours, but mapping rather than forwarding them keeps the log key stable if
+// the wording changes and guarantees nothing from the wire can reach a log value.
+func boundedSMSRejectReason(err error) string {
+	if err == nil {
+		return "none"
+	}
+	switch msg := err.Error(); {
+	case strings.Contains(msg, "not a network-originated RP-DATA"):
+		return "not_network_rp_data"
+	case strings.Contains(msg, "truncated RP address"):
+		return "truncated_rp_address"
+	case strings.Contains(msg, "RP address length out of range"):
+		return "rp_address_length"
+	case strings.Contains(msg, "missing RP user data"):
+		return "missing_rp_user_data"
+	case strings.Contains(msg, "invalid RP user data length"):
+		return "rp_user_data_length"
+	case strings.Contains(msg, "not an SMS-STATUS-REPORT"):
+		return "tpdu_not_status_report"
+	case strings.Contains(msg, "invalid TP recipient length"):
+		return "tp_recipient_length"
+	case strings.Contains(msg, "truncated TP recipient"):
+		return "tp_recipient_truncated"
+	case strings.Contains(msg, "timestamps or status"):
+		return "tpdu_truncated"
+	case strings.Contains(msg, "timestamp"):
+		return "tp_timestamp_invalid"
+	default:
+		return "other"
+	}
+}
+
 func (c *Client) processSMSStatusReport(req *sip.Request) (*sip.Response, *smsRPAckTask) {
-	report, err := classifySMSStatusReport(req.Body())
+	body := req.Body()
+	report, err := classifySMSStatusReport(body)
 	if err != nil {
+		// "malformed" on its own is a dead end: every rejection reason inside
+		// classifySMSStatusReport produced the same log line and the error was
+		// discarded, so a message that simply is not a STATUS-REPORT looked
+		// identical to a corrupt one.
+		//
+		// A live 310/240 send sat at acked forever with exactly this warning, and
+		// there was no way to tell whether the carrier sent a STATUS-REPORT this
+		// parser rejects (e.g. TP-SRQ set) or an inbound SMS-DELIVER that reached
+		// this function only because incomingMessageResult routes on RP-MTI alone --
+		// SMS-DELIVER shares RP-MTI = 1.
+		//
+		// The fields below are structural: message-type bits and lengths, never user
+		// data, addresses or identifiers.
+		shape := describeSMSReportShape(body)
 		logger.Warn("IMS SMS status report",
 			logger.String("report_kind", "sms_status_report"),
 			logger.String("tp_status_class", "malformed"),
 			logger.Int("tp_status", 0),
 			logger.String("correlation_method", "none"),
-			logger.Int("part_index", 0))
+			logger.Int("part_index", 0),
+			logger.String("reject_reason", boundedSMSRejectReason(err)),
+			logger.String("tpdu_kind", shape.tpduKind),
+			logger.Bool("tp_srq", shape.tpSRQ),
+			logger.Bool("tp_mms", shape.tpMMS),
+			logger.Int("rp_mti", shape.rpMTI),
+			logger.Int("body_len", shape.bodyLen),
+			logger.Int("tpdu_len", shape.tpduLen))
 		return sip.NewResponseFromRequest(req, 200, "OK", nil), nil
 	}
 
 	correlationMethod := "none"
 	partIndex := 0
 	if store, ok := c.cfg.DeliveryStore.(messaging.StatusReportStore); ok {
-		match, _ := store.MarkSMSDeliveryPartStatusReport(
+		match, storeErr := store.MarkSMSDeliveryPartStatusReport(
 			c.cfg.IMSI,
 			c.cfg.DeviceID,
 			report.recipient,
@@ -84,6 +206,9 @@ func (c *Client) processSMSStatusReport(req *sip.Request) (*sip.Response, *smsRP
 			int(report.tpStatus),
 			time.Now(),
 		)
+		if storeErr != nil && !errors.Is(storeErr, messaging.ErrDeliveryNotFound) {
+			return sip.NewResponseFromRequest(req, 503, "Service Unavailable", nil), nil
+		}
 		correlationMethod = boundedSMSCorrelationMethod(match.CorrelationMethod)
 		if match.PartNo > 0 && match.PartNo <= 255 {
 			partIndex = match.PartNo

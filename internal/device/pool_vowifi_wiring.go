@@ -3,9 +3,9 @@ package device
 import (
 	"fmt"
 
-	"github.com/emiago/sipgo/sip"
 	"github.com/1239t/vohive/internal/sipgw"
 	"github.com/1239t/vowifi-go/runtimehost/voicehost"
+	"github.com/emiago/sipgo/sip"
 
 	"github.com/1239t/vohive/pkg/logger"
 )
@@ -15,7 +15,7 @@ func (p *Pool) SetVoiceGateway(g *voicehost.Gateway) {
 	p.mu.Lock()
 	p.voiceGateway = g
 	p.mu.Unlock()
-	p.voWiFiHost().ConfigureRuntimeDependencies(g, vowifiDeliveryStore{}, poolVoWiFiRuntimeDispatcher{pool: p})
+	p.voWiFiHost().ConfigureRuntimeDependencies(g, vowifiDeliveryStore{pool: p}, poolVoWiFiRuntimeDispatcher{pool: p})
 }
 
 // GetVoiceGateway 返回绑定的 VoiceGateway 实例

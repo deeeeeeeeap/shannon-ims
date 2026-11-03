@@ -2,7 +2,6 @@ package device
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -204,7 +203,6 @@ func (w *Worker) handleNewSMSRawQMI(info qmicore.RawSMSIndication) {
 	if err != nil {
 		logger.Error(fmt.Sprintf("[%s] 解析原始短信失败 (QMI)", w.ID),
 			"pdu_len", len(info.PDU),
-			"pdu_hex", rawSMSPDUHexForLog(info.PDU),
 			"ack_required", info.AckRequired,
 			"transaction_id", info.TransactionID,
 			"format", info.Format,
@@ -239,14 +237,6 @@ func (w *Worker) ackRawSMSQMI(info qmicore.RawSMSIndication, reason string) {
 			"err", err,
 		)
 	}
-}
-
-func rawSMSPDUHexForLog(pdu []byte) string {
-	const maxRawSMSLogBytes = 128
-	if len(pdu) <= maxRawSMSLogBytes {
-		return strings.ToUpper(hex.EncodeToString(pdu))
-	}
-	return strings.ToUpper(hex.EncodeToString(pdu[:maxRawSMSLogBytes])) + "...(truncated)"
 }
 
 func (w *Worker) processDecodedSMSQMI(sms *qmimanager.DecodedSMS) {

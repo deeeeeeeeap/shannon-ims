@@ -229,11 +229,9 @@ func runSecureAuthenticatedRegister(ctx context.Context, cfg Config, swuTCP voic
 	}
 	if finalRes.StatusCode != sip.StatusOK {
 		_ = secureTransport.Close()
-		return nil, fmt.Errorf(
-			"authenticated REGISTER failed: status=%d result=%s",
-			finalRes.StatusCode,
-			registerStatusResult(finalRes.StatusCode),
-		)
+		return nil, newProtectedPhaseError(protectedPhaseStageResponse, &registrarAttemptError{
+			statusCode: finalRes.StatusCode, reason: registerStatusResult(finalRes.StatusCode),
+		})
 	}
 	return finalizeRegisterSuccess(cfg, *state, finalRes)
 }

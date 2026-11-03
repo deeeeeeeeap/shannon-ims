@@ -285,36 +285,9 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 			}
 		}
 	} else if hasManagedQMINetwork(devCfg) {
-		configuredStatic := QMIDevice{
-			ControlPath:  devCfg.ControlDevice,
-			NetInterface: devCfg.Interface,
-			ATPort:       devCfg.ATPort,
-			USBPath:      devCfg.USBPath,
-		}
-		selected := configuredStatic
-		selectedByDiscovery := false
-		if !controlDeviceReady && strings.TrimSpace(devCfg.ModemIMEI) != "" {
-			qmiList, qmiErr := discoveryCache.Get()
-			if qmiErr != nil {
-				logger.Debug("QMI 静态路径启动前发现失败", "device", devCfg.ID, "err", qmiErr)
-			} else {
-				hardware := p.collectRescanHardware(qmiList, liveWorkerIndex)
-				resolved := ResolveDeviceIdentities(hardware, []config.DeviceConfig{devCfg})
-				if len(resolved.Matched) > 0 {
-					hw := resolved.Matched[0].Hardware
-					selected = QMIDevice{
-						ControlPath:  strings.TrimSpace(hw.ControlPath),
-						NetInterface: hw.NetInterface,
-						ATPort:       hw.ATPort,
-						USBPath:      hw.USBPath,
-					}
-					selectedByDiscovery = true
-				}
-			}
-		}
-		if !controlDeviceReady && !selectedByDiscovery && controlDeviceStatErr != nil {
-			return nil, fmt.Errorf("设备控制口 %s 不存在，可能模块尚未重新枚举: %w",
-				strings.TrimSpace(devCfg.ControlDevice), controlDeviceStatErr)
+		selected, err := p.resolveManagedQMIAttachment(devCfg, controlDeviceReady, controlDeviceStatErr, discoveryCache, liveWorkerIndex)
+		if err != nil {
+			return nil, err
 		}
 		matched = &selected
 	} else if imei := strings.TrimSpace(devCfg.ModemIMEI); imei != "" {
@@ -731,4 +704,35 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	p.persistDeviceAttachmentsIfChanged(devCfg)
 
 	return w, nil
+}
+
+// Resolve attachment before opening the control plane. Discovery can be tested
+// independently of QMI proxy availability and modem startup.
+func (p *Pool) resolveManagedQMIAttachment(devCfg config.DeviceConfig, controlReady bool, statErr error, discovery *qmiBootstrapDiscoveryCache, live WorkerDiscoveryIndex) (QMIDevice, error) {
+	selected := QMIDevice{
+		ControlPath: devCfg.ControlDevice, NetInterface: devCfg.Interface,
+		ATPort: devCfg.ATPort, USBPath: devCfg.USBPath,
+	}
+	selectedByDiscovery := false
+	if !controlReady && strings.TrimSpace(devCfg.ModemIMEI) != "" {
+		qmiList, err := discovery.Get()
+		if err != nil {
+			logger.Debug("QMI 静态路径启动前发现失败", "device", devCfg.ID, "err", err)
+		} else {
+			hardware := p.collectRescanHardware(qmiList, live)
+			resolved := ResolveDeviceIdentities(hardware, []config.DeviceConfig{devCfg})
+			if len(resolved.Matched) > 0 {
+				hw := resolved.Matched[0].Hardware
+				selected = QMIDevice{
+					ControlPath: strings.TrimSpace(hw.ControlPath), NetInterface: hw.NetInterface,
+					ATPort: hw.ATPort, USBPath: hw.USBPath,
+				}
+				selectedByDiscovery = true
+			}
+		}
+	}
+	if !controlReady && !selectedByDiscovery && statErr != nil {
+		return QMIDevice{}, fmt.Errorf("设备控制口 %s 不存在，可能模块尚未重新枚举: %w", strings.TrimSpace(devCfg.ControlDevice), statErr)
+	}
+	return selected, nil
 }

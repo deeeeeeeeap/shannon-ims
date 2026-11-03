@@ -468,16 +468,22 @@ func (c *Client) doTransaction(ctx context.Context, req *sip.Request, opts ...si
 	terminate := func() { terminateOnce.Do(func() { tx.Terminate() }) }
 	defer terminate()
 
-	select {
-	case <-tx.Done():
-		if err := tx.Err(); err != nil {
-			return nil, fmt.Errorf("transaction ended: %w", err)
+	for {
+		select {
+		case <-tx.Done():
+			if err := tx.Err(); err != nil {
+				return nil, fmt.Errorf("transaction ended: %w", err)
+			}
+			return nil, fmt.Errorf("transaction ended without a response")
+		case res, ok := <-tx.Responses():
+			if !ok {
+				return nil, fmt.Errorf("transaction response stream closed")
+			}
+			if res != nil && res.StatusCode >= 200 {
+				return res, nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("transaction ended without a response")
-	case res := <-tx.Responses():
-		return res, nil
-	case <-ctx.Done():
-		terminate()
-		return nil, ctx.Err()
 	}
 }

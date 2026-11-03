@@ -237,7 +237,7 @@ func (s *Store) ClaimStarted(deviceID string, epoch uint64, inst *runtimehost.In
 		s.mu.Unlock()
 		return false
 	}
-	currentAPDUScheduleRun := slot.recoverScheduleDone != nil &&
+	currentAPDUScheduleRun := (slot.recoverScheduleDone != nil || slot.recoverInFlight) &&
 		slot.runKind == LifecycleCommandRecover &&
 		slot.runRecoverGeneration == slot.recoverGeneration
 	var scheduleCancel context.CancelFunc
@@ -248,7 +248,7 @@ func (s *Store) ClaimStarted(deviceID string, epoch uint64, inst *runtimehost.In
 		slot.recoverGeneration++
 		resetDesiredRecoverLocked(slot)
 	}
-	slot.state = runtimehost.State{}
+	slot.state = inst.State()
 	slot.updatedAt = time.Now()
 	s.notifyLocked(deviceID)
 	s.mu.Unlock()
@@ -320,6 +320,20 @@ func (s *Store) publishRuntimeState(deviceID string, epoch uint64, inst *runtime
 	if slot.instance != nil {
 		if slot.instance != inst {
 			return false
+		}
+		if !slot.state.UpdatedAt.IsZero() && state.UpdatedAt.Before(slot.state.UpdatedAt) {
+			return false
+		}
+		alreadyFailed := slot.state.LastErrorClass != ""
+		slot.state = state
+		slot.updatedAt = state.UpdatedAt
+		if state.IMSReady {
+			resetDesiredRecoverLocked(slot)
+		} else if !alreadyFailed && state.LastErrorClass != "" && state.LastErrorClass != "canceled" && !slot.recoverInFlight {
+			slot.recoverPresent = true
+			slot.recoverDelay = DesiredRecoverDelay(slot.recoverAttempt)
+			slot.recoverAttempt++
+			slot.recoverNextAt = time.Now().Add(slot.recoverDelay)
 		}
 		s.notifyLocked(deviceID)
 		return true

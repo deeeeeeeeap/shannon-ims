@@ -113,7 +113,21 @@ func (s *Service) SendSMS(ctx context.Context, peer, content string, parts []mes
 // before the stream messaging adapter is available, so this capability must not
 // be inferred from registration success alone.
 func (s *Service) MessagingReady() bool {
-	return s != nil && s.inner != nil
+	if s == nil || s.inner == nil {
+		return false
+	}
+	select {
+	case <-s.inner.Done():
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Service) Done() <-chan struct{} { return s.inner.Done() }
+
+func (s *Service) RegistrationLifetime() time.Duration {
+	return time.Duration(s.expiresSeconds) * time.Second
 }
 
 func (s *Service) SendUSSD(ctx context.Context, command string) (*messaging.USSDResult, error) {

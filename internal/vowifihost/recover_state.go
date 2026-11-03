@@ -60,7 +60,7 @@ func (s *Store) beginDesiredRecover(deviceID string, now time.Time) (uint64, boo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	slot := s.ensureSlotLocked(deviceID)
-	if slot.instance != nil || slot.starting {
+	if !desiredRecoverableSlot(slot) {
 		return 0, false
 	}
 	if slot.recoverScheduleDone != nil || slot.recoverInFlight || now.Before(slot.recoverNextAt) {
@@ -87,6 +87,15 @@ func (s *Store) finishDesiredRecover(deviceID string, generation uint64, now tim
 	slot := s.slots[deviceID]
 	if slot == nil || !slot.recoverInFlight || slot.recoverGeneration != generation {
 		return DesiredRecoverSnapshot{}, false
+	}
+	// Runtime admission returns before SWu and IMS finish. Preserve the retry
+	// history until that same instance publishes readiness or a terminal error.
+	if result == desiredRecoverSucceeded && slot.instance != nil && !slot.state.IMSReady {
+		if slot.state.LastErrorClass == "" {
+			slot.recoverInFlight = false
+			return desiredRecoverSnapshot(slot), true
+		}
+		result = desiredRecoverFailed
 	}
 	switch result {
 	case desiredRecoverSucceeded, desiredRecoverPolicyBlocked:

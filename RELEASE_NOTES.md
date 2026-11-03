@@ -1,3 +1,31 @@
+# Unreleased — SMS and runtime recovery
+
+## 中文
+
+- 修复短信 SIP 事务把临时响应当成失败的问题，接受最终 `200` / `202`；这两种响应都不会直接标记接收方已送达。
+- SIP 与 RP-DATA 使用发送前读取的同一份 SMSC，避免启动时缺失或过期的短信中心阻断发送。
+- 发送取消可中断阻塞写入；不会因为超时而自动提交第二条短信。
+- IMS SMS-DELIVER 接入真实解码、持久化、乱序长短信重组、收件箱与通知。数据库事务成功后才返回 SIP 成功并安排 RP-ACK；临时存储失败返回 `503`。
+- 投递/状态报告的临时写库错误不再被忽略；无匹配或歧义的报告不更新其他消息。
+- 通道关闭、SWu 退出、注册到期会撤销就绪状态。已失败的实例可进入现有串行恢复流程，异步启动失败保留重试退避。
+
+升级前备份运行数据库。新增 `sms_incoming_part_journals` 表保留未完成分片和去重记录；完整消息与联系人在同一事务中提交，完成分片不保留第二份正文。旧表不删除，旧二进制可忽略新表；回滚期间新接收的未完成分片需等支持此表的版本重新启动后才能继续重组。
+
+当前到期恢复会重建链路，尚非无中断的受保护 REGISTER 续期，恢复时存在短暂不可用。默认使用现有 30 秒检查和 30/60/120 秒失败退避。实卡兼容性仍需逐运营商验证；Wi-Fi Calling 注册成功不等于短信业务授权。没有新增强制绕过、SIM 重置或发送失败自动重试。
+
+## English
+
+- SIP MESSAGE transactions wait past provisional responses and accept final 200/202 responses without claiming recipient delivery.
+- SIP routing and RP-DATA share the SMSC read for the current submission instead of retaining a stale startup value.
+- Cancellation interrupts a blocked request write; ambiguous outcomes are never automatically resubmitted.
+- IMS SMS-DELIVER now reaches decoding, durable out-of-order multipart assembly, inbox storage and notifications. SIP success and RP-ACK follow durable storage; transient database failures receive 503.
+- Delivery/status report persistence errors are propagated. Unmatched or ambiguous reports cannot update unrelated messages.
+- Channel loss, SWu termination and registration expiry revoke readiness. Failed admitted instances can recover through the existing serialized lifecycle with failure backoff preserved across asynchronous startup.
+
+Back up the runtime database before upgrading. The additive `sms_incoming_part_journals` table retains incomplete fragments and deduplication records. Inbox/contact updates commit atomically; completed fragments do not retain a second body copy. Older binaries ignore the new table; pending fragments resume assembly when a supporting version runs again.
+
+Expiry recovery currently rebuilds the connection, with a service interruption; seamless protected REGISTER refresh is not implemented. Recovery uses the existing 30-second check and 30/60/120-second failure backoff. Carrier acceptance still requires live validation. Registration is not proof of SMS entitlement. No SIM reset, policy bypass or automatic SMS resubmission was added.
+
 # Shannon IMS v0.1.0-rc.1
 
 ## 中文

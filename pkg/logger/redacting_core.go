@@ -126,6 +126,9 @@ func classifySensitiveKey(key string) sensitiveKeyKind {
 		"peer", "identity", "subscriber", "username") || key == "call_id" {
 		return sensitiveIdentity
 	}
+	if containsKeyPart(parts, "pdu", "tpdu") {
+		return sensitiveContent
+	}
 	switch key {
 	case "content", "body", "pdu", "tpdu", "payload", "sip_raw", "raw_sip",
 		"route", "request_uri", "destination", "contact", "from", "to":

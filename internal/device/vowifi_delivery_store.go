@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm"
 )
 
-type vowifiDeliveryStore struct{}
+type vowifiDeliveryStore struct{ pool *Pool }
 
 func (vowifiDeliveryStore) CreateSMSDelivery(messageID, imsi, deviceID, peer, content string, partsTotal int, at time.Time) error {
 	return db.CreateSMSDelivery(messageID, imsi, deviceID, peer, content, partsTotal, at)
@@ -38,6 +38,9 @@ func (vowifiDeliveryStore) MarkSMSDeliveryPartReport(inReplyTo, callID, deviceID
 func (vowifiDeliveryStore) MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient string, tpMR int, state string, tpStatus int, at time.Time) (messaging.DeliveryPartMatch, error) {
 	part, err := db.MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient, tpMR, state, tpStatus, at)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, db.ErrSMSDeliveryReportAmbiguous) {
+			return messaging.DeliveryPartMatch{}, messaging.ErrDeliveryNotFound
+		}
 		return messaging.DeliveryPartMatch{}, err
 	}
 	return messaging.DeliveryPartMatch{

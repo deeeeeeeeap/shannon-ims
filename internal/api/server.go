@@ -68,6 +68,7 @@ type Server struct {
 	fullCfg     *config.Config      // 完整配置引用
 	pool        *device.Pool        // 设备工作器池
 	auth        config.WebConfig    // Web 认证配置
+	authMu      sync.RWMutex        // Credentials and session signing share one rotation boundary.
 	fs          http.FileSystem     // 静态文件系统
 	configPath  string              // 配置文件路径
 	runtimeRoot string              // 绝对运行目录
@@ -174,13 +175,20 @@ func checkPassword(stored, input string) bool {
 }
 
 func (s *Server) issueSessionToken() (string, time.Time, error) {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.issueSessionTokenLocked()
+}
+
+// The caller holds authMu so verification and issuance observe one credential set.
+func (s *Server) issueSessionTokenLocked() (string, time.Time, error) {
 	if len(s.sessionSecret) != sessionSecretSize {
 		return "", time.Time{}, fmt.Errorf("session signing is unavailable")
 	}
 	exp := time.Now().Add(30 * 24 * time.Hour) // 有效期 30 天
 	expStr := strconv.FormatInt(exp.Unix(), 10)
 
-	sig := hex.EncodeToString(s.sessionTokenMAC(expStr))
+	sig := hex.EncodeToString(s.sessionTokenMACLocked(expStr))
 
 	tokenRaw := expStr + "." + sig
 	token := base64.StdEncoding.EncodeToString([]byte(tokenRaw))
@@ -2142,8 +2150,10 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
 	if req.Username == s.auth.Username && checkPassword(s.auth.Password, req.Password) {
-		token, exp, err := s.issueSessionToken()
+		token, exp, err := s.issueSessionTokenLocked()
 		if err != nil {
 			logger.Error("生成登录 token 失败", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -2184,6 +2194,9 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 		return
 	}
 
+	// Serialize validation, persistence and publication of a password rotation.
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
 	// 校验当前密码
 	if !checkPassword(s.auth.Password, req.OldPassword) {
 		c.JSON(http.StatusUnauthorized, gin.H{
@@ -2299,6 +2312,8 @@ func (s *Server) authorizeRotate(c *gin.Context, username string, password strin
 		return false
 	}
 
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
 	if username == s.auth.Username && checkPassword(s.auth.Password, password) {
 		return true
 	}
@@ -2340,6 +2355,12 @@ func (s *Server) isSessionTokenValid(token string, now time.Time) bool {
 }
 
 func (s *Server) sessionTokenMAC(expStr string) []byte {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.sessionTokenMACLocked(expStr)
+}
+
+func (s *Server) sessionTokenMACLocked(expStr string) []byte {
 	h := hmac.New(sha256.New, s.sessionSecret)
 	_, _ = io.WriteString(h, "shannon-ims-session-v1\n")
 	_, _ = io.WriteString(h, expStr)

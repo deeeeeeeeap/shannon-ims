@@ -2,7 +2,6 @@ package imscore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -42,26 +41,20 @@ func (s *Service) Start(ctx context.Context) error {
 
 	reg, err := s.runRegisterFlow(registerCtx)
 	if err != nil {
-		status := 0
-		result := "register_failed"
-		var attemptErr *registrarAttemptError
-		if errors.As(err, &attemptErr) {
-			status = attemptErr.statusCode
-			result = attemptErr.reason
-		} else if errors.Is(err, context.Canceled) {
-			result = "canceled"
-		}
+		failure := classifyRegisterFailure(err)
+		reachedAuth := registerReachedAuthenticatedPhase(err) || registerErrorReachedAuthPhase(err)
 		logRegisterDiagnostic(registerDiagnostic{
-			stage:          "register_failed",
-			status:         status,
-			result:         result,
-			transport:      s.imsCfg.Transport,
-			addressFamily:  registerAddressFamily(s.cfg.PCSCFAddr),
-			candidateTotal: len(s.cfg.RegistrarCandidates),
-			hasWarning:     true,
-			reachedAuth:    registerErrorReachedAuthPhase(err),
+			stage:              "register_failed",
+			status:             failure.status,
+			result:             failure.result,
+			transport:          s.imsCfg.Transport,
+			addressFamily:      registerAddressFamily(s.cfg.PCSCFAddr),
+			candidateTotal:     len(s.cfg.RegistrarCandidates),
+			hasWarning:         true,
+			reachedAuth:        reachedAuth,
+			protectedPhaseStep: failure.stage,
 		})
-		return newSafeRegisterFailure(err)
+		return failure
 	}
 	channel, err := s.adoptProtectedChannelResult(reg)
 	if err != nil {

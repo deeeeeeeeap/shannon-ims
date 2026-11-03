@@ -2,7 +2,9 @@ package voiceclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"mime"
 	"strings"
 	"time"
 
@@ -16,7 +18,7 @@ import (
 const smsContentType = "application/vnd.3gpp.sms"
 
 // SendSMS submits each of parts as a separate SIP MESSAGE (3GPP TS 24.341),
-// expecting the immediate 202 Accepted per part, and records delivery
+// accepting SIP 200/202 per part, and records delivery
 // tracking via DeliveryStore. It does not wait for the delivery report
 // (RP-ACK/RP-ERROR) -- that arrives asynchronously as a separate incoming
 // MESSAGE and is handled by handleIncomingMessage, matching how vohive's own
@@ -27,7 +29,16 @@ func (c *Client) SendSMS(ctx context.Context, peer, content string, parts []mess
 	if len(parts) == 0 {
 		return messaging.SendOutcome{}, fmt.Errorf("voiceclient: no parts to send")
 	}
-	serviceCentreURI, err := c.smsServiceCentreURI()
+	smsc := strings.TrimSpace(parts[0].ServiceCentre)
+	for _, part := range parts[1:] {
+		if strings.TrimSpace(part.ServiceCentre) != smsc {
+			return messaging.SendOutcome{}, fmt.Errorf("voiceclient: inconsistent SMS service centre across parts")
+		}
+	}
+	if smsc == "" {
+		smsc = c.cfg.SMSC
+	}
+	serviceCentreURI, err := c.smsServiceCentreURIFor(smsc)
 	if err != nil {
 		return messaging.SendOutcome{}, err
 	}
@@ -73,7 +84,7 @@ func (c *Client) SendSMS(ctx context.Context, peer, content string, parts []mess
 			outcome.DeliveryState = "failed"
 			return outcome, fmt.Errorf("voiceclient: submit part %d: %w", partNo, err)
 		}
-		if res.StatusCode != 202 {
+		if res.StatusCode != 200 && res.StatusCode != 202 {
 			c.markSMSDeliveryPartSubmissionFailed(messageID, partNo, req, int(part.RPMR))
 			outcome.DeliveryState = "failed"
 			return outcome, fmt.Errorf("voiceclient: submit part %d: unexpected response %d %s", partNo, res.StatusCode, res.Reason)
@@ -122,7 +133,11 @@ func (c *Client) markSMSDeliveryPartSubmissionFailed(messageID string, partNo in
 }
 
 func (c *Client) smsServiceCentreURI() (string, error) {
-	raw := strings.TrimSpace(c.cfg.SMSC)
+	return c.smsServiceCentreURIFor(c.cfg.SMSC)
+}
+
+func (c *Client) smsServiceCentreURIFor(value string) (string, error) {
+	raw := strings.TrimSpace(value)
 	if raw == "" {
 		return "", fmt.Errorf("voiceclient: SMS service centre is unavailable")
 	}
@@ -427,16 +442,16 @@ func parseOptionalRPUserData(body []byte, offset int) ([]byte, bool, error) {
 	return body[start:], true, nil
 }
 
-// handleIncomingMessage is the SIP server's MESSAGE handler. It only
-// recognizes delivery reports for our own outbound SMS (Content-Type +
-// classifiable RP envelope); anything else -- notably an inbound
-// SMS-DELIVER from another party -- is out of scope (see package doc
-// comment) and just gets a bare 200 OK so we don't leave the sender's
-// transaction hanging.
+// handleIncomingMessage stores incoming SMS and delivery reports before
+// accepting them. The independent RP acknowledgement follows the SIP response.
 func (c *Client) handleIncomingMessage(req *sip.Request, tx sip.ServerTransaction) {
 	response, rpAck := c.incomingMessageResult(req)
-	if err := tx.Respond(response); err == nil && rpAck != nil && c.secure != nil {
-		c.secure.enqueueRPAck(*rpAck)
+	if err := tx.Respond(response); err == nil && rpAck != nil {
+		if c.secure != nil {
+			c.secure.enqueueRPAck(*rpAck)
+		} else {
+			c.sendStatusReportRPAck(*rpAck)
+		}
 	}
 }
 
@@ -447,10 +462,19 @@ func (c *Client) incomingMessageResponse(req *sip.Request) *sip.Response {
 
 func (c *Client) incomingMessageResult(req *sip.Request) (*sip.Response, *smsRPAckTask) {
 	ct := req.GetHeader("Content-Type")
-	if ct == nil || !strings.EqualFold(ct.Value(), smsContentType) {
+	mediaType := ""
+	if ct != nil {
+		mediaType, _, _ = mime.ParseMediaType(ct.Value())
+	}
+	if !strings.EqualFold(mediaType, smsContentType) {
 		return sip.NewResponseFromRequest(req, 415, "Unsupported Media Type", nil), nil
 	}
-	if body := req.Body(); len(body) > 0 && body[0] == 0x01 {
+	if body := req.Body(); len(body) > 0 && body[0]&0x07 == 0x01 {
+		// RP-DATA carries both incoming SMS and status reports; TP-MTI selects
+		// the consumer, which then validates the complete envelope.
+		if shape := describeSMSReportShape(body); shape.tpduKind == "sms_deliver" {
+			return c.processIncomingSMS(req)
+		}
 		return c.processSMSStatusReport(req)
 	}
 
@@ -466,16 +490,22 @@ func (c *Client) incomingMessageResult(req *sip.Request) (*sip.Response, *smsRPA
 		if irt := req.GetHeader("In-Reply-To"); irt != nil {
 			inReplyTo = irt.Value()
 		}
-		callID := req.CallID().Value()
+		callID := ""
+		if h := req.CallID(); h != nil {
+			callID = h.Value()
+		}
 
 		state := "acked"
 		if report.kind == rpKindError {
 			state = "failed"
 		}
-		match, _ := c.cfg.DeliveryStore.MarkSMSDeliveryPartReport(
+		match, storeErr := c.cfg.DeliveryStore.MarkSMSDeliveryPartReport(
 			inReplyTo, callID, c.cfg.DeviceID, int(report.rpMR),
 			state, 200, report.cause, "", time.Now(),
 		)
+		if storeErr != nil && !errors.Is(storeErr, messaging.ErrDeliveryNotFound) {
+			return sip.NewResponseFromRequest(req, 503, "Service Unavailable", nil), nil
+		}
 		correlationMethod = boundedSMSCorrelationMethod(match.CorrelationMethod)
 		if match.PartNo > 0 && match.PartNo <= 255 {
 			partIndex = match.PartNo

@@ -19,15 +19,10 @@
 //     already resolved for the tunnel (identity.PreparedSession.EAPIdentity())
 //     -- simpler, not a spec claim.
 //
-// Inbound SMS (an unsolicited MESSAGE carrying an RP-DATA SMS-DELIVER, i.e.
-// someone texting the UE) is also out of scope here: decoding a DELIVER
-// TPDU into sender/text needs vohive's pkg/smscodec, which this module
-// can't import (wrong dependency direction) -- symmetric to why
-// messaging.SMSPart carries pre-encoded bytes for the outbound direction.
-// Delivery *reports* for our own outbound SMS (RP-ACK/RP-ERROR) don't have
-// this problem: correlating them only needs the RP envelope's message type
-// and RP-MR (a few fixed bytes per 3GPP TS 24.011), not the TPDU, so that
-// part IS implemented here (see sms.go's classifyRPEnvelope).
+// Inbound SMS decoding and durable assembly belong to messaging.IncomingSMSStore,
+// implemented by the host. This keeps the dependency direction symmetrical with
+// outgoing messaging.SMSPart while letting the SIP layer acknowledge only stored
+// messages. Delivery reports are correlated through DeliveryStore.
 package voiceclient
 
 import (

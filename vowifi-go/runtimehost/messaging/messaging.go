@@ -8,6 +8,15 @@ import (
 
 var ErrDeliveryNotFound = errors.New("delivery not found")
 
+var ErrInvalidIncomingSMS = errors.New("invalid incoming SMS")
+
+// IncomingSMSStore owns TPDU decoding, durable multipart assembly and inbox
+// notification. Nil means every part is durable (or an already-stored duplicate).
+// The transport must not send RP-ACK on an error. No raw TPDU belongs in logs.
+type IncomingSMSStore interface {
+	StoreIncomingSMS(imsi, deviceID string, tpdu []byte, receivedAt time.Time) error
+}
+
 // SMSPart is one already-encoded SMS TPDU part, wrapped in RP-DATA and
 // ready to send as a SIP MESSAGE body. Building this (GSM 7-bit/UCS2 text
 // encoding, concatenation, RP-DATA framing, RP-MR allocation) is the
@@ -15,6 +24,9 @@ var ErrDeliveryNotFound = errors.New("delivery not found")
 // pkg/smscodec (vohive depends on vowifi-go, not the reverse), and the
 // caller already owns the SMSC relationship and delivery bookkeeping.
 type SMSPart struct {
+	// ServiceCentre is the current SIM's SMSC used when encoding Body. All parts
+	// of one submission use the same value. Empty retains the startup fallback.
+	ServiceCentre string
 	// RPMR is this part's RP-Message-Reference. It's already embedded
 	// inside Body, but passed explicitly too so the delivery-report
 	// correlation path (which only needs to recognize an incoming

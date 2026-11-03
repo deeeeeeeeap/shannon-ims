@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { getCurrentScope, onScopeDispose, ref } from 'vue'
 import { api } from '../stores/auth'
 
 export type EventStreamOptions<T> = {
@@ -18,6 +18,7 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
   const lastError = ref('')
   const abortCtrl = ref<AbortController | null>(null)
   const reconnectTimer = ref<number | null>(null)
+  let disposed = false
 
   const queryRef = ref<Record<string, string | number | boolean | undefined>>(options.query || {})
 
@@ -40,12 +41,15 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
   }
 
   async function connect() {
+    if (disposed) return
     disconnect()
     if (paused.value) return
 
     const token = localStorage.getItem('token') || ''
     const controller = new AbortController()
     abortCtrl.value = controller
+    const isCurrent = () => abortCtrl.value === controller && !controller.signal.aborted
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
 
     try {
       const res = await fetch(buildUrl(), {
@@ -53,6 +57,10 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
         headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
         signal: controller.signal
       })
+      if (!isCurrent()) {
+        await res.body?.cancel()
+        return
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       if (!res.body) throw new Error('No stream body')
 
@@ -60,18 +68,20 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
       lastError.value = ''
       options.onConnected?.()
 
-      const reader = res.body.getReader()
+      reader = res.body.getReader()
       const decoder = new TextDecoder('utf-8')
       let buffer = ''
       let eventName = ''
       let dataLines: string[] = []
 
-      while (true) {
+      while (isCurrent()) {
         const { value, done } = await reader.read()
+        // Abort can race with a read that has already settled.
+        if (!isCurrent()) return
         if (done) break
         buffer += decoder.decode(value, { stream: true })
 
-        while (true) {
+        while (isCurrent()) {
           const nl = buffer.indexOf('\n')
           if (nl < 0) break
           let line = buffer.slice(0, nl)
@@ -83,7 +93,7 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
             if (eventName === options.eventName) {
               options.onEvent(options.parse(payload))
             }
-            if (eventName) {
+            if (eventName && isCurrent()) {
               options.onRawEvent?.(eventName, payload)
             }
             eventName = ''
@@ -100,13 +110,22 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
           }
         }
       }
+      if (!isCurrent()) return
       connected.value = false
       if (!paused.value) reconnectLater()
     } catch (err: unknown) {
-      if (controller.signal.aborted) return
+      if (!isCurrent()) return
       connected.value = false
       lastError.value = err instanceof Error ? err.message : String(err)
       reconnectLater()
+    } finally {
+      // Parser/callback failures also need to release the old response body.
+      controller.abort()
+      if (reader) {
+        await reader.cancel().catch(() => {})
+        reader.releaseLock()
+      }
+      if (abortCtrl.value === controller) abortCtrl.value = null
     }
   }
 
@@ -134,6 +153,13 @@ export function useEventStream<T>(options: EventStreamOptions<T>) {
 
   function setQuery(next: Record<string, string | number | boolean | undefined>) {
     queryRef.value = next || {}
+  }
+
+  if (getCurrentScope()) {
+    onScopeDispose(() => {
+      disposed = true
+      disconnect()
+    })
   }
 
   return { connected, paused, lastError, connect, disconnect, setPaused, setQuery }

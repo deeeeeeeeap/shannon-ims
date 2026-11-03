@@ -636,6 +636,11 @@ func (i *Instance) notifyObserversForGeneration(ctx context.Context, generation 
 
 func (i *Instance) failStageForGeneration(ctx context.Context, generation uint64, class, errMsg, reason string) {
 	if !i.updateStateForGeneration(generation, func(s *State) {
+		s.IMSReady = false
+		s.SMSReady = false
+		if class == "tunnel" || class == "access" {
+			s.TunnelReady = false
+		}
 		s.LastErrorClass = class
 		s.LastError = errMsg
 		s.LastReason = reason
@@ -916,6 +921,13 @@ func (i *Instance) runStagedPipeline(ctx context.Context, req StartRequest, gene
 			winningPCSCF = strings.TrimSpace(v)
 		}
 	}
+	channelDone := svc.Done()
+	var expires <-chan time.Time
+	if lifetime := svc.RegistrationLifetime(); lifetime > 0 {
+		timer := time.NewTimer(lifetime)
+		defer timer.Stop()
+		expires = timer.C
+	}
 	if !i.installService(ctx, generation, svc, svc.Status, localIP.String(), winningPCSCF) {
 		return
 	}
@@ -926,6 +938,7 @@ func (i *Instance) runStagedPipeline(ctx context.Context, req StartRequest, gene
 		return
 	}
 	i.notifyObserversForGeneration(ctx, generation)
+	i.watchIMSHealth(pipelineCtx, generation, channelDone, lease.joined, expires)
 }
 
 func resolveEPDGHost(req StartRequest) (string, string) {

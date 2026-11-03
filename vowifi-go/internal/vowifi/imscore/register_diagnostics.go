@@ -37,6 +37,12 @@ type registerDiagnostic struct {
 	ipsecInstalled       bool
 	syncFailure          bool
 
+	// protectedPhaseStep names which post-auth stage failed, on the stages that
+	// report a failure. Empty for everything else, and emitted only when set: a
+	// key that is present-but-empty on every line reads as "measured empty" rather
+	// than "not applicable". Always a closed-enum value.
+	protectedPhaseStep string
+
 	// Warning metadata is independent of hasWarning on purpose. hasWarning is
 	// overloaded: on stage=initial_response it means a Warning header existed,
 	// but several other stages set it only to raise the log level. These fields
@@ -106,6 +112,7 @@ func registerDiagnosticAllowedFieldKeys() map[string]struct{} {
 		"has_require": {}, "requires_sec_agree": {}, "has_www_authenticate": {},
 		"has_proxy_authenticate": {}, "has_security_server": {}, "has_path": {},
 		"has_service_route": {}, "reached_auth": {}, "protected": {},
+		"protected_phase_step": {},
 		"ipsec_installed": {}, "sync_failure": {},
 		"warning_present": {}, "warning_count": {}, "warning_code": {},
 		"warning_class": {}, "warning_parse_result": {},
@@ -229,6 +236,11 @@ func logRegisterDiagnostic(d registerDiagnostic) {
 		logger.Int("inner_packet_len", boundRegisterSIPMessageLen(d.innerPacketLen)),
 		logger.Int("raw_ip_packet_count", boundRegisterESPCounter(d.rawIPPacketCount)),
 		logger.Bool("fragmented", d.fragmented),
+	}
+	// Appended only when set. On every other line the key is absent rather than
+	// empty, so its presence alone means "a post-auth stage failed".
+	if step := canonicalProtectedPhaseStage(d.protectedPhaseStep); step != "" {
+		fields = append(fields, logger.String("protected_phase_step", step))
 	}
 	// Log level stays keyed on hasWarning alone. warningPresent must not change
 	// existing level behavior.

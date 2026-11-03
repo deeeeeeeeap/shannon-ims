@@ -121,7 +121,7 @@ func (t *streamRegisterTransport) Send(ctx context.Context, req *sip.Request) er
 	return t.SendPayload(ctx, []byte(req.String()))
 }
 
-// ReadResponse returns the next complete SIP response.
+// ReadResponse consumes provisional responses and returns the final SIP response.
 //
 // It loops because a Read can return a partial message, several messages, or
 // only the tail of one. The framer decides when a complete frame exists; this
@@ -142,8 +142,8 @@ func (t *streamRegisterTransport) ReadResponse(ctx context.Context) (*sip.Respon
 	}
 
 	// A frame may already have been completed by an earlier read.
-	if frame, ok := t.takePendingLocked(); ok {
-		return parseStreamSIPResponse(frame)
+	if response, err := t.takeFinalResponseLocked(); response != nil || err != nil {
+		return response, err
 	}
 	if err := t.framer.Failed(); err != nil {
 		return nil, err
@@ -162,8 +162,8 @@ func (t *streamRegisterTransport) ReadResponse(ctx context.Context) (*sip.Respon
 			}
 			t.pending = append(t.pending, frames...)
 			t.framesProduced += len(frames)
-			if frame, ok := t.takePendingLocked(); ok {
-				return parseStreamSIPResponse(frame)
+			if response, err := t.takeFinalResponseLocked(); response != nil || err != nil {
+				return response, err
 			}
 		}
 		if readErr != nil {
@@ -173,6 +173,24 @@ func (t *streamRegisterTransport) ReadResponse(ctx context.Context) (*sip.Respon
 				return nil, closeErr
 			}
 			return nil, readErr
+		}
+	}
+}
+
+// A 1xx frame is progress within the same transaction; consuming it must not
+// reset the read deadline or discard a final response in the same TCP read.
+func (t *streamRegisterTransport) takeFinalResponseLocked() (*sip.Response, error) {
+	for {
+		frame, ok := t.takePendingLocked()
+		if !ok {
+			return nil, nil
+		}
+		response, err := parseStreamSIPResponse(frame)
+		if err != nil {
+			return nil, err
+		}
+		if !response.IsProvisional() {
+			return response, nil
 		}
 	}
 }

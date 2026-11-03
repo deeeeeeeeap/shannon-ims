@@ -211,7 +211,7 @@ func (t *connRegisterTransport) ReadResponse(ctx context.Context) (*sip.Response
 				loggerSIPRead(t.traceID, t.deviceID, t.transport, connLocalAddrString(t.conn), connRemoteAddrString(t.conn), data)
 			}
 			parseErr := t.parser.ParseSIPStream(data, func(msg sip.Message) {
-				if res, ok := msg.(*sip.Response); ok && response == nil {
+				if res, ok := msg.(*sip.Response); ok && response == nil && !res.IsProvisional() {
 					response = res
 				}
 			})

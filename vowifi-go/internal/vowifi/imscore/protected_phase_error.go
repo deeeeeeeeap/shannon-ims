@@ -49,6 +49,28 @@ const (
 	protectedPhaseStageResponse     = "response"
 )
 
+// canonicalProtectedPhaseStage clamps a stage to the closed enum above.
+//
+// The stage reaches logs and error strings, so an unrecognised value collapses to
+// "unknown" rather than being passed through. An empty stage stays empty, which is
+// how a pre-authentication failure is represented.
+func canonicalProtectedPhaseStage(stage string) string {
+	switch stage {
+	case "":
+		return ""
+	case protectedPhaseStageIPSecInstall,
+		protectedPhaseStageRuntime,
+		protectedPhaseStageActivation,
+		protectedPhaseStageHandshake,
+		protectedPhaseStageSend,
+		protectedPhaseStageRead,
+		protectedPhaseStageResponse:
+		return stage
+	default:
+		return "unknown"
+	}
+}
+
 // protectedPhaseError marks a failure that happened after the registration
 // reached the authenticated phase.
 //

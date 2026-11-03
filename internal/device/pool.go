@@ -257,7 +257,7 @@ func NewPoolWithContext(parent context.Context, cfg *config.Config) *Pool {
 	}
 	p.transportRecovery = NewTransportRecoveryController(p)
 	p.voWiFiHost().ConfigureAdapter(p)
-	p.voWiFiHost().ConfigureRuntimeDependencies(p.GetVoiceGateway(), vowifiDeliveryStore{}, poolVoWiFiRuntimeDispatcher{pool: p})
+	p.voWiFiHost().ConfigureRuntimeDependencies(p.GetVoiceGateway(), vowifiDeliveryStore{pool: p}, poolVoWiFiRuntimeDispatcher{pool: p})
 
 	return p
 }

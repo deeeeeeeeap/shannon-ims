@@ -266,7 +266,7 @@ func (m *Manager) recoverRuntime(ctx context.Context, deviceID, reason string, g
 	if strings.TrimSpace(reason) == "" {
 		reason = "recover"
 	}
-	if m.Active(deviceID) || m.Starting(deviceID) {
+	if !m.DesiredRecoverable(deviceID) {
 		logger.Debug("VoWiFi recover 跳过：运行态仍活跃或正在启动", "device", deviceID, "reason", reason)
 		return nil
 	}

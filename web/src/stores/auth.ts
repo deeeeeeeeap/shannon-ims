@@ -59,8 +59,8 @@ export const useAuthStore = defineStore('auth', {
         localStorage.setItem('token', token)
         api.defaults.headers.common.Authorization = `Bearer ${token}`
         return true
-      } catch (e) {
-        console.error(e)
+      } catch {
+        // Axios errors retain the login body; the interceptor records safe metadata.
         return false
       }
     },

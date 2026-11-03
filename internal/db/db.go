@@ -80,9 +80,9 @@ func (PendingPhoneNumber) TableName() string { return "pending_phone_numbers" }
 
 // SMS 短信表 (关联 IMSI)
 type SMS struct {
-	ID         uint      `gorm:"primaryKey" json:"id"`
-	MessageID  string    `gorm:"column:message_id;index" json:"message_id"`
-	IMSI       string    `gorm:"column:imsi;index:idx_sms_imsi_peer_ts,priority:1;index:idx_sms_imsi_ts,priority:1" json:"imsi"`
+	ID        uint   `gorm:"primaryKey" json:"id"`
+	MessageID string `gorm:"column:message_id;index" json:"message_id"`
+	IMSI      string `gorm:"column:imsi;index:idx_sms_imsi_peer_ts,priority:1;index:idx_sms_imsi_ts,priority:1" json:"imsi"`
 	// The ICCID path had only a single-column index, so the live thread query
 	// (WHERE iccid=? AND peer=? ORDER BY timestamp DESC) filtered on iccid alone and
 	// then sorted every message for that SIM in memory. The IMSI equivalent below
@@ -110,7 +110,7 @@ type SMS struct {
 }
 
 type SMSContact struct {
-	IMSI          string    `gorm:"column:imsi;primaryKey;index:idx_sms_contact_imsi_last_ts,priority:1" json:"imsi"`
+	IMSI string `gorm:"column:imsi;primaryKey;index:idx_sms_contact_imsi_last_ts,priority:1" json:"imsi"`
 	// Same asymmetry as SMS: the IMSI column had a composite index with
 	// last_timestamp, the ICCID column did not, so the thread-list query sorted in
 	// memory. This is the query behind the SMS page's conversation list.
@@ -175,6 +175,7 @@ func Init(dbPath string) error {
 		&SMSContact{},
 		&SMSDelivery{},
 		&SMSDeliveryPart{},
+		&SMSIncomingPartJournal{},
 		&TrafficMinute{},
 		&TrafficHour{},
 		&TrafficDay{},

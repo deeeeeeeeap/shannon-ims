@@ -111,7 +111,12 @@ Access ready
 - Security-Verify 与 sec-agree；
 - 多分片提交与 delivery 状态记录；
 - 接收 RP-ACK / RP-ERROR 报告；
+- 接收 IMS SMS-DELIVER，持久化长短信分片、乱序重组、重复投递去重，完成后进入收件箱并推送通知；
+- SIP `100 Trying` 后等待最终结果，兼容 `200 OK` / `202 Accepted`；提交成功与接收方送达分别记录；
+- 发送使用当前读取的短信中心；断链和注册过期会撤销就绪状态并进入现有退避恢复流程；
 - SQLite 幂等写入和安全迁移。
+
+`IMSReady` / `SMSReady` 表示本地注册与消息通道状态，不代表运营商保证放行每条短信。控制台的“重连 VoWiFi”可主动重建当前链路，但不能绕过运营商开户或区域限制。超时、`504` 等不确定结果不会自动重发，以免重复投递或扣费；最终送达需要运营商状态报告或接收端确认。
 
 #### 模组与平台能力
 
@@ -181,7 +186,7 @@ Shannon IMS 的隐私边界体现在运行方式中，而不是要求使用者�
 
 `v0.1.0-rc.1` 将当前协议实现收口为可持续验证的 RC 基线：根模块、`vowifi-go` 与 `third_party/swu-go` 三个 Go Module 的全量测试/vet、关键并发模块 race、前端 lint/typecheck/build、隐私扫描、运行时脚本测试以及 Linux amd64 归档 smoke 都进入 push/PR CI。发布包同时包含 `release-manifest.env`、运行时 manifest、归档内 `SHA256SUMS` 和独立 `.sha256` 文件。
 
-本轮只收紧 SA 所有权、测试夹具、持续验证和发布归档，不改变已验证的 IMS-AKA、AUTS、3GPP IPsec、短信或 eSIM 协议行为。详见 [RELEASE_NOTES.md](RELEASE_NOTES.md) 和 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
+RC 基线之后的未发布改进补齐了 IMS 入站短信与运行态恢复；IMS-AKA、AUTS、3GPP IPsec 协商和 eSIM 行为保持不变。详见 [RELEASE_NOTES.md](RELEASE_NOTES.md) 和 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
 
 <a id="快速开始"></a>
 
@@ -328,8 +333,13 @@ Instead of treating IMS as a single SIP request, it models the complete path fro
 - protected REGISTER with explicit state transitions;
 - SMS over IMS using service-centre PSI and Service-Route;
 - local SQLite delivery tracking;
+- durable IMS SMS-DELIVER reception, out-of-order multipart assembly and duplicate suppression before inbox notification;
+- final-response handling after SIP 1xx, with both 200 and 202 accepted for submission;
+- current-SIM service-centre routing and readiness revocation on channel loss or registration expiry;
 - privacy-safe diagnostics that do not expose AKA key material;
 - Vue 3 management UI, HTTP API, and OpenAPI documentation.
+
+`IMSReady` / `SMSReady` describe local registration and messaging capability, not carrier approval of every SMS. “Reconnect VoWiFi” rebuilds the current connection; it cannot bypass subscription or regional restrictions. Ambiguous timeouts and 504 responses are not automatically resent. Recipient delivery requires a carrier status report or confirmation at the receiving device.
 
 ### End-to-end model
 
@@ -361,7 +371,7 @@ Modem access
 
 `v0.1.0-rc.1` is the continuously verifiable RC baseline. Push and pull-request CI now runs full tests and vet for all three Go modules (root, `vowifi-go`, and `third_party/swu-go`), race tests for critical concurrency packages, frontend lint/typecheck/build, privacy and runtime contract checks, plus a Linux amd64 release-bundle smoke test. Every archive carries `release-manifest.env`, the runtime manifest, in-bundle `SHA256SUMS`, and a detached `.sha256` file.
 
-This hardening round changes SA ownership, stale test fixtures, continuous verification, and release packaging only. It does not change the validated IMS-AKA, AUTS, 3GPP IPsec, SMS, or eSIM protocol behavior. See [RELEASE_NOTES.md](RELEASE_NOTES.md) and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
+Unreleased improvements after the RC baseline add IMS inbound SMS and runtime recovery while preserving IMS-AKA, AUTS, 3GPP IPsec negotiation and eSIM behavior. See [RELEASE_NOTES.md](RELEASE_NOTES.md) and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
 
 <a id="quick-start"></a>
 

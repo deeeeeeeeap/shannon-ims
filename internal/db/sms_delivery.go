@@ -204,7 +204,6 @@ func MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient string, tpMR int,
 	}
 	var part SMSDeliveryPart
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var rows []statusCandidate
 		query := tx.Table("sms_delivery_part").
 			Select("sms_delivery_part.*, sms_delivery.peer AS delivery_peer").
 			Joins("JOIN sms_delivery ON sms_delivery.message_id = sms_delivery_part.message_id").
@@ -217,26 +216,41 @@ func MarkSMSDeliveryPartStatusReport(imsi, deviceID, recipient string, tpMR int,
 				SMSDeliveryPartStateDeliveryUnconfirmed,
 				SMSDeliveryPartStateDelivered,
 				SMSDeliveryPartStateDeliveryFailed,
+				// A lost/failed SIP submission response does not disprove a later
+				// uniquely correlated terminal delivery report.
+				SMSDeliveryPartStateFailed,
+				SMSDeliveryPartStateTimeout,
 			}).
-			Order("sms_delivery_part.created_at desc").
-			Limit(16).
-			Find(&rows)
-		if query.Error != nil {
-			return query.Error
+			Order("sms_delivery_part.created_at desc")
+		rows, err := query.Rows()
+		if err != nil {
+			return err
 		}
-		matches := make([]SMSDeliveryPart, 0, 2)
-		for _, row := range rows {
+		defer rows.Close()
+		matches := 0
+		// Scan the complete eligible set with bounded memory. Truncating before
+		// recipient normalization can make an ambiguous reference appear unique.
+		for rows.Next() {
+			var row statusCandidate
+			if err := tx.ScanRows(rows, &row); err != nil {
+				return err
+			}
 			if canonicalSMSStatusRecipient(row.DeliveryPeer) == recipient {
-				matches = append(matches, row.SMSDeliveryPart)
+				matches++
+				if matches > 1 {
+					return ErrSMSDeliveryReportAmbiguous
+				}
+				part = row.SMSDeliveryPart
 			}
 		}
-		switch len(matches) {
-		case 0:
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if matches == 0 {
 			return gorm.ErrRecordNotFound
-		case 1:
-			part = matches[0]
-		default:
-			return ErrSMSDeliveryReportAmbiguous
 		}
 
 		if !isFinalSMSDeliveryPartState(part.State) {
