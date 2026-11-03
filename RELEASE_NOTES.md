@@ -8,6 +8,11 @@
 - IMS SMS-DELIVER 接入真实解码、持久化、乱序长短信重组、收件箱与通知。数据库事务成功后才返回 SIP 成功并安排 RP-ACK；临时存储失败返回 `503`。
 - 投递/状态报告的临时写库错误不再被忽略；无匹配或歧义的报告不更新其他消息。
 - 通道关闭、SWu 退出、注册到期会撤销就绪状态。已失败的实例可进入现有串行恢复流程，异步启动失败保留重试退避。
+- 本地提交失败后，全部分片的可信送达报告仍可将整条短信及历史记录更新为已送达；缺片或部分送达不会误报成功。
+- QMI 收件与 IMS 共用可靠存储：分片落库后才删除模组副本或正向 ACK；保存失败保留副本或负向 ACK，已读残留重试保存，重复投递不重复入库或通知。
+- 注册期限取实际发送 Contact 在成功响应中的绑定，优先使用该绑定的 `expires`；缺失本机绑定、无效期限或零期限均不能进入就绪状态。
+- 受保护 TCP 的两条 flow 分别串行写入，锁等待和写入均响应取消；下行回复使用原入站 flow，不再挡住另一条 flow 的上行发送。
+- 受保护 SIP MESSAGE 使用现有 Timer F 限制事务时长，并遵守调用者更早的期限；网关不回复时会结束等待，不会自动重发。
 
 升级前备份运行数据库。新增 `sms_incoming_part_journals` 表保留未完成分片和去重记录；完整消息与联系人在同一事务中提交，完成分片不保留第二份正文。旧表不删除，旧二进制可忽略新表；回滚期间新接收的未完成分片需等支持此表的版本重新启动后才能继续重组。
 
@@ -21,6 +26,11 @@
 - IMS SMS-DELIVER now reaches decoding, durable out-of-order multipart assembly, inbox storage and notifications. SIP success and RP-ACK follow durable storage; transient database failures receive 503.
 - Delivery/status report persistence errors are propagated. Unmatched or ambiguous reports cannot update unrelated messages.
 - Channel loss, SWu termination and registration expiry revoke readiness. Failed admitted instances can recover through the existing serialized lifecycle with failure backoff preserved across asynchronous startup.
+- Trusted terminal receipts for every declared part can correct an earlier local submission failure in both delivery tracking and SMS history. Missing or partially delivered parts cannot produce a false success.
+- QMI reception uses the durable inbox/fragment store: modem deletion and positive ACK follow persistence. Storage failures retain the modem copy or receive a negative ACK; read residuals retry persistence, without duplicate inbox rows or notifications.
+- Registration lifetime is matched to the Contact actually sent and prefers that binding's `expires`. A missing local binding, invalid lifetime or zero lifetime cannot establish readiness.
+- Protected TCP flows serialize writes independently, with cancellation covering both lock acquisition and writes. Responses stay on their incoming flow without blocking outbound requests on the other flow.
+- Protected SIP MESSAGE transactions use the existing Timer F budget and respect an earlier caller deadline. A silent gateway no longer leaves the transaction waiting indefinitely, and timeouts never trigger automatic resubmission.
 
 Back up the runtime database before upgrading. The additive `sms_incoming_part_journals` table retains incomplete fragments and deduplication records. Inbox/contact updates commit atomically; completed fragments do not retain a second body copy. Older binaries ignore the new table; pending fragments resume assembly when a supporting version runs again.
 

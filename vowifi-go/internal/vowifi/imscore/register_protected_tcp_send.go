@@ -197,7 +197,7 @@ func runProtectedTCPAuthenticatedRegister(
 			errors.New("imscore: protected TCP response did not end at a message boundary"))
 		return nil, handled, err
 	}
-	result, err = finalizeRegisterSuccess(cfg, *state, finalRes)
+	result, err = finalizeRegisterSuccess(cfg, *state, finalRes, req)
 	if err != nil {
 		return nil, handled, err
 	}

@@ -13,6 +13,10 @@ func TestFinalizeRegisterSuccessPreservesServiceRoutes(t *testing.T) {
 		"<sip:orig@scscf.ims.example.invalid;lr>",
 	}
 	response := sip.NewResponse(sip.StatusOK, "OK")
+	request := sip.NewRequest(sip.REGISTER, sip.Uri{Scheme: "sip", Host: "example.invalid"})
+	contact := "<sip:fixture@192.0.2.10:5062;transport=tcp>;expires=3600"
+	request.AppendHeader(sip.NewHeader("Contact", contact))
+	response.AppendHeader(sip.NewHeader("Contact", contact))
 	for _, route := range want {
 		response.AppendHeader(sip.NewHeader("Service-Route", route))
 	}
@@ -21,6 +25,7 @@ func TestFinalizeRegisterSuccessPreservesServiceRoutes(t *testing.T) {
 		Config{DeviceID: "test-device"},
 		registerState{verifyHeader: "verified"},
 		response,
+		request,
 	)
 	if err != nil {
 		t.Fatalf("finalizeRegisterSuccess: %v", err)

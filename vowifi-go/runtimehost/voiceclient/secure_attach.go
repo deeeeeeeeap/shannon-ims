@@ -103,11 +103,11 @@ type secureMessagingTransport struct {
 	client *Client
 	conn   net.Conn
 
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	pending map[string]chan *sip.Response
-	cseq    atomic.Uint32
-	rpAcks  chan smsRPAckTask
+	writeGate chan struct{}
+	mu        sync.Mutex
+	pending   map[string]chan *sip.Response
+	cseq      atomic.Uint32
+	rpAcks    chan smsRPAckTask
 
 	done      chan struct{}
 	doneOnce  sync.Once
@@ -117,11 +117,12 @@ type secureMessagingTransport struct {
 
 func newSecureMessagingTransport(client *Client, conn net.Conn) *secureMessagingTransport {
 	t := &secureMessagingTransport{
-		client:  client,
-		conn:    conn,
-		pending: make(map[string]chan *sip.Response),
-		rpAcks:  make(chan smsRPAckTask, 16),
-		done:    make(chan struct{}),
+		client:    client,
+		conn:      conn,
+		writeGate: make(chan struct{}, 1),
+		pending:   make(map[string]chan *sip.Response),
+		rpAcks:    make(chan smsRPAckTask, 16),
+		done:      make(chan struct{}),
 	}
 	t.cseq.Store(1)
 	t.wg.Add(2)
@@ -134,6 +135,10 @@ func (t *secureMessagingTransport) RoundTrip(ctx context.Context, req *sip.Reque
 	if t == nil || t.conn == nil || req == nil {
 		return nil, errors.New("voiceclient: secure messaging transport unavailable")
 	}
+	// The protected transport bypasses sipgo's non-INVITE transaction FSM,
+	// so it must retain Timer F even when the caller supplied no deadline.
+	ctx, cancel := context.WithTimeout(ctx, sip.Timer_F)
+	defer cancel()
 	if err := t.decorateRequest(req); err != nil {
 		return nil, err
 	}
@@ -175,8 +180,19 @@ func (t *secureMessagingTransport) RoundTrip(ctx context.Context, req *sip.Reque
 }
 
 func (t *secureMessagingTransport) writeRequest(ctx context.Context, payload []byte) (int, error) {
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
+	if writer, ok := t.conn.(interface {
+		WriteContext(context.Context, []byte) (int, error)
+	}); ok {
+		return writer.WriteContext(ctx, payload)
+	}
+	select {
+	case t.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-t.done:
+		return 0, net.ErrClosed
+	}
+	defer func() { <-t.writeGate }()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -198,6 +214,9 @@ func (t *secureMessagingTransport) writeRequest(ctx context.Context, payload []b
 		_ = t.conn.SetWriteDeadline(time.Time{})
 	}()
 	n, err := t.conn.Write(payload)
+	if t.client.cfg.transportNetwork() == "tcp" && n > 0 && n < len(payload) {
+		_ = t.conn.Close()
+	}
 	if ctx.Err() != nil {
 		return n, ctx.Err()
 	}
@@ -329,16 +348,32 @@ func (t *secureMessagingTransport) respondToRequest(request *sip.Request) {
 		response = sip.NewResponseFromRequest(request, 501, "Not Implemented", nil)
 	}
 	payload := []byte(response.String())
-	if writer, ok := t.conn.(interface{ WriteServerFlow([]byte) (int, error) }); ok {
-		n, err := writer.WriteServerFlow(payload)
-		if err == nil && n == len(payload) && rpAck != nil {
-			t.enqueueRPAck(*rpAck)
+	ctx, cancel := context.WithTimeout(context.Background(), sip.Timer_F)
+	defer cancel()
+	var n int
+	var err error
+	if writer, ok := t.conn.(interface {
+		WriteServerFlowContext(context.Context, []byte) (int, error)
+	}); ok {
+		n, err = writer.WriteServerFlowContext(ctx, payload)
+	} else if writer, ok := t.conn.(interface{ WriteServerFlow([]byte) (int, error) }); ok {
+		// Older dual-flow adapters expose no way to set the selected flow's
+		// deadline. Closing on timeout is their only reliable cancellation.
+		cancelDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = t.conn.Close()
+			close(cancelDone)
+		})
+		n, err = writer.WriteServerFlow(payload)
+		if !stop() {
+			<-cancelDone
 		}
-		return
+	} else {
+		n, err = t.writeRequest(ctx, payload)
 	}
-	t.writeMu.Lock()
-	n, err := t.conn.Write(payload)
-	t.writeMu.Unlock()
+	if t.client.cfg.transportNetwork() == "tcp" && n > 0 && n < len(payload) {
+		_ = t.conn.Close()
+	}
 	if err == nil && n == len(payload) && rpAck != nil {
 		t.enqueueRPAck(*rpAck)
 	}

@@ -261,6 +261,9 @@ func (s *registerSessionTestRawSWU) DialContextIP(ctx context.Context, localIP n
 		}
 		capture.requests = append(capture.requests, request)
 		response := sip.NewResponseFromRequest(request, sip.StatusOK, "OK", nil)
+		for _, contact := range request.GetHeaders("Contact") {
+			response.AppendHeader(sip.NewHeader("Contact", contact.Value()))
+		}
 		if _, writeErr := io.WriteString(securePeer, response.String()); writeErr != nil {
 			capture.err = writeErr
 		}

@@ -233,7 +233,11 @@ func runSecureAuthenticatedRegister(ctx context.Context, cfg Config, swuTCP voic
 			statusCode: finalRes.StatusCode, reason: registerStatusResult(finalRes.StatusCode),
 		})
 	}
-	return finalizeRegisterSuccess(cfg, *state, finalRes)
+	result, err := finalizeRegisterSuccess(cfg, *state, finalRes, authRes)
+	if err != nil {
+		_ = secureTransport.Close()
+	}
+	return result, err
 }
 
 func usesVodafoneRegisterWireFormat(cfg Config) bool {
@@ -647,12 +651,10 @@ func templatePANIValue(template policy.IMSRegisterTemplate) string {
 	return value
 }
 
-func finalizeRegisterSuccess(cfg Config, state registerState, res *sip.Response) (*registerResult, error) {
-	expires := 3600
-	if h := res.GetHeader("Expires"); h != nil {
-		if v, err := strconv.Atoi(strings.TrimSpace(h.Value())); err == nil && v > 0 {
-			expires = v
-		}
+func finalizeRegisterSuccess(cfg Config, state registerState, res *sip.Response, req *sip.Request) (*registerResult, error) {
+	expires, err := registeredBindingExpiry(req, res)
+	if err != nil {
+		return nil, err
 	}
 	logRegisterDiagnostic(registerDiagnostic{
 		stage:          "complete",
@@ -675,6 +677,106 @@ func finalizeRegisterSuccess(cfg Config, state registerState, res *sip.Response)
 		serviceRoutes:  serviceRoutes,
 		channel:        state.channel,
 	}, nil
+}
+
+func registeredBindingExpiry(req *sip.Request, res *sip.Response) (int, error) {
+	if req == nil || res == nil {
+		return 0, fmt.Errorf("REGISTER binding response is missing")
+	}
+	requested, err := parseRegisterContacts(req.GetHeaders("Contact"))
+	if err != nil || len(requested) != 1 {
+		return 0, fmt.Errorf("REGISTER local Contact is unavailable")
+	}
+	bindings, err := parseRegisterContacts(res.GetHeaders("Contact"))
+	if err != nil {
+		return 0, err
+	}
+	expiry := 0
+	matched := false
+	for _, binding := range bindings {
+		if !registerContactURIEqual(requested[0].Address, binding.Address) {
+			continue
+		}
+		raw, ok := registerParam(binding.Params, "expires")
+		if !ok {
+			if h := res.GetHeader("Expires"); h != nil {
+				raw = h.Value()
+			}
+		}
+		value, parseErr := strconv.ParseUint(strings.TrimSpace(raw), 10, 32)
+		if parseErr != nil || value == 0 || value > uint64(^uint(0)>>1) {
+			return 0, fmt.Errorf("REGISTER local binding has no valid lifetime")
+		}
+		if matched && expiry != int(value) {
+			return 0, fmt.Errorf("REGISTER local binding lifetime is ambiguous")
+		}
+		expiry, matched = int(value), true
+	}
+	if !matched {
+		return 0, fmt.Errorf("REGISTER response does not contain the local binding")
+	}
+	return expiry, nil
+}
+
+func parseRegisterContacts(values []sip.Header) ([]*sip.ContactHeader, error) {
+	parser := sip.HeadersParser(sip.DefaultHeadersParser())
+	var contacts []*sip.ContactHeader
+	for _, value := range values {
+		if value == nil {
+			return nil, fmt.Errorf("REGISTER Contact is malformed")
+		}
+		headers, err := parser.ParseHeader(nil, []byte("Contact: "+value.Value()))
+		if err != nil {
+			return nil, fmt.Errorf("REGISTER Contact is malformed")
+		}
+		for _, header := range headers {
+			contact, ok := header.(*sip.ContactHeader)
+			if !ok || contact.Address.Wildcard {
+				return nil, fmt.Errorf("REGISTER Contact is invalid")
+			}
+			contacts = append(contacts, contact)
+		}
+	}
+	return contacts, nil
+}
+
+func registerParam(params sip.HeaderParams, name string) (string, bool) {
+	for key, value := range params.Items() {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func registerContactURIEqual(a, b sip.Uri) bool {
+	if !strings.EqualFold(a.Scheme, b.Scheme) || a.User != b.User || a.Password != b.Password || a.Port != b.Port {
+		return false
+	}
+	if !strings.EqualFold(a.Host, b.Host) {
+		first, second := net.ParseIP(a.Host), net.ParseIP(b.Host)
+		if first == nil || second == nil || !first.Equal(second) {
+			return false
+		}
+	}
+	// RFC 3261 19.1.4: common URI parameters must agree; the listed
+	// routing parameters also differ when present in only one URI.
+	for _, pair := range [][2]sip.HeaderParams{{a.UriParams, b.UriParams}, {b.UriParams, a.UriParams}} {
+		for key, value := range pair[0].Items() {
+			other, found := registerParam(pair[1], key)
+			if found {
+				if !strings.EqualFold(value, other) {
+					return false
+				}
+				continue
+			}
+			switch strings.ToLower(key) {
+			case "user", "ttl", "method", "maddr":
+				return false
+			}
+		}
+	}
+	return a.Headers.Equals(b.Headers)
 }
 
 func doRegisterTransaction(ctx context.Context, client *sipgo.Client, req *sip.Request, opts ...sipgo.ClientRequestOption) (*sip.Response, error) {

@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 	qmicore "github.com/1239t/vohive/internal/qmi"
 	"github.com/1239t/vohive/pkg/smscodec"
+	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
+	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 )
 
 type qmiSMSCoreStub struct {
@@ -29,6 +29,7 @@ type qmiSMSCoreStub struct {
 	listCalls   []string
 	deleteCalls []string
 	ackCalls    []qmicore.RawSMSIndication
+	ackRejects  []qmicore.RawSMSIndication
 }
 
 func (s *qmiSMSCoreStub) key(storage uint8, index uint32) string {
@@ -83,6 +84,8 @@ func (s *qmiSMSCoreStub) WMSDeleteMessage(ctx context.Context, storageType uint8
 func (s *qmiSMSCoreStub) AckRawSMS(ctx context.Context, info qmicore.RawSMSIndication, success bool) error {
 	if success {
 		s.ackCalls = append(s.ackCalls, info)
+	} else {
+		s.ackRejects = append(s.ackRejects, info)
 	}
 	return nil
 }
@@ -111,12 +114,7 @@ func TestHandleNewSMSQMIUsesIndicatedStorageAndDeletesSameStorage(t *testing.T) 
 			},
 		},
 	}
-	worker := &Worker{
-		ID:          "wwan0",
-		Pool:        &Pool{},
-		qmiSMS:      stub,
-		reassembler: smscodec.NewReassembler(),
-	}
+	worker := newPersistentQMITestWorker(t, stub)
 
 	worker.handleNewSMSQMI(0, 7)
 
@@ -149,12 +147,7 @@ func TestHandleNewSMSQMIFallsBackToAlternateStorageWhenIndexExistsThere(t *testi
 			"0:9": errors.New("storage miss"),
 		},
 	}
-	worker := &Worker{
-		ID:          "wwan0",
-		Pool:        &Pool{},
-		qmiSMS:      stub,
-		reassembler: smscodec.NewReassembler(),
-	}
+	worker := newPersistentQMITestWorker(t, stub)
 
 	worker.handleNewSMSQMI(0, 9)
 
@@ -195,12 +188,7 @@ func TestCheckAllSMSQMIReadsUnreadFromBothStorages(t *testing.T) {
 			},
 		},
 	}
-	worker := &Worker{
-		ID:          "wwan0",
-		Pool:        &Pool{},
-		qmiSMS:      stub,
-		reassembler: smscodec.NewReassembler(),
-	}
+	worker := newPersistentQMITestWorker(t, stub)
 
 	if err := worker.CheckAllSMSQMI(); err != nil {
 		t.Fatalf("CheckAllSMSQMI() error=%v", err)
@@ -210,8 +198,12 @@ func TestCheckAllSMSQMIReadsUnreadFromBothStorages(t *testing.T) {
 	}
 }
 
-func TestCheckAllSMSQMICleansReadResidualsFromBothStorages(t *testing.T) {
+func TestCheckAllSMSQMIPersistsReadResidualsFromBothStorages(t *testing.T) {
 	stub := &qmiSMSCoreStub{
+		readResults: map[string]*qmimanager.DecodedSMS{
+			"0:11": {Sender: "55501", Message: "fixture-a", Timestamp: time.Unix(1700000000, 0)},
+			"1:13": {Sender: "55501", Message: "fixture-b", Timestamp: time.Unix(1700000001, 0)},
+		},
 		listByStorage: map[uint8][]struct {
 			Index uint32
 			Tag   qmi.MessageTagType
@@ -224,12 +216,7 @@ func TestCheckAllSMSQMICleansReadResidualsFromBothStorages(t *testing.T) {
 			},
 		},
 	}
-	worker := &Worker{
-		ID:          "wwan0",
-		Pool:        &Pool{},
-		qmiSMS:      stub,
-		reassembler: smscodec.NewReassembler(),
-	}
+	worker := newPersistentQMITestWorker(t, stub)
 
 	if err := worker.CheckAllSMSQMI(); err != nil {
 		t.Fatalf("CheckAllSMSQMI() error=%v", err)
@@ -244,8 +231,8 @@ func TestCheckAllSMSQMICleansReadResidualsFromBothStorages(t *testing.T) {
 	if fmt.Sprint(stub.listCalls) != fmt.Sprint(wantListCalls) {
 		t.Fatalf("listCalls=%v want %v", stub.listCalls, wantListCalls)
 	}
-	if len(stub.readCalls) != 0 {
-		t.Fatalf("readCalls=%v, want no reprocessing for read residuals", stub.readCalls)
+	if len(stub.readCalls) != 2 {
+		t.Fatalf("readCalls=%v, want persistence retry before deletion", stub.readCalls)
 	}
 	wantDeleteCalls := []string{"0:11", "1:13"}
 	if fmt.Sprint(stub.deleteCalls) != fmt.Sprint(wantDeleteCalls) {
@@ -255,15 +242,10 @@ func TestCheckAllSMSQMICleansReadResidualsFromBothStorages(t *testing.T) {
 
 func TestHandleRawSMSQMIProcessesAndAcksDirectPDU(t *testing.T) {
 	stub := &qmiSMSCoreStub{}
-	worker := &Worker{
-		ID:          "wwan0",
-		Pool:        &Pool{},
-		qmiSMS:      stub,
-		reassembler: smscodec.NewReassembler(),
-	}
+	worker := newPersistentQMITestWorker(t, stub)
 
 	worker.handleNewSMSRawQMI(qmicore.RawSMSIndication{
-		PDU:           qmiRawSMSFixtureDirectTPDU(t),
+		PDU:           syntheticQMIRawPDU(),
 		AckRequired:   true,
 		TransactionID: 0x11223344,
 		Format:        0x06,
@@ -277,7 +259,7 @@ func TestHandleRawSMSQMIProcessesAndAcksDirectPDU(t *testing.T) {
 	}
 }
 
-func TestHandleRawSMSQMIAcksDecodeFailure(t *testing.T) {
+func TestHandleRawSMSQMIRejectsDecodeFailure(t *testing.T) {
 	stub := &qmiSMSCoreStub{}
 	worker := &Worker{
 		ID:          "wwan0",
@@ -293,10 +275,10 @@ func TestHandleRawSMSQMIAcksDecodeFailure(t *testing.T) {
 		Format:        0x06,
 	})
 
-	if len(stub.ackCalls) != 1 {
-		t.Fatalf("ackCalls=%d, want 1", len(stub.ackCalls))
+	if len(stub.ackCalls) != 0 || len(stub.ackRejects) != 1 {
+		t.Fatal("decode failure did not receive a negative acknowledgement")
 	}
-	if stub.ackCalls[0].TransactionID != 0x55667788 {
-		t.Fatalf("ack transaction=0x%x, want 0x55667788", stub.ackCalls[0].TransactionID)
+	if stub.ackRejects[0].TransactionID != 0x55667788 {
+		t.Fatal("negative acknowledgement used wrong transaction")
 	}
 }

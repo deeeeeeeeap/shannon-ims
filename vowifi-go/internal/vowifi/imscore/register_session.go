@@ -268,7 +268,7 @@ func (s *registerSession) runInitialRegisterFlow(ctx context.Context) (*register
 				s.phase = registerPhaseSecure
 				return runSecureAuthenticatedRegister(ctx, s.cfg, s.swu, s.state, nil, res)
 			}
-			return finalizeRegisterSuccess(s.cfg, *s.state, res)
+			return finalizeRegisterSuccess(s.cfg, *s.state, res, req)
 		case sip.StatusUnauthorized, sip.StatusProxyAuthRequired:
 			s.phase = registerPhaseAuth
 			return s.runAuthRegisterPhase(ctx, transport, req, res)
@@ -480,7 +480,7 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 			}
 			lastReq, lastRes = newReq, res
 			if lastRes.StatusCode == sip.StatusOK {
-				return finalizeRegisterSuccess(s.cfg, *s.state, lastRes)
+				return finalizeRegisterSuccess(s.cfg, *s.state, lastRes, lastReq)
 			}
 			continue
 		}
@@ -529,7 +529,7 @@ func (s *registerSession) runAuthRegisterPhase(ctx context.Context, transport *c
 	}
 
 	if lastRes.StatusCode == sip.StatusOK {
-		return finalizeRegisterSuccess(s.cfg, *s.state, lastRes)
+		return finalizeRegisterSuccess(s.cfg, *s.state, lastRes, lastReq)
 	}
 	return nil, fmt.Errorf(
 		"unexpected challenged REGISTER response: status=%d result=%s",

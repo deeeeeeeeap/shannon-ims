@@ -559,7 +559,9 @@ func recomputeSMSDelivery(database *gorm.DB, messageID string, at time.Time) err
 	} else {
 		return failErr
 	}
-	if strings.EqualFold(strings.TrimSpace(delivery.State), SMSDeliveryStateFailed) {
+	// Local submission failure is not evidence against a later terminal receipt
+	// for every declared part. Preserve failure while any part is still missing.
+	if strings.EqualFold(strings.TrimSpace(delivery.State), SMSDeliveryStateFailed) && state != SMSDeliveryStateDelivered {
 		state = SMSDeliveryStateFailed
 		if lastError == "" {
 			lastError = strings.TrimSpace(delivery.LastError)

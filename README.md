@@ -113,6 +113,8 @@ Access ready
 - 接收 RP-ACK / RP-ERROR 报告；
 - 接收 IMS SMS-DELIVER，持久化长短信分片、乱序重组、重复投递去重，完成后进入收件箱并推送通知；
 - SIP `100 Trying` 后等待最终结果，兼容 `200 OK` / `202 Accepted`；提交成功与接收方送达分别记录；
+- 事务超时与双 TCP flow 写入可取消；迟到的完整送达报告可纠正本地提交失败状态；
+- QMI 分片也会可靠保存后才删除或确认，保存失败可重试，重启后继续长短信重组；
 - 发送使用当前读取的短信中心；断链和注册过期会撤销就绪状态并进入现有退避恢复流程；
 - SQLite 幂等写入和安全迁移。
 
@@ -335,6 +337,8 @@ Instead of treating IMS as a single SIP request, it models the complete path fro
 - local SQLite delivery tracking;
 - durable IMS SMS-DELIVER reception, out-of-order multipart assembly and duplicate suppression before inbox notification;
 - final-response handling after SIP 1xx, with both 200 and 202 accepted for submission;
+- bounded transactions and cancellable writes on independent TCP flows, with complete late delivery receipts correcting earlier local submission failures;
+- durable QMI fragments before deletion or acknowledgment, safe persistence retries and multipart recovery after restart;
 - current-SIM service-centre routing and readiness revocation on channel loss or registration expiry;
 - privacy-safe diagnostics that do not expose AKA key material;
 - Vue 3 management UI, HTTP API, and OpenAPI documentation.

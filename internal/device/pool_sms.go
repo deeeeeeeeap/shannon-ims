@@ -2,6 +2,9 @@ package device
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -149,46 +152,58 @@ func (w *Worker) CheckAllSMSQMI() error {
 	if len(discovered) > 0 {
 		logger.Info(fmt.Sprintf("[%s] QMI 轮询发现 %d 条未读短信", w.ID, len(discovered)))
 	}
+	var processingErrors []error
 	for _, msg := range discovered {
-		w.handleNewSMSQMI(msg.storage, msg.index)
-	}
-	if len(readResiduals) > 0 {
-		logger.Info(fmt.Sprintf("[%s] QMI 轮询清理 %d 条已读残留短信", w.ID, len(readResiduals)))
-	}
-	for _, msg := range readResiduals {
-		if err := smsCore.WMSDeleteMessage(context.Background(), msg.storage, msg.index); err != nil {
-			logger.Warn(fmt.Sprintf("[%s] 清理已读残留短信失败 (QMI)", w.ID), "index", msg.index, "storage", msg.storage, "err", err)
+		if err := w.handleNewSMSQMI(msg.storage, msg.index); err != nil {
+			processingErrors = append(processingErrors, err)
 		}
 	}
-	return nil
+	if len(readResiduals) > 0 {
+		logger.Info(fmt.Sprintf("[%s] QMI 轮询重试 %d 条已读残留短信", w.ID, len(readResiduals)))
+	}
+	for _, msg := range readResiduals {
+		// ReadSMS can mark a message read before its database transaction commits.
+		// Retry persistence (idempotently) rather than treating MTRead as durable.
+		if err := w.handleNewSMSQMI(msg.storage, msg.index); err != nil {
+			processingErrors = append(processingErrors, err)
+		}
+	}
+	return errors.Join(processingErrors...)
 }
 
-func (w *Worker) handleNewSMSQMI(storage uint8, index uint32) {
+func (w *Worker) handleNewSMSQMI(storage uint8, index uint32) error {
 	logger.Info(fmt.Sprintf("[%s] 收到新短信通知 (QMI)", w.ID), "index", index, "storage", storage)
 
 	sms, actualStorage, err := w.readIncomingSMSQMI(storage, index)
 	if err != nil {
 		logger.Error(fmt.Sprintf("[%s] 读取短信失败 (QMI)", w.ID), "index", index, "storage", storage, "err", err)
-		return
+		return err
 	}
 
-	w.processDecodedSMSQMI(sms)
+	if err := w.processDecodedSMSQMI(sms); err != nil {
+		logger.Warn("QMI SMS persistence failed; modem copy retained", "index", index)
+		return err
+	}
 
 	if smsCore := w.smsQMICore(); smsCore != nil {
 		if err := smsCore.WMSDeleteMessage(context.Background(), actualStorage, index); err != nil {
 			logger.Warn(fmt.Sprintf("[%s] 删除短信失败 (QMI)", w.ID), "index", index, "storage", actualStorage, "err", err)
+			return err
 		}
-		return
+		return nil
 	}
 	if w.Backend != nil {
 		if err := w.Backend.DeleteSMS(context.Background(), int(index)); err != nil {
 			logger.Warn(fmt.Sprintf("[%s] 删除短信失败 (Backend)", w.ID), "index", index, "err", err)
+			return err
 		}
 	} else if w.Modem != nil {
 		if err := w.Modem.DeleteSMS(index); err != nil {
 			logger.Warn(fmt.Sprintf("[%s] 删除短信失败", w.ID), "index", index, "err", err)
+			return err
 		}
 	}
+	return nil
 }
 
 func (w *Worker) handleNewSMSRawQMI(info qmicore.RawSMSIndication) {
@@ -208,15 +223,19 @@ func (w *Worker) handleNewSMSRawQMI(info qmicore.RawSMSIndication) {
 			"format", info.Format,
 			"err", err,
 		)
-		w.ackRawSMSQMI(info, "decode_failure")
+		w.ackRawSMSQMI(info, false, "decode_failure")
 		return
 	}
 
-	w.processDecodedSMSQMI(sms)
-	w.ackRawSMSQMI(info, "processed")
+	if err := w.processDecodedSMSQMI(sms); err != nil {
+		logger.Warn("QMI Raw SMS persistence failed; delivery rejected")
+		w.ackRawSMSQMI(info, false, "storage_failure")
+		return
+	}
+	w.ackRawSMSQMI(info, true, "processed")
 }
 
-func (w *Worker) ackRawSMSQMI(info qmicore.RawSMSIndication, reason string) {
+func (w *Worker) ackRawSMSQMI(info qmicore.RawSMSIndication, success bool, reason string) {
 	if !info.AckRequired {
 		return
 	}
@@ -230,7 +249,7 @@ func (w *Worker) ackRawSMSQMI(info qmicore.RawSMSIndication, reason string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := smsCore.AckRawSMS(ctx, info, true); err != nil {
+	if err := smsCore.AckRawSMS(ctx, info, success); err != nil {
 		logger.Warn(fmt.Sprintf("[%s] QMI 原始短信 ACK 失败", w.ID),
 			"transaction_id", info.TransactionID,
 			"reason", reason,
@@ -239,28 +258,46 @@ func (w *Worker) ackRawSMSQMI(info qmicore.RawSMSIndication, reason string) {
 	}
 }
 
-func (w *Worker) processDecodedSMSQMI(sms *qmimanager.DecodedSMS) {
+func (w *Worker) processDecodedSMSQMI(sms *qmimanager.DecodedSMS) error {
 	if sms == nil {
-		return
+		return errors.New("missing decoded SMS")
 	}
-
+	if smsnotify.ShouldSuppressReceivedSMS(sms.Message) {
+		return nil
+	}
+	imsi := w.GetCachedIMSI()
+	if imsi == "" {
+		imsi = w.GetIMSI()
+	}
+	if imsi == "" {
+		return errors.New("SMS SIM identity unavailable")
+	}
+	total, sequence, reference := 1, 1, 0
 	if sms.IsConcat {
-		concat := smscodec.ConcatInfo{
-			IsConcat: true,
-			Ref:      sms.ConcatRef,
-			Total:    sms.ConcatTotal,
-			Seq:      sms.ConcatSeq,
+		total, sequence, reference = sms.ConcatTotal, sms.ConcatSeq, sms.ConcatRef
+		if total < 2 || total > 255 || sequence < 1 || sequence > total {
+			return errors.New("invalid QMI SMS concatenation")
 		}
-		logger.Debug(fmt.Sprintf("[%s] 收到 QMI 短信分片", w.ID), "ref", sms.ConcatRef, "seq", sms.ConcatSeq, "total", sms.ConcatTotal)
-		complete, full := w.reassembler.Add(sms.Sender, concat, sms.Message)
-		if !complete {
-			return
-		}
-		sms.Message = full
-		logger.Info(fmt.Sprintf("[%s] QMI 长短信重组完成", w.ID), "total", sms.ConcatTotal)
 	}
-
-	w.processSMS(sms.Sender, sms.Message, sms.Timestamp)
+	// The QMI decoder does not expose reference width or original TPDU. Keep its
+	// fragment namespace separate (ReferenceBits=0); completed inbox dedup remains
+	// shared with IMS. Storage/index are excluded because modem slots are recycled.
+	encoded, err := json.Marshal([]any{imsi, sms.Sender, sms.Timestamp.UTC().Truncate(time.Second), reference, total, sequence, sms.Message})
+	if err != nil {
+		return errors.New("invalid QMI SMS timestamp")
+	}
+	fingerprint := sha256.Sum256(encoded)
+	result, err := db.StoreIncomingSMSPart(db.IncomingSMSPart{
+		Fingerprint: hex.EncodeToString(fingerprint[:]), IMSI: imsi, Sender: sms.Sender, Content: sms.Message,
+		Timestamp: sms.Timestamp, Reference: reference, Total: total, Sequence: sequence,
+	}, vowifiReceivedSMSDuplicateWindow)
+	if err != nil {
+		return err
+	}
+	if result.Stored {
+		w.Pool.notifyStoredIncomingSMS(w.ID, result.SMS, "蜂窝")
+	}
+	return nil
 }
 
 func (w *Worker) cleanupFragmentCache(ttl time.Duration) {

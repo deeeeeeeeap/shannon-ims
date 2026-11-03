@@ -43,14 +43,18 @@ func (s vowifiDeliveryStore) StoreIncomingSMS(imsi, deviceID string, tpdu []byte
 	if err != nil || !result.Stored {
 		return err
 	}
-	if s.pool != nil {
-		if notifier := s.pool.getNotifier(); notifier != nil {
+	s.pool.notifyStoredIncomingSMS(deviceID, result.SMS, "VoWiFi")
+	return nil
+}
+
+func (p *Pool) notifyStoredIncomingSMS(deviceID string, sms db.SMS, source string) {
+	if p != nil {
+		if notifier := p.getNotifier(); notifier != nil {
 			if withSource, ok := notifier.(SMSSourceNotifier); ok {
-				withSource.NotifySMSWithSource(deviceID, sender, result.SMS.Content, "VoWiFi", result.SMS.Timestamp)
+				withSource.NotifySMSWithSource(deviceID, sms.Sender, sms.Content, source, sms.Timestamp)
 			} else {
-				notifier.NotifySMS(deviceID, sender, result.SMS.Content, result.SMS.Timestamp)
+				notifier.NotifySMS(deviceID, sms.Sender, sms.Content, sms.Timestamp)
 			}
 		}
 	}
-	return nil
 }

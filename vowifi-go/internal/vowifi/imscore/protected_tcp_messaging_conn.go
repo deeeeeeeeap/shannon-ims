@@ -1,6 +1,7 @@
 package imscore
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -18,14 +19,15 @@ type protectedTCPMessagingConn struct {
 	frames chan protectedTCPMessagingFrame
 	done   chan struct{}
 
-	mu         sync.Mutex
-	server     net.Conn
-	reply      net.Conn
-	closed     bool
-	closeOnce  sync.Once
-	failOnce   sync.Once
-	wireWrite  sync.Mutex
-	readerWait sync.WaitGroup
+	mu          sync.Mutex
+	server      net.Conn
+	reply       net.Conn
+	closed      bool
+	closeOnce   sync.Once
+	failOnce    sync.Once
+	clientWrite chan struct{}
+	serverWrite chan struct{}
+	readerWait  sync.WaitGroup
 }
 
 type protectedTCPMessagingChannel interface {
@@ -48,9 +50,11 @@ func newProtectedTCPMessagingConn(channel protectedTCPMessagingChannel) (*protec
 		return nil, err
 	}
 	c := &protectedTCPMessagingConn{
-		channel: channel,
-		frames:  make(chan protectedTCPMessagingFrame, 16),
-		done:    make(chan struct{}),
+		channel:     channel,
+		frames:      make(chan protectedTCPMessagingFrame, 16),
+		done:        make(chan struct{}),
+		clientWrite: make(chan struct{}, 1),
+		serverWrite: make(chan struct{}, 1),
 	}
 	c.readerWait.Add(2)
 	go c.runClientReader()
@@ -178,12 +182,25 @@ func (c *protectedTCPMessagingConn) Write(p []byte) (int, error) {
 	if c == nil || c.channel == nil || c.isClosing() {
 		return 0, net.ErrClosed
 	}
-	c.wireWrite.Lock()
-	defer c.wireWrite.Unlock()
-	return writeFullSIPStream(c.channel, p)
+	return c.writeFlow(context.Background(), c.channel, c.clientWrite, p, false)
 }
 
 func (c *protectedTCPMessagingConn) WriteServerFlow(p []byte) (int, error) {
+	return c.writeServerFlow(context.Background(), p, false)
+}
+
+func (c *protectedTCPMessagingConn) WriteContext(ctx context.Context, p []byte) (int, error) {
+	if c == nil || c.channel == nil || c.isClosing() {
+		return 0, net.ErrClosed
+	}
+	return c.writeFlow(ctx, c.channel, c.clientWrite, p, true)
+}
+
+func (c *protectedTCPMessagingConn) WriteServerFlowContext(ctx context.Context, p []byte) (int, error) {
+	return c.writeServerFlow(ctx, p, true)
+}
+
+func (c *protectedTCPMessagingConn) writeServerFlow(ctx context.Context, p []byte, withDeadline bool) (int, error) {
 	if c == nil || c.isClosing() {
 		return 0, net.ErrClosed
 	}
@@ -194,9 +211,62 @@ func (c *protectedTCPMessagingConn) WriteServerFlow(p []byte) (int, error) {
 	if reply == nil {
 		return 0, errors.New("imscore: protected TCP response has no source flow")
 	}
-	c.wireWrite.Lock()
-	defer c.wireWrite.Unlock()
-	return writeFullSIPStream(reply, p)
+	gate := c.serverWrite
+	if reply == c.channel {
+		gate = c.clientWrite
+	}
+	return c.writeFlow(ctx, reply, gate, p, withDeadline)
+}
+
+// Each physical flow owns its write gate and deadline. A blocked terminating
+// flow must not hold the originating flow hostage, while replies received on
+// the originating flow must still serialize with outbound requests.
+func (c *protectedTCPMessagingConn) writeFlow(ctx context.Context, conn net.Conn, gate chan struct{}, p []byte, withDeadline bool) (int, error) {
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-c.done:
+		return 0, net.ErrClosed
+	}
+	defer func() { <-gate }()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if c.isClosing() {
+		return 0, net.ErrClosed
+	}
+	if withDeadline {
+		deadline, _ := ctx.Deadline()
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return 0, err
+		}
+		cancelDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = conn.SetWriteDeadline(time.Now())
+			close(cancelDone)
+		})
+		defer func() {
+			if !stop() {
+				<-cancelDone
+			}
+			_ = conn.SetWriteDeadline(time.Time{})
+		}()
+	}
+	n, err := writeFullSIPStream(conn, p)
+	if n > 0 && n < len(p) {
+		// A truncated SIP frame cannot be followed by another request safely.
+		_ = conn.Close()
+	}
+	if ctx.Err() != nil {
+		return n, ctx.Err()
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return n, context.DeadlineExceeded
+		}
+	}
+	return n, err
 }
 
 func writeFullSIPStream(conn net.Conn, payload []byte) (int, error) {
