@@ -57,6 +57,8 @@ email:
     enabled: false
     smtp_host: ""
     smtp_port: 0
+    # true 表示连接建立即使用 TLS（通常为 465 端口）；false 时按服务器能力使用 STARTTLS。
+    use_ssl: false
     username: ""
     password: ""
     from_address: ""

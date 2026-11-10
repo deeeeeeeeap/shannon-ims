@@ -2,8 +2,6 @@ package config
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 
 	yaml "go.yaml.in/yaml/v3"
 )
@@ -66,52 +64,21 @@ func UpdateProxyConfigInFile(path string, cfg ProxyConfig) error {
 
 // updateProxyInFile 通用的代理配置更新函数
 func updateProxyInFile(path string, mutate func(*yaml.Node) error) error {
-	data, err := os.ReadFile(path)
+	err := mutateConfigDocument(path, true, func(root *yaml.Node) (bool, error) {
+		proxy := getMapValue(root, "proxy")
+		if proxy == nil || proxy.Kind != yaml.MappingNode {
+			proxy = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			setMapNode(root, "proxy", proxy)
+		}
+		if err := mutate(proxy); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
 	if err != nil {
-		return fmt.Errorf("读取配置文件失败: %w", err)
-	}
-
-	var doc yaml.Node
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return fmt.Errorf("解析配置文件失败: %w", err)
-	}
-
-	if len(doc.Content) == 0 {
-		return fmt.Errorf("配置文件为空")
-	}
-
-	root := doc.Content[0]
-	if root.Kind != yaml.MappingNode {
-		return fmt.Errorf("配置文件结构错误")
-	}
-
-	proxy := getMapValue(root, "proxy")
-	if proxy == nil {
-		proxy = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		setMapNode(root, "proxy", proxy)
-	}
-
-	if err := mutate(proxy); err != nil {
 		return err
 	}
-
-	out, err := yaml.Marshal(&doc)
-	if err != nil {
-		return fmt.Errorf("序列化配置文件失败: %w", err)
-	}
-
-	tmp := path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("创建配置目录失败: %w", err)
-	}
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return fmt.Errorf("写入临时配置文件失败: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("替换配置文件失败: %w", err)
-	}
-
-	_ = ReloadFromFile()
+	reloadAfterWrite(path)
 	return nil
 }
 

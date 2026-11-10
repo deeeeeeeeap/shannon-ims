@@ -110,6 +110,33 @@ func deviceConfigFromDTOWithBase(d deviceConfigDTO, base *config.DeviceConfig) c
 	if d.QMIProxyExecutable != nil {
 		qmiProxyExecutable = strings.TrimSpace(*d.QMIProxyExecutable)
 	}
+
+	// The device form does not carry operator selection or serial parameters.
+	// A save that omits them must keep what is configured: operator selection
+	// is owned by its dedicated endpoint, serial parameters by the config file.
+	baudRate, dataBits, stopBits, parity := d.BaudRate, d.DataBits, d.StopBits, strings.TrimSpace(d.Parity)
+	opMode := strings.TrimSpace(d.OperatorSelectionMode)
+	opPLMN := strings.TrimSpace(d.OperatorSelectionPLMN)
+	opRAT := strings.TrimSpace(d.OperatorSelectionRAT)
+	if base != nil {
+		if baudRate == 0 {
+			baudRate = base.BaudRate
+		}
+		if dataBits == 0 {
+			dataBits = base.DataBits
+		}
+		if stopBits == 0 {
+			stopBits = base.StopBits
+		}
+		if parity == "" {
+			parity = base.Parity
+		}
+		if opMode == "" && opPLMN == "" && opRAT == "" {
+			opMode = base.OperatorSelectionMode
+			opPLMN = base.OperatorSelectionPLMN
+			opRAT = base.OperatorSelectionRAT
+		}
+	}
 	return config.DeviceConfig{
 		ID:                    id,
 		Name:                  strings.TrimSpace(d.Name),
@@ -123,13 +150,13 @@ func deviceConfigFromDTOWithBase(d deviceConfigDTO, base *config.DeviceConfig) c
 		QMIProxyPath:          qmiProxyPath,
 		QMIProxyExecutable:    qmiProxyExecutable,
 		ESIMTransport:         config.NormalizeESIMTransport(d.ESIMTransport),
-		BaudRate:              d.BaudRate,
-		DataBits:              d.DataBits,
-		StopBits:              d.StopBits,
-		Parity:                strings.TrimSpace(d.Parity),
-		OperatorSelectionMode: strings.TrimSpace(d.OperatorSelectionMode),
-		OperatorSelectionPLMN: strings.TrimSpace(d.OperatorSelectionPLMN),
-		OperatorSelectionRAT:  strings.TrimSpace(d.OperatorSelectionRAT),
+		BaudRate:              baudRate,
+		DataBits:              dataBits,
+		StopBits:              stopBits,
+		Parity:                parity,
+		OperatorSelectionMode: opMode,
+		OperatorSelectionPLMN: opPLMN,
+		OperatorSelectionRAT:  opRAT,
 		SMSEnabled:            true, // 短信功能始终启用
 		APN:                   strings.TrimSpace(d.APN),
 		IPVersion:             strings.TrimSpace(d.IPVersion),
@@ -1456,14 +1483,7 @@ type addDeviceRequest struct {
 // validateDeviceBackendConfig 校验 device_backend 配置合法值。
 // 零路径持久化后 control_device 由运行时从 IMEI 发现，不再作为保存前置条件。
 func validateDeviceBackendConfig(cfg config.DeviceConfig) error {
-	backend := strings.ToLower(strings.TrimSpace(cfg.DeviceBackend))
-	switch backend {
-	case "", "at", "qmi", "mbim":
-		// 合法值
-	default:
-		return fmt.Errorf("不支持的 device_backend: %q，可选值: at, qmi, mbim", backend)
-	}
-	return nil
+	return config.ValidateDeviceBackend(cfg.DeviceBackend)
 }
 
 func validateFreeDeviceConfigLimit(devices []config.DeviceConfig) error {

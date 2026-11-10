@@ -15,7 +15,46 @@ const (
 	MBIMTransportProxy         = "proxy"
 	MBIMTransportDirect        = "direct"
 	DefaultWebhookTextTemplate = "{{device_label}} {{text}}"
+
+	DeviceBackendAT   = "at"
+	DeviceBackendQMI  = "qmi"
+	DeviceBackendMBIM = "mbim"
+
+	OperatorSelectionAutomatic = "automatic"
+	OperatorSelectionManual    = "manual"
+
+	DefaultServerPort       = 7575
+	DefaultWebhookTimeoutMs = 5000
+	DefaultWebhookRetryMax  = 3
+
+	// Serial defaults used when the device entry leaves a parameter unset.
+	DefaultSerialBaudRate = 115200
+	DefaultSerialDataBits = 8
+	DefaultSerialStopBits = 1
+	DefaultSerialParity   = "N"
 )
+
+// ValidateDeviceBackend reports whether in names a supported device backend.
+// Empty means "not configured" and is valid: the runtime then derives the
+// backend from the discovered control device.
+func ValidateDeviceBackend(in string) error {
+	switch strings.ToLower(strings.TrimSpace(in)) {
+	case "", DeviceBackendAT, DeviceBackendQMI, DeviceBackendMBIM:
+		return nil
+	default:
+		return fmt.Errorf("不支持的 device_backend: %q，可选值: at, qmi, mbim", strings.TrimSpace(in))
+	}
+}
+
+// ValidateMBIMTransport reports whether in names a supported MBIM transport.
+func ValidateMBIMTransport(in string) error {
+	switch strings.ToLower(strings.TrimSpace(in)) {
+	case "", MBIMTransportAuto, MBIMTransportProxy, MBIMTransportDirect:
+		return nil
+	default:
+		return fmt.Errorf("不支持的 mbim_transport: %q，可选值: auto, proxy, direct", strings.TrimSpace(in))
+	}
+}
 
 func NormalizeESIMTransport(in string) string {
 	switch strings.ToLower(strings.TrimSpace(in)) {
@@ -402,42 +441,46 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
-	viper.SetConfigFile(path)
-	viper.SetConfigType("yaml")
+	// A private instance per call: Load runs concurrently (API handlers and the
+	// device pool both trigger reloads) and the package-level viper singleton
+	// is not safe for that.
+	v := viper.New()
+	v.SetConfigFile(path)
+	v.SetConfigType("yaml")
 
 	// 默认值设置
-	viper.SetDefault("server.port", 7575)
-	viper.SetDefault("server.websheet_enabled", false)
-	viper.SetDefault("webhook.timeout_ms", 5000)
-	viper.SetDefault("webhook.retry_max", 3)
-	viper.SetDefault("webhook.text_template", DefaultWebhookTextTemplate)
+	v.SetDefault("server.port", DefaultServerPort)
+	v.SetDefault("server.websheet_enabled", false)
+	v.SetDefault("webhook.timeout_ms", DefaultWebhookTimeoutMs)
+	v.SetDefault("webhook.retry_max", DefaultWebhookRetryMax)
+	v.SetDefault("webhook.text_template", DefaultWebhookTextTemplate)
 
-	viper.SetDefault("bark.enabled", false)
-	viper.SetDefault("bark.group", "vohive")
-	viper.SetDefault("bark.level", "active")
-	viper.SetDefault("email.enabled", false)
-	viper.SetDefault("email.use_ssl", false)
-	viper.SetDefault("pushplus.enabled", false)
-	viper.SetDefault("web.username", "admin")
-	viper.SetDefault("vowifi.enabled", false)
-	viper.SetDefault("vowifi.mode", "vowifi")
-	viper.SetDefault("imscore.use_sipgo_udp", false)
+	v.SetDefault("bark.enabled", false)
+	v.SetDefault("bark.group", "vohive")
+	v.SetDefault("bark.level", "active")
+	v.SetDefault("email.enabled", false)
+	v.SetDefault("email.use_ssl", false)
+	v.SetDefault("pushplus.enabled", false)
+	v.SetDefault("web.username", "admin")
+	v.SetDefault("vowifi.enabled", false)
+	v.SetDefault("vowifi.mode", "vowifi")
+	v.SetDefault("imscore.use_sipgo_udp", false)
 
 	// 官方默认推送秘钥与用户 (留空则不执行 Push)
-	viper.SetDefault("vowifi.voice_gateway.linphone_push.linphone_user", "")
-	viper.SetDefault("vowifi.voice_gateway.linphone_push.linphone_password", "")
+	v.SetDefault("vowifi.voice_gateway.linphone_push.linphone_user", "")
+	v.SetDefault("vowifi.voice_gateway.linphone_push.linphone_password", "")
 
 	// 环境变量覆盖支持 (例如 PROXY_DEVICES_0_APN)
-	viper.SetEnvPrefix("PROXY")
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
+	v.SetEnvPrefix("PROXY")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
 
-	if err := viper.ReadInConfig(); err != nil {
+	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
 	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
+	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
@@ -463,6 +506,15 @@ func LoadForStartup(path string) (*Config, error) {
 	}
 	if err := ValidateWebCredentials(cfg.Web); err != nil {
 		return nil, err
+	}
+	var blocking []string
+	for _, issue := range Validate(cfg) {
+		if issue.Severity == SeverityError {
+			blocking = append(blocking, issue.Path+": "+issue.Message)
+		}
+	}
+	if len(blocking) > 0 {
+		return nil, fmt.Errorf("配置校验失败: %s", strings.Join(blocking, "; "))
 	}
 	return cfg, nil
 }

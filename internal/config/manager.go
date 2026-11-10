@@ -8,6 +8,7 @@ import (
 
 var (
 	globalConfig *Config
+	globalIssues []Issue
 	configMu     sync.RWMutex
 	configPath   string
 	secureWeb    bool
@@ -29,13 +30,25 @@ func InitGlobalManagerForStartup(path string) error {
 	if err != nil {
 		return err
 	}
+	issues := Validate(cfg)
 	configMu.Lock()
 	configPath = path
 	globalConfig = cfg
+	globalIssues = issues
 	secureWeb = true
 	configMu.Unlock()
 	logger.Info("配置文件已从磁盘加载到内存", "path", path)
+	logValidationIssues(issues)
 	return nil
+}
+
+// logValidationIssues reports findings once, at startup. Reloads only refresh
+// the list returned by ValidationIssues: every saved setting triggers a reload
+// and repeating the same warnings each time would bury real events.
+func logValidationIssues(issues []Issue) {
+	for _, issue := range issues {
+		logger.Warn("配置校验发现问题", "severity", string(issue.Severity), "field", issue.Path, "problem", issue.Message)
+	}
 }
 
 // ReloadFromFile 从磁盘重新加载最新配置到内存，通常在任何更新配置的动作后主动调用
@@ -56,11 +69,24 @@ func ReloadFromFile() error {
 			return err
 		}
 	}
+	issues := Validate(cfg)
 	configMu.Lock()
 	globalConfig = cfg
+	globalIssues = issues
 	configMu.Unlock()
 	logger.Info("配置文件已从磁盘热加载到内存", "path", path)
 	return nil
+}
+
+// ValidationIssues returns the findings of the most recent load, so the
+// diagnostics API can show operators what the running process ignored. The
+// result is never nil, which keeps the JSON form an array.
+func ValidationIssues() []Issue {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	out := make([]Issue, len(globalIssues))
+	copy(out, globalIssues)
+	return out
 }
 
 // GetConfig 获取当前处于内存中的全局配置。为保障一致性，不可在外部直接修改返回值。

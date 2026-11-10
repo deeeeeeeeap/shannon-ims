@@ -65,6 +65,8 @@ coverage.out
 *.tmp
 *.temp
 .cache/
+# 本地验证用的工具链、依赖缓存与日志（scripts/verify-local.sh 生成）
+/.sandbox/
 __pycache__/
 *.pyc
 /server

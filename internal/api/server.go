@@ -34,7 +34,6 @@ import (
 	"github.com/1239t/vowifi-go/runtimehost/voicehost"
 
 	"github.com/1239t/vohive/pkg/logger"
-	"github.com/spf13/viper"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -2506,7 +2505,10 @@ func (s *Server) handleSystemInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"version":    global.Version,
 		"build_time": global.BuildTime,
-		"config":     viper.ConfigFileUsed(),
-		"docs":       currentAPIDocsLinks(),
+		"config":     s.configPath,
+		// Findings of the last configuration load: values the running process
+		// ignored or replaced by a fallback. Never contains credential values.
+		"config_issues": config.ValidationIssues(),
+		"docs":          currentAPIDocsLinks(),
 	})
 }

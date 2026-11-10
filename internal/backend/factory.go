@@ -4,18 +4,21 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/internal/modem"
 	"github.com/1239t/vohive/pkg/logger"
 )
 
 // 后端模式常量
 const (
-	BackendAT   = "at"
-	BackendQMI  = "qmi"
-	BackendMBIM = "mbim"
+	BackendAT   = config.DeviceBackendAT
+	BackendQMI  = config.DeviceBackendQMI
+	BackendMBIM = config.DeviceBackendMBIM
 )
 
-// NormalizeBackendMode 标准化后端模式字符串
+// NormalizeBackendMode 标准化后端模式字符串。
+// 未知取值按 AT 处理以兼容已部署的配置；需要拒绝未知取值的入口（API 保存、
+// 启动期配置校验）必须先调用 ValidateBackendMode。
 func NormalizeBackendMode(in string) string {
 	switch strings.ToLower(strings.TrimSpace(in)) {
 	case "", BackendAT:
@@ -29,14 +32,10 @@ func NormalizeBackendMode(in string) string {
 	}
 }
 
-// ValidateBackendMode 验证后端模式是否有效
+// ValidateBackendMode 验证后端模式是否有效（空值表示未配置，合法）。
+// 必须在规范化之前判断：NormalizeBackendMode 会把未知取值折叠成 AT。
 func ValidateBackendMode(in string) error {
-	switch NormalizeBackendMode(in) {
-	case BackendAT, BackendQMI, BackendMBIM:
-		return nil
-	default:
-		return fmt.Errorf("无效的 device_backend 值: %q (可选: at, qmi, mbim)", in)
-	}
+	return config.ValidateDeviceBackend(in)
 }
 
 // NewBackend 根据配置模式创建对应后端实例的工厂方法
