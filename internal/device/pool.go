@@ -141,6 +141,12 @@ type Worker struct {
 
 	reassembler *smscodec.Reassembler
 
+	// smsIdentityUnknownSince 记录“收到短信但读不到 SIM 身份”的起始时间（Unix 纳秒），0 表示身份可读。
+	smsIdentityUnknownSince atomic.Int64
+
+	// smsRetries 记录暂时无法入库、留在模组中等待重试的短信首次失败的时间。
+	smsRetries cellularSMSRetries
+
 	// 短信工作模式：AT / QMI / VoWiFi（三模完全隔离）
 	smsMode smsMode
 
@@ -1746,16 +1752,15 @@ func (p *Pool) startAllSynchronousLegacy() error {
 			}
 			// 纯 MBIM 模式不监听 AT URC；短信通过 MBIM SMS service 接收。
 		} else {
-			// AT 模式：+CMTI URC → AT+CMGR 读取 → smsCallback → processSMS
+			// AT 模式：+CMTI URC → AT+CMGR 读取 → 接收流水线（入库后才删除模组副本）；
+			// 流水线不接管的短信仍走 smsCallback → processSMS
 			w.smsMode = smsModeAT
 			m.SetNewSMSHandler(nil)    // 不接管，让 modem.Manager 内部原生处理
 			m.SetDisableURCRead(false) // 确保 AT URC 自动读取启用
 			m.SetSIMStatusHandler(func(inserted *bool, state string) {
 				p.handleSIMStatusEvent(w.ID, "at_urc", inserted, state)
 			})
-			m.SetSMSCallback(func(sender, content string, timestamp time.Time) {
-				w.processSMS(sender, content, timestamp)
-			})
+			w.attachATSMSReception(m)
 		}
 		logger.Info(fmt.Sprintf("[%s] 短信模式已配置", w.ID), "sms_mode", w.smsMode.String(), "backend", bMode)
 
@@ -1844,35 +1849,8 @@ func (p *Pool) startAllSynchronousLegacy() error {
 			p.refreshIPs(worker, true)
 		}(w)
 
-		// 短信定时轮询（按 smsMode 分支）
-		go func(worker *Worker) {
-			ticker := time.NewTicker(60 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-p.ctx.Done():
-					return
-				case <-worker.stop:
-					return
-				case <-ticker.C:
-					switch worker.smsMode {
-					case smsModeAT:
-						// AT 模式：完全依赖 URC，不轮询
-					case smsModeQMI:
-						// QMI 模式：只走 QMI 轮询，不 fallback AT
-						if worker.QMICore != nil {
-							if err := worker.CheckAllSMSQMI(); err != nil {
-								logger.Warn(fmt.Sprintf("[%s] QMI 轮询短信失败", worker.ID), "err", err)
-							}
-						}
-					case smsModeMBIM:
-						worker.handleNewSMSMBIM("poll")
-					case smsModeVoWiFi:
-						// VoWiFi 模式：完全跳过，IMS 接管
-					}
-				}
-			}
-		}(w)
+		// 短信补收：启动后一次，此后定时（按 smsMode 分支）
+		go p.runSMSPoll(w)
 	}
 
 	// 启动健康检查定时任务

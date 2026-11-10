@@ -116,6 +116,8 @@ func (s *mbimInboxBackendStub) DeleteSMS(_ context.Context, index int) error {
 }
 
 func TestDrainMBIMInboxReassemblesAndDeletesSegments(t *testing.T) {
+	// Without a history database the parts are reassembled in memory.
+	withoutIncomingSMSTestDB(t)
 	pduHex := smscodecFixedSlotPaddedPDU()
 	sender, part2, ts, concat, err := decodeMBIMDeliverPDUHex(pduHex)
 	if err != nil {

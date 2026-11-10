@@ -446,10 +446,12 @@ func (w *Worker) ProbeDeviceHealth() (bool, error) {
 }
 
 func (w *Worker) processSMS(sender, content string, timestamp time.Time) {
-	logger.Info(fmt.Sprintf("[%s] 处理新短信", w.ID), "sender", sender, "content_len", len(content))
+	logger.Info(fmt.Sprintf("[%s] 处理新短信", w.ID),
+		"sender_len", len(sender), "sender_fingerprint", logger.Fingerprint(sender), "content_len", len(content))
 
 	if smsnotify.ShouldSuppressReceivedSMS(content) {
-		logger.Info(fmt.Sprintf("[%s] 短信已过滤（运营商 OTA/不可解码二进制包）", w.ID), "sender", sender)
+		logger.Info(fmt.Sprintf("[%s] 短信已过滤（运营商 OTA/不可解码二进制包）", w.ID),
+			"sender_fingerprint", logger.Fingerprint(sender))
 		return
 	}
 

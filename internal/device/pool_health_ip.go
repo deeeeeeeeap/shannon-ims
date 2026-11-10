@@ -83,6 +83,7 @@ func (p *Pool) healthCheckWorkerSnapshot() []*Worker {
 }
 
 func (p *Pool) runHealthCheckTick() bool {
+	purgeIncomingSMSJournalIfDue(time.Now())
 	workers := p.healthCheckWorkerSnapshot()
 	needRescan := false
 	for _, w := range workers {

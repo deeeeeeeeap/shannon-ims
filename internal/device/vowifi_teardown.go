@@ -38,9 +38,7 @@ func (p *Pool) restoreSMSModeAfterVoWiFiTeardown(w *Worker) {
 		if w.Modem != nil {
 			w.Modem.SetDisableURCRead(false)
 			w.Modem.ExecuteATSilent("AT+CNMI=2,1,0,0,0", 2*time.Second)
-			w.Modem.SetSMSCallback(func(sender, content string, timestamp time.Time) {
-				w.processSMS(sender, content, timestamp)
-			})
+			w.attachATSMSReception(w.Modem)
 		}
 	}
 

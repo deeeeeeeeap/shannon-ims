@@ -547,9 +547,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		w.smsMode = smsModeAT
 		m.SetNewSMSHandler(nil)
 		m.SetDisableURCRead(false)
-		m.SetSMSCallback(func(sender, content string, timestamp time.Time) {
-			w.processSMS(sender, content, timestamp)
-		})
+		w.attachATSMSReception(m)
 	}
 	logger.Info(fmt.Sprintf("[%s] 短信模式已配置", w.ID), "sms_mode", w.smsMode.String(), "backend", backendMode)
 
@@ -664,31 +662,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		logger.Warn(fmt.Sprintf("[%s] 启动期卡策略应用最终未完成", worker.ID))
 	}(w)
 
-	go func(worker *Worker) {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-p.ctx.Done():
-				return
-			case <-worker.stop:
-				return
-			case <-ticker.C:
-				switch worker.smsMode {
-				case smsModeAT:
-				case smsModeQMI:
-					if worker.QMICore != nil {
-						if err := worker.CheckAllSMSQMI(); err != nil {
-							logger.Warn(fmt.Sprintf("[%s] QMI 轮询短信失败", worker.ID), "err", err)
-						}
-					}
-				case smsModeMBIM:
-					worker.handleNewSMSMBIM("poll")
-				case smsModeVoWiFi:
-				}
-			}
-		}
-	}(w)
+	go p.runSMSPoll(w)
 
 	// 老配置(无 IMEI)首次起来后,尽力学到 live IMEI 并回填,完成身份锚定;
 	// 失败只记日志,不影响已成功启动的设备。

@@ -107,8 +107,14 @@ type Manager struct {
 
 	infoMu sync.RWMutex
 
+	// smsInboxMu 串行化对模组短信存储的读取、存储切换与删除（URC 触发的读取和定时补收），
+	// 同时保护 presentedSMS。
+	smsInboxMu   sync.Mutex
+	presentedSMS presentedSMSSet
+
 	// 回调
 	smsCallback            SMSCallback
+	incomingSMSSink        IncomingSMSSink
 	newSMSHandler          func(index string) // 处理新短信索引的回调 (用于 bubble up URC)
 	disableURCRead         bool               // 如果启用 QMI，禁用 AT 自动读取
 	simStatusHandler       func(inserted *bool, state string)
@@ -321,7 +327,9 @@ func parseFuserPIDs(raw string) []int {
 
 // SetSMSCallback 设置短信接收回调
 func (m *Manager) SetSMSCallback(cb SMSCallback) {
+	m.infoMu.Lock()
 	m.smsCallback = cb
+	m.infoMu.Unlock()
 }
 
 // SetNewSMSHandler 设置新短信索引回调 (当收到 URC 时调用，用于接管读取流程)
@@ -1500,6 +1508,10 @@ func (m *Manager) readAndProcessSMSFromStorage(storage, index string) {
 		return
 	}
 
+	// 与定时补收互斥：两者都会切换存储并按索引删除。
+	m.smsInboxMu.Lock()
+	defer m.smsInboxMu.Unlock()
+
 	normalizedStorage, hasStorage := normalizeSMSStorage(storage)
 	if hasStorage {
 		restore, switched := m.switchSMSStorageForRead(normalizedStorage)
@@ -1533,29 +1545,15 @@ func (m *Manager) readAndProcessSMSFromStorage(storage, index string) {
 		return
 	}
 
-	// 解码 PDU
-	sender, content, timestamp := m.decodePDU(pduHex)
-
-	// 如果内容为空（说明是分片且未完成），则不进行回调
-	if content == "" {
-		// 删除已读分片 (非常重要，否则SIM卡满了)
-		m.ExecuteAT("AT+CMGD="+index, 3*time.Second)
+	// 交给接收流程；只有被接下的短信才从模组中删除，其余的留待 DrainStoredSMS 重试。
+	if !m.deliverStoredSMS(pduHex) {
 		return
 	}
 
-	logger.Debug(fmt.Sprintf("[%s] 短信已解码", m.cfg.ID),
-		"sender_len", len(sender),
-		"sender_fingerprint", logger.Fingerprint(sender),
-		"content_len", len(content),
-		"content_fingerprint", logger.Fingerprint(content))
-
-	// 回调通知
-	if m.smsCallback != nil {
-		m.smsCallback(sender, content, timestamp)
+	// 删除已处理的短信（分片也要删除，否则存储会被占满）
+	if _, err := m.ExecuteAT("AT+CMGD="+index, 3*time.Second); err != nil {
+		logger.Warn(fmt.Sprintf("[%s] 删除已处理短信失败，下次补收时重试", m.cfg.ID), "index", index, "err", err)
 	}
-
-	// 删除已读短信
-	m.ExecuteAT("AT+CMGD="+index, 3*time.Second)
 }
 
 func normalizeSMSIndex(index string) (string, bool) {
@@ -1945,31 +1943,14 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-// CheckAllSMS 检查所有短信（轮询模式）
+// CheckAllSMS 检查所有短信（轮询模式）。
+//
+// 等同于 DrainStoredSMS：逐条处理并按索引删除，不再“全部读完后整体清空”，
+// 以免删掉列举之后才到达的短信。
 func (m *Manager) CheckAllSMS() {
-	if m.IsBusy() {
-		return
-	}
-
-	pdus, err := m.SMSListAllPDU()
-	if err != nil {
+	if _, err := m.DrainStoredSMS(); err != nil {
 		logger.Warn(fmt.Sprintf("[%s] 检查短信失败", m.cfg.ID), "err", err)
-		return
 	}
-
-	if len(pdus) == 0 {
-		return
-	}
-
-	for _, pduHex := range pdus {
-		sender, content, timestamp := m.decodePDU(pduHex)
-		if m.smsCallback != nil && content != "" {
-			m.smsCallback(sender, content, timestamp)
-		}
-	}
-
-	// 删除所有短信
-	_ = m.SMSDeleteAll()
 }
 
 // DeleteSMS 删除指定索引的短信

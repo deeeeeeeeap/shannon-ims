@@ -28,11 +28,50 @@ type IncomingSMSPart struct {
 	Fingerprint, IMSI, Sender, Content        string
 	Timestamp                                 time.Time
 	Reference, ReferenceBits, Total, Sequence int
+	// MessageIDPrefix starts the message ID of the stored message and names the
+	// channel it arrived on. Empty selects the prefix of messages received over IMS.
+	MessageIDPrefix string
 }
+
+// IncomingSMSMessageIDPrefixIMS is the message ID prefix of messages received
+// over IMS; IncomingSMSMessageIDPrefixCellular that of messages read from a
+// modem's message storage.
+const (
+	IncomingSMSMessageIDPrefixIMS      = "ims-in-"
+	IncomingSMSMessageIDPrefixCellular = "cell-in-"
+)
 
 type IncomingSMSResult struct {
 	Stored bool
 	SMS    SMS
+}
+
+// IncomingSMSJournalPurge counts the journal rows removed by one purge.
+type IncomingSMSJournalPurge struct {
+	Completed  int64 // correlation rows of messages that were stored
+	Incomplete int64 // parts of messages that never became complete
+}
+
+// PurgeIncomingSMSJournal removes the journal rows created before the given
+// time. Rows of completed messages hold no text and only serve to recognise a
+// repeated delivery. Parts of messages that never became complete still hold
+// their text; it is removed with them.
+func PurgeIncomingSMSJournal(before time.Time) (IncomingSMSJournalPurge, error) {
+	var removed IncomingSMSJournalPurge
+	if DB == nil {
+		return removed, errors.New("SMS database unavailable")
+	}
+	completed := DB.Where("created_at < ? AND message_id <> ?", before, "").Delete(&SMSIncomingPartJournal{})
+	if completed.Error != nil {
+		return removed, completed.Error
+	}
+	removed.Completed = completed.RowsAffected
+	incomplete := DB.Where("created_at < ? AND message_id = ?", before, "").Delete(&SMSIncomingPartJournal{})
+	if incomplete.Error != nil {
+		return removed, incomplete.Error
+	}
+	removed.Incomplete = incomplete.RowsAffected
+	return removed, nil
 }
 
 // StoreIncomingSMSPart commits the fragment, completed inbox row and contacts
@@ -93,7 +132,11 @@ func StoreIncomingSMSPart(part IncomingSMSPart, assemblyWindow time.Duration) (I
 			content.WriteString(fragment.Content)
 			fingerprints = append(fingerprints, fragment.Fingerprint)
 		}
-		messageID := "ims-in-" + fragments[0].Fingerprint
+		prefix := part.MessageIDPrefix
+		if prefix == "" {
+			prefix = IncomingSMSMessageIDPrefixIMS
+		}
+		messageID := prefix + fragments[0].Fingerprint
 		sms := SMS{MessageID: messageID, IMSI: part.IMSI, ICCID: iccid, Peer: part.Sender,
 			Sender: part.Sender, LocalPhone: localPhone, Recipient: localPhone, Content: content.String(),
 			Type: 1, Status: 0, Timestamp: fragments[0].Timestamp}

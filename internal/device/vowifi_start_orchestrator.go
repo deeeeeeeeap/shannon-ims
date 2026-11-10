@@ -122,6 +122,7 @@ func (p *Pool) MarkRuntimeStarted(req vowifihost.RuntimeStartedRequest) {
 	if w.Modem != nil {
 		w.Modem.SetNewSMSHandler(nil)
 		w.Modem.SetSMSCallback(nil)
+		w.Modem.SetIncomingSMSSink(nil)
 		w.Modem.SetDisableURCRead(true)
 	}
 }

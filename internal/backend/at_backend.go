@@ -206,14 +206,14 @@ func (a *ATBackend) DeleteSMS(ctx context.Context, index int) error {
 }
 
 func (a *ATBackend) ListSMS(ctx context.Context) ([]SMSSummary, error) {
-	pdus, err := a.modem.SMSListAllPDU()
+	entries, err := a.modem.ListStoredSMS()
 	if err != nil {
 		return nil, err
 	}
-	// 返回 PDU 数量的概要；实际索引需解析 +CMGL 响应
-	result := make([]SMSSummary, 0, len(pdus))
-	for i := range pdus {
-		result = append(result, SMSSummary{Index: i})
+	// Index 是模组存储中的真实索引（可直接用于 ReadSMS / DeleteSMS），Tag 是 +CMGL 的 <stat>。
+	result := make([]SMSSummary, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, SMSSummary{Index: entry.Index, Tag: entry.Status})
 	}
 	return result, nil
 }
