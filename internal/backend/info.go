@@ -40,7 +40,7 @@ type DeviceInfoProvider interface {
 	GetServingSystem(ctx context.Context) (*ServingSystem, error)
 
 	// IsSimInserted 判断 SIM 卡是否已插入
-	// AT 实现：AT+QSIMSTAT? / AT+CPIN?
+	// AT 实现：AT+CPIN?
 	// QMI 实现：DMS.GetSIMStatus
 	IsSimInserted(ctx context.Context) (bool, error)
 

@@ -72,22 +72,6 @@ func parseFirmware(resp string) string {
 	return ""
 }
 
-func parseQSIMSTATInserted(resp string) (bool, bool) {
-	line, ok := findLineWithPrefix(resp, "+QSIMSTAT:")
-	if !ok {
-		return false, false
-	}
-	parts := strings.Split(line, ",")
-	if len(parts) < 2 {
-		return false, false
-	}
-	var inserted int
-	if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &inserted); err != nil {
-		return false, false
-	}
-	return inserted == 1, true
-}
-
 func parseCPINInserted(resp string) (bool, bool) {
 	s := strings.ToUpper(resp)
 	if strings.Contains(s, "READY") {

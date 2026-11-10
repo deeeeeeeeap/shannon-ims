@@ -134,6 +134,9 @@ type Manager struct {
 	simFailCount int
 	simAlerting  bool
 
+	// 最近一次得知的 SIM 就绪状态，用来从查询应答里识别“状态变了”，见 noteQueryAnswer
+	simState atomic.Int32
+
 	// USSD 会话通道：当有协程在等待 USSD 响应时，+CUSD URC 会被投递到此通道
 	ussdChan chan USSDResult
 
@@ -771,6 +774,7 @@ RespLoop:
 				if !appendResponse(line) {
 					return
 				}
+				m.noteQueryRefused(req.cmd)
 				if !req.silent {
 					logger.Warn(fmt.Sprintf("[%s] AT 执行失败", m.cfg.ID),
 						"cmd", req.cmd,
@@ -815,6 +819,13 @@ RespLoop:
 
 				req.respChan <- "> "
 				break RespLoop
+			} else if answersQueryCommand(req.cmd, line) {
+				// 查询命令自己的应答归这条命令所有。它和同名的主动上报长得一样，却不是模组发来的事件：
+				// 当成事件分发，每一轮状态查询都会被看成一次“模组就绪”或“SIM 插拔”。
+				if !appendResponse(line) {
+					return
+				}
+				m.noteQueryAnswer(line)
 			} else if m.isURC(line) {
 				// 对于确认为 URC 的行，始终分发出去
 				m.handleURC(line)
@@ -1413,6 +1424,71 @@ func (m *Manager) dispatchSIMStatusURC(inserted *bool, state string) {
 	}
 }
 
+// SIM 就绪状态的取值。未知只出现在管理器刚启动、还没有任何依据的时候。
+const (
+	simStateUnknown int32 = iota
+	simStateReady
+	simStateNotReady
+)
+
+// observeSIMState 记录最近一次得知的 SIM 就绪状态，返回它是否与上一次得知的不同。
+func (m *Manager) observeSIMState(ready bool) (changed bool) {
+	next := simStateNotReady
+	if ready {
+		next = simStateReady
+	}
+	return m.simState.Swap(next) != next
+}
+
+// queriedCommandName 取出读取命令 (AT+X?) 或测试命令 (AT+X=?) 查询的名字，例如 "AT+CPIN?" 得到 "+CPIN"。
+// 带参数的查询 (AT+QCFG="usbnet"?) 和设置/执行命令不算。
+func queriedCommandName(cmd string) (string, bool) {
+	c := strings.ToUpper(strings.TrimSpace(cmd))
+	if !strings.HasPrefix(c, "AT") || !strings.HasSuffix(c, "?") {
+		return "", false
+	}
+	name := strings.TrimSuffix(strings.TrimSuffix(c[2:], "?"), "=")
+	if len(name) < 2 || strings.ContainsAny(name, "=?\", ") {
+		return "", false
+	}
+	return name, true
+}
+
+// answersQueryCommand 判断一行是否是正在执行的查询命令自己的应答。
+// AT+X? 与 AT+X=? 的应答以 "+X:" 开头，和同名的主动上报没有区别；设置/执行命令之后出现的
+// "+X:"（例如 AT+CUSD=1,... 之后的 +CUSD:）才是真正的上报，所以它们不在此列。
+func answersQueryCommand(cmd, line string) bool {
+	name, ok := queriedCommandName(cmd)
+	return ok && strings.EqualFold(urcKey(line), name)
+}
+
+// noteQueryAnswer 从查询应答里取出状态变化。应答本身不是事件，它反映出的变化才是：
+// 模组的主动上报不一定到得了这里（上报发生在串口打开之前就会丢失，模组也可能根本不报），
+// 这时 SIM 就绪与否只能从 AT+CPIN? 的应答里看到。
+// 因此状态第一次得知或发生变化时，按模组自己上报时的方式通知一次；之后相同的应答不再通知。
+func (m *Manager) noteQueryAnswer(line string) {
+	if !strings.EqualFold(urcKey(line), "+CPIN") {
+		return
+	}
+	state := strings.Trim(parseURCAfterColon(line), "\"")
+	ready := state == "READY"
+	if !m.observeSIMState(ready) {
+		return
+	}
+	if ready {
+		m.dispatchRDY()
+	}
+	m.dispatchSIMStatusURC(nil, state)
+}
+
+// noteQueryRefused 处理被模组拒绝的查询。AT+CPIN? 被拒绝（例如 +CME ERROR: 10）说明 SIM 眼下不可用；
+// 这里只记下状态，好让之后的第一次 READY 被识别为变化，不另外发事件——错误应答从来不是事件。
+func (m *Manager) noteQueryRefused(cmd string) {
+	if name, ok := queriedCommandName(cmd); ok && name == "+CPIN" {
+		m.observeSIMState(false)
+	}
+}
+
 // handleURC 处理 URC
 func (m *Manager) handleURC(line string) {
 	s := strings.TrimSpace(line)
@@ -1447,6 +1523,7 @@ func (m *Manager) handleURC(line string) {
 				break
 			}
 		}
+		m.observeSIMState(state == "READY")
 		m.dispatchSIMStatusURC(nil, state)
 	}
 

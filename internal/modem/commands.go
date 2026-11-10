@@ -26,12 +26,12 @@ func (m *Manager) QueryFirmware() (string, error) {
 	return parseFirmware(resp), nil
 }
 
+// QuerySIMInserted 查询 SIM 是否可用，依据是 AT+CPIN? 的应答。
+//
+// 这里不问 AT+QSIMSTAT?：它报告的是卡座检测的结果，和卡能不能用不是一回事。早先的实现虽然先发它，
+// 应答却一直被当作主动上报从命令响应里剔除，真正起作用的始终是 AT+CPIN?，所以去掉那条查询
+// 不改变判定结果。要改用卡座检测作依据，需要先在实物模组上确认两者在各种卡状态下是否一致。
 func (m *Manager) QuerySIMInserted() (bool, error) {
-	if resp, err := m.ExecuteATSilent("AT+QSIMSTAT?", 2*time.Second); err == nil {
-		if inserted, ok := parseQSIMSTATInserted(resp); ok {
-			return inserted, nil
-		}
-	}
 	resp, err := m.ExecuteATSilent("AT+CPIN?", 2*time.Second)
 	if err != nil {
 		return false, err
