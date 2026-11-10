@@ -51,9 +51,11 @@ IMS_LOG_PATH_PREFIXES = (
     "vowifi-go/runtimehost/voiceclient/",
 )
 PROFILE_LOG_PATHS = {
+    "internal/device/incoming_sms_pipeline.go",
+    "internal/device/sms_send.go",
     "internal/device/vowifi_start_profile.go",
     "internal/modem/manager.go",
-    "internal/sms/poller.go",
+    "internal/modem/sms_inbox.go",
 }
 
 

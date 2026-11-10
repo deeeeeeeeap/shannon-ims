@@ -72,6 +72,33 @@ class RepositoryPrivacyRulesTest(unittest.TestCase):
         )
         self.assertNotIn("raw_log_runtime_bypass", rules)
 
+    def test_rejects_raw_identity_log_fields_in_sms_pipeline(self) -> None:
+        for relative in (
+            "internal/device/incoming_sms_pipeline.go",
+            "internal/device/sms_send.go",
+            "internal/modem/sms_inbox.go",
+        ):
+            with self.subTest(relative=relative):
+                rules = self.findings(
+                    relative,
+                    'logger.Info("stored", "sender", sender, "content", text)',
+                )
+                self.assertIn("sensitive_profile_log_field", rules)
+
+    def test_accepts_sms_pipeline_diagnostic_metadata(self) -> None:
+        rules = self.findings(
+            "internal/device/sms_send.go",
+            'logger.Info("sent", "to_fingerprint", logger.Fingerprint(to), "parts", parts)',
+        )
+        self.assertNotIn("sensitive_profile_log_field", rules)
+
+    def test_profile_log_rule_only_names_files_that_exist(self) -> None:
+        # A path that no longer exists would leave the code that replaced it
+        # outside the rule without anyone noticing.
+        for relative in sorted(repository_privacy.PROFILE_LOG_PATHS):
+            with self.subTest(relative=relative):
+                self.assertTrue((repository_privacy.ROOT / relative).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
