@@ -228,6 +228,14 @@ paths:
     post:
       tags: [sms]
       summary: 发送短信
+      description: |
+        设备的 VoWiFi 会话在线时经 IMS 发送，否则经模组发送；两条通道的校验、分段和历史记录一致。
+
+        - 400：请求无法发送（号码为空、含非法字符或超过 20 位；正文为空或超过 255 段；编码取值不支持）。
+          此时不会联系模组或网络，也不写入短信历史。
+        - 404：找不到发送设备。
+        - 500：已交给通道但发送失败。响应同时带有 message_id（只有 IMS 通道可能有值）、parts_total 和 delivery_state；
+          能读到卡的 IMSI 时，该短信在历史中记为发送失败。
       requestBody:
         required: true
         content:
@@ -2173,12 +2181,23 @@ components:
       properties:
         device_id:
           type: string
+          description: 发送设备；只有一台设备时可以省略
         imsi:
           type: string
+          description: 没有给 device_id 时，按卡的 IMSI 选择设备
         phone:
           type: string
+          description: |
+            收件号码。可以带空格、短横线、点和括号，全角数字也可以，发送前统一整理；
+            国际号码以 + 开头（不会自动补国家码）；最多 20 位，可以含 * 和 #。
         message:
           type: string
+          description: 短信正文；一条放不下时自动拆成长短信，最多 255 段
+        encoding:
+          type: string
+          enum: [auto, ucs2]
+          default: auto
+          description: auto 按正文自动选择 GSM 7-bit 或 UCS-2；ucs2 强制使用 UCS-2
 
     SMSSendResponse:
       type: object
@@ -2191,12 +2210,17 @@ components:
           type: string
         phone:
           type: string
+          description: 请求里的号码，原样返回
         message_id:
           type: string
+          description: 投递状态的查询编号；只有经 IMS 发送时才有，经模组发送时为空
         parts_total:
           type: integer
+          description: 这条短信实际拆成的段数
         delivery_state:
           type: string
+          enum: [pending, partial_ack, acked, delivery_pending, delivery_unconfirmed, delivered, failed, timeout]
+          description: 经模组发送成功为 acked；经 IMS 发送时随短信中心确认和状态报告变化
 
     SMSDeliveryResponse:
       type: object

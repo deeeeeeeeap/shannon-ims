@@ -21,22 +21,3 @@ func TestSMSSubmissionResponseMessageKeepsRPAckDistinctFromDelivery(t *testing.T
 		}
 	}
 }
-
-func TestNormalizeSMSDeliveryStateUsesPathSpecificFailureFallback(t *testing.T) {
-	tests := []struct {
-		state    string
-		fallback string
-		want     string
-	}{
-		{state: "", fallback: "failed", want: "failed"},
-		{state: "unknown", fallback: "failed", want: "failed"},
-		{state: "partial_ack", fallback: "failed", want: "partial_ack"},
-		{state: "ACKED", fallback: "failed", want: "acked"},
-		{state: "DELIVERED", fallback: "failed", want: "delivered"},
-	}
-	for _, test := range tests {
-		if got := normalizeSMSDeliveryState(test.state, test.fallback); got != test.want {
-			t.Fatalf("state=%q fallback=%q got=%q want=%q", test.state, test.fallback, got, test.want)
-		}
-	}
-}

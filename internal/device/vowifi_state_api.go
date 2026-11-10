@@ -28,18 +28,6 @@ func (p *Pool) GetVoWiFiApp() *runtimehost.Instance {
 	return p.GetVoWiFiAppForDevice()
 }
 
-// FirstVoWiFiDeviceID returns the device ID of an arbitrary active VoWiFi
-// instance (matching GetVoWiFiAppForDevice's no-argument behavior), or ""
-// if none is active. Exists so callers that only had a *runtimehost.Instance
-// via GetVoWiFiApp() (with no device ID of their own) can still reach the
-// device-scoped Pool methods, e.g. SendVoWiFiSMSWithOptions.
-func (p *Pool) FirstVoWiFiDeviceID() string {
-	for devID := range p.voWiFiHost().Instances() {
-		return devID
-	}
-	return ""
-}
-
 func (p *Pool) GetVoWiFiAppForDevice(deviceID ...string) *runtimehost.Instance {
 	if len(deviceID) > 0 && deviceID[0] != "" {
 		return p.voWiFiHost().Instance(deviceID[0])
@@ -56,21 +44,16 @@ func (p *Pool) GetAllVoWiFiApps() map[string]*runtimehost.Instance {
 	return p.voWiFiHost().Instances()
 }
 
-func (p *Pool) SendVoWiFiSMS(ctx context.Context, deviceID, to, text string) error {
-	_, err := p.SendVoWiFiSMSWithResult(ctx, deviceID, to, text)
-	return err
-}
-
-func (p *Pool) SendVoWiFiSMSWithResult(ctx context.Context, deviceID, to, text string) (messaging.SendOutcome, error) {
-	return p.SendVoWiFiSMSWithOptions(ctx, deviceID, to, text, smscodec.SubmitOptions{})
-}
-
 // SendVoWiFiSMSWithOptions encodes to/text into RP-DATA(SUBMIT) parts using
 // vohive's own pkg/smscodec, then hands the already-encoded bytes to the
 // vowifi-go IMS engine. That engine (vowifi-go/runtimehost) must not import
 // vohive (the dependency runs the other way), so encoding responsibility
 // -- TPDU construction, GSM7/UCS2 choice, RP-DATA framing, RP-MR allocation
 // -- lives here, on vohive's side, per messaging.SMSPart's contract.
+//
+// It is the IMS leg on its own: it does not choose a channel and does not
+// record a failed message. Callers that send a message for a user go through
+// Pool.SendSMS.
 func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text string, opts smscodec.SubmitOptions) (messaging.SendOutcome, error) {
 	inst := p.voWiFiHost().Instance(deviceID)
 	if inst == nil {
@@ -88,7 +71,14 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 	if err != nil {
 		return messaging.SendOutcome{}, fmt.Errorf("编码 SMS TPDU 失败: %w", err)
 	}
+	return sendPreparedVoWiFiSMS(ctx, inst, worker, deviceID, submission, text)
+}
 
+// sendPreparedVoWiFiSMS frames a prepared message as RP-DATA, one per part,
+// and hands the parts to the IMS engine. inst is the instance the caller
+// decided to send on: looking it up again after the service centre query
+// could find a session that has replaced it in the meantime.
+func sendPreparedVoWiFiSMS(ctx context.Context, inst *runtimehost.Instance, worker *Worker, deviceID string, submission *smscodec.Submission, text string) (messaging.SendOutcome, error) {
 	smscCtx, smscCancel := context.WithTimeout(ctx, 5*time.Second)
 	smsc, err := worker.getSMSCWithContext(smscCtx)
 	smscCancel()

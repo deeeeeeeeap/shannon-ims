@@ -16,7 +16,6 @@ import (
 	qmicore "github.com/1239t/vohive/internal/qmi"
 	"github.com/1239t/vohive/internal/smsnotify"
 	"github.com/1239t/vohive/pkg/logger"
-	"github.com/1239t/vohive/pkg/smscodec"
 
 	qmimanager "github.com/iniwex5/quectel-qmi-go/pkg/manager"
 	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
@@ -373,30 +372,6 @@ func (w *Worker) getPhoneNumberWithContext(ctx context.Context) string {
 		}
 	}
 	return ""
-}
-
-func (w *Worker) SendSMS(phone, message string) error {
-	return w.SendSMSWithOptions(phone, message, smscodec.SubmitOptions{})
-}
-
-func (w *Worker) SendSMSWithOptions(phone, message string, opts smscodec.SubmitOptions) error {
-	if w.Backend != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-		defer cancel()
-		if sender, ok := w.Backend.(interface {
-			SendSMSWithOptions(context.Context, string, string, smscodec.SubmitOptions) error
-		}); ok {
-			return sender.SendSMSWithOptions(ctx, phone, message, opts)
-		}
-		if encoding, _ := smscodec.NormalizeSMSEncoding(string(opts.Encoding)); encoding != smscodec.SMSEncodingAuto {
-			return fmt.Errorf("设备 %s 的短信后端不支持编码选项: %s", w.ID, opts.Encoding)
-		}
-		return w.Backend.SendSMS(ctx, phone, message)
-	}
-	if w.Modem != nil {
-		return w.Modem.SendSMSWithOptions(phone, message, opts)
-	}
-	return fmt.Errorf("设备 %s 无可用的短信发送后端", w.ID)
 }
 
 func (w *Worker) GetIMSI() string {

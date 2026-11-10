@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/1239t/vohive/internal/db"
+	"github.com/1239t/vohive/internal/device"
 	"github.com/1239t/vowifi-go/runtimehost"
 	"github.com/1239t/vowifi-go/runtimehost/messaging"
 	"github.com/1239t/vowifi-go/runtimehost/voicehost"
@@ -68,42 +69,28 @@ func (m *Manager) handleCmdSendSMS(cmdCtx CommandContext, args []string) string 
 	if worker.Config.Name != "" {
 		displayName = fmt.Sprintf("%s (%s)", worker.Config.Name, worker.ID)
 	}
-	isVoWiFi := m.pool.IsVoWiFiActive(deviceID)
+	channel := m.pool.SMSChannelFor(deviceID)
 
 	// /send 是用户的显式操作，不能因 notifyPool 满载被丢弃。
 	// 这里使用独立 goroutine，确保命令被执行并回执结果。
 	go func() {
-		var sendErr error
-		if isVoWiFi {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx := context.Background()
+		if channel == device.SMSChannelIMS {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 			ctx = messaging.WithSuppressSendTGSuccess(ctx)
-			sendErr = m.pool.SendVoWiFiSMS(ctx, deviceID, phone, message)
-			if sendErr != nil {
-				cmdCtx.Reply(fmt.Sprintf("发送短信 / 失败\n设备    %s\n号码    %s\n通道    VoWiFi\n原因    %v", displayName, phone, sendErr))
-				return
-			}
-		} else {
-			sendErr = worker.SendSMS(phone, message)
-			if sendErr != nil {
-				cmdCtx.Reply(fmt.Sprintf("发送短信 / 失败\n设备    %s\n号码    %s\n通道    蜂窝\n原因    %v", displayName, phone, sendErr))
-				return
-			}
-			_ = db.SaveSMS(worker.GetIMSI(), worker.ID, phone, message, 2, 2, time.Now())
 		}
-
-		channel := "蜂窝"
-		if isVoWiFi {
-			channel = "VoWiFi"
+		// 选通道、发送和历史入库（含失败）都在 Pool.SendSMS 里完成；回执以实际使用的通道为准。
+		result, sendErr := m.pool.SendSMS(ctx, device.SMSSendRequest{DeviceID: deviceID, To: phone, Text: message})
+		if sendErr != nil {
+			cmdCtx.Reply(fmt.Sprintf("发送短信 / 失败\n设备    %s\n号码    %s\n通道    %s\n原因    %v", displayName, phone, result.Channel.Label(), sendErr))
+			return
 		}
-		cmdCtx.Reply(fmt.Sprintf("发送短信 / 完成\n设备    %s\n号码    %s\n通道    %s\n内容    %s", displayName, phone, channel, message))
+		cmdCtx.Reply(fmt.Sprintf("发送短信 / 完成\n设备    %s\n号码    %s\n通道    %s\n内容    %s", displayName, phone, result.Channel.Label(), message))
 	}()
 
-	channel := "蜂窝"
-	if isVoWiFi {
-		channel = "VoWiFi"
-	}
-	return fmt.Sprintf("发送短信 / 已受理\n设备    %s\n号码    %s\n通道    %s", displayName, phone, channel)
+	return fmt.Sprintf("发送短信 / 已受理\n设备    %s\n号码    %s\n通道    %s", displayName, phone, channel.Label())
 }
 
 func summarizeVoWiFiReady(st runtimehost.State) string {
