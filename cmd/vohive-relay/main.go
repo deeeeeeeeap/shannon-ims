@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -49,13 +50,24 @@ func main() {
 		TargetHost: *targetHost,
 		LocalIP:    *bindIP,
 		Ports:      []int{500, 4500},
+		Logf:       log.Printf,
 	})
 	if err != nil {
 		log.Fatalf("start relay: %v", err)
 	}
-	defer relay.Close()
 
 	log.Printf("relay up: %s:{500,4500} -> (via %s) -> %s:{500,4500}", *bindIP, *proxyAddr, *targetHost)
-	<-ctx.Done()
-	log.Println("shutting down")
+	select {
+	case <-ctx.Done():
+		log.Println("shutting down")
+		_ = relay.Close()
+	case <-relay.Done():
+		// The proxy association is gone for good. Exit non-zero so a service
+		// manager restarts the relay instead of leaving it listening for nothing.
+		stats := relay.Stats()
+		log.Printf("relay stopped: %v (forwarded=%d returned=%d dropped=%d associations=%d)",
+			relay.Err(), stats.Forwarded, stats.Returned, stats.Dropped, stats.Associations)
+		stop()
+		os.Exit(1)
+	}
 }

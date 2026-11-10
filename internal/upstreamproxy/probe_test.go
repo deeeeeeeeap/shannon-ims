@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// Wire values used by the hand-written proxy stubs in this file.
+const (
+	socks5Version      = 0x05
+	socks5ReplySuccess = 0x00
+	socks5AtypIPv4     = 0x01
+	socks5AtypIPv6     = 0x04
+)
+
 func TestProbeSOCKS5Success(t *testing.T) {
 	addr := startProbeServer(t, func(conn net.Conn) {
 		defer conn.Close()

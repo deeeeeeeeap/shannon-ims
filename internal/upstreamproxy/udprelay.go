@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/1239t/vowifi-go/runtimehost/transport"
 )
 
 // UDPRelayConfig configures a UDPRelay: forward UDP traffic aimed at
@@ -82,30 +85,76 @@ type UDPRelayConfig struct {
 	// set explicitly only when the listen and forward-to ports must
 	// differ, e.g. to work around the same-host conflict described above.
 	TargetPorts []int
+
+	// Logf receives one line for every change in the state of the proxy
+	// association. Optional.
+	Logf func(format string, args ...any)
+
+	// retry replaces the retry policy for a lost proxy association; the zero
+	// value keeps the transport's defaults.
+	retry relayRetry
 }
+
+// relayRetry is the policy for making a lost proxy association again.
+type relayRetry struct {
+	maxAttempts int
+	backoffBase time.Duration
+	backoffMax  time.Duration
+	minStable   time.Duration
+}
+
+// UDPRelayStats counts what a relay has done.
+type UDPRelayStats struct {
+	// Forwarded counts datagrams handed to the proxy for the target.
+	Forwarded uint64
+	// Returned counts datagrams delivered back to a local peer.
+	Returned uint64
+	// Dropped counts datagrams that could not be passed on: the proxy
+	// association was down, or there was no local peer to return them to.
+	Dropped uint64
+	// Associations counts proxy associations made, the first one included.
+	Associations uint64
+}
+
+// relayAssociateTimeout bounds the TCP connect and every SOCKS5 exchange.
+const relayAssociateTimeout = 5 * time.Second
 
 // UDPRelay is a running relay; call Close to tear it down.
+//
+// A relay stops on its own when the proxy association is lost and cannot be
+// made again: Done is then closed and Err says why. It never keeps listening
+// while silently forwarding nowhere.
 type UDPRelay struct {
-	ctrl      net.Conn // SOCKS5 TCP control connection; keeps the UDP ASSOCIATE alive
-	toRelay   *net.UDPConn
-	relayAddr *net.UDPAddr
-	targetIP  net.IP
-	listeners []*net.UDPConn
+	tp     transport.DatagramTransport
+	target net.IP
+	logf   func(format string, args ...any)
 
-	portMap        map[int]int // listen port -> target port
-	reversePortMap map[int]int // target port -> listen port
+	listeners   []*net.UDPConn
+	targetPorts []int       // by listener index
+	byTarget    map[int]int // target port -> listener index
 
 	mu    sync.Mutex
-	peers map[int]*net.UDPAddr // listen port -> last-seen local peer (e.g. charon) to reply to
+	peers []*net.UDPAddr // by listener index: last-seen local peer (e.g. charon) to reply to
+	err   error
 
-	cancel context.CancelFunc
-	done   chan struct{}
+	running  atomic.Bool
+	stopOnce sync.Once
+	stopped  chan struct{}
+	done     chan struct{}
+
+	forwarded atomic.Uint64
+	returned  atomic.Uint64
+	dropped   atomic.Uint64
 }
 
-// StartUDPRelay dials cfg.ProxyAddr, performs the SOCKS5 handshake and UDP
-// ASSOCIATE (reusing probeHandshake/probeUDPAssociate's exact wire logic --
-// already validated by ProbeSOCKS5), then binds cfg.LocalIP on each of
-// cfg.Ports and starts pumping datagrams in both directions.
+// StartUDPRelay binds cfg.LocalIP on each of cfg.Ports, obtains a UDP
+// association from the SOCKS5 proxy and starts pumping datagrams in both
+// directions. It returns once the association is up, or with the reason it
+// could not be made.
+//
+// The proxy side is the transport the tunnel itself uses, so the relay gets
+// the same negotiation, the same handling of the advertised relay address,
+// and re-association when the proxy drops the control connection.
 func StartUDPRelay(ctx context.Context, cfg UDPRelayConfig) (*UDPRelay, error) {
 	proxyAddr := strings.TrimSpace(cfg.ProxyAddr)
 	if proxyAddr == "" {
@@ -115,9 +164,14 @@ func StartUDPRelay(ctx context.Context, cfg UDPRelayConfig) (*UDPRelay, error) {
 	if targetHost == "" {
 		return nil, errors.New("upstreamproxy: UDPRelayConfig.TargetHost is required")
 	}
-	localIP := strings.TrimSpace(cfg.LocalIP)
-	if localIP == "" {
+	localIPText := strings.TrimSpace(cfg.LocalIP)
+	if localIPText == "" {
 		return nil, errors.New("upstreamproxy: UDPRelayConfig.LocalIP is required")
+	}
+	localIP := net.ParseIP(localIPText)
+	if localIP == nil {
+		// A name here would silently become the wildcard address.
+		return nil, fmt.Errorf("upstreamproxy: UDPRelayConfig.LocalIP %q is not an IP address", localIPText)
 	}
 	if len(cfg.Ports) == 0 {
 		return nil, errors.New("upstreamproxy: UDPRelayConfig.Ports is required")
@@ -129,219 +183,314 @@ func StartUDPRelay(ctx context.Context, cfg UDPRelayConfig) (*UDPRelay, error) {
 	if len(targetPorts) != len(cfg.Ports) {
 		return nil, errors.New("upstreamproxy: UDPRelayConfig.TargetPorts must be the same length as Ports")
 	}
-	portMap := make(map[int]int, len(cfg.Ports))
-	reversePortMap := make(map[int]int, len(cfg.Ports))
-	for i, p := range cfg.Ports {
-		portMap[p] = targetPorts[i]
-		reversePortMap[targetPorts[i]] = p
+	byTarget := make(map[int]int, len(targetPorts))
+	for i, port := range targetPorts {
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("upstreamproxy: target port %d is out of range", port)
+		}
+		if _, dup := byTarget[port]; dup {
+			// Replies are routed back by the port they come from.
+			return nil, fmt.Errorf("upstreamproxy: target port %d is listed twice", port)
+		}
+		byTarget[port] = i
+	}
+	for _, port := range cfg.Ports {
+		if port < 0 || port > 65535 {
+			return nil, fmt.Errorf("upstreamproxy: listen port %d is out of range", port)
+		}
 	}
 
-	targetIPs, err := net.DefaultResolver.LookupIP(ctx, "ip4", targetHost)
-	if err != nil || len(targetIPs) == 0 {
+	target, err := resolveRelayTarget(ctx, targetHost)
+	if err != nil {
 		return nil, fmt.Errorf("upstreamproxy: resolve target %s: %w", targetHost, err)
 	}
-	targetIP := targetIPs[0]
 
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	ctrl, err := dialer.DialContext(ctx, "tcp", proxyAddr)
-	if err != nil {
-		return nil, fmt.Errorf("upstreamproxy: dial proxy %s: %w", proxyAddr, err)
-	}
-	if err := ctrl.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("upstreamproxy: set handshake deadline: %w", err)
-	}
-	if _, err := probeHandshake(ctrl, cfg.Username, cfg.Password); err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("upstreamproxy: socks5 handshake: %w", err)
-	}
-	relayAddr, err := probeUDPAssociate(ctrl)
-	if err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("upstreamproxy: socks5 udp associate: %w", err)
-	}
-	// The UDP ASSOCIATE session lives as long as ctrl stays open (RFC 1928
-	// §7); this relay is meant to run indefinitely, so the handshake-only
-	// deadline is cleared now that setup succeeded.
-	if err := ctrl.SetDeadline(time.Time{}); err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("upstreamproxy: clear deadline: %w", err)
-	}
-
-	toRelay, err := net.DialUDP("udp", nil, relayAddr)
-	if err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("upstreamproxy: dial relay udp endpoint %s: %w", relayAddr, err)
-	}
-
-	relayCtx, cancel := context.WithCancel(context.Background())
 	r := &UDPRelay{
-		ctrl:           ctrl,
-		toRelay:        toRelay,
-		relayAddr:      relayAddr,
-		targetIP:       targetIP,
-		portMap:        portMap,
-		reversePortMap: reversePortMap,
-		peers:          make(map[int]*net.UDPAddr),
-		cancel:         cancel,
-		done:           make(chan struct{}),
+		target:      target,
+		logf:        cfg.Logf,
+		targetPorts: append([]int(nil), targetPorts...),
+		byTarget:    byTarget,
+		peers:       make([]*net.UDPAddr, len(cfg.Ports)),
+		stopped:     make(chan struct{}),
+		done:        make(chan struct{}),
 	}
-
 	for _, port := range cfg.Ports {
-		ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(localIP), Port: port})
+		ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: port})
 		if err != nil {
-			r.closeAll()
-			return nil, fmt.Errorf("upstreamproxy: listen %s:%d: %w", localIP, port, err)
+			r.closeListeners()
+			return nil, fmt.Errorf("upstreamproxy: listen %s: %w", net.JoinHostPort(localIPText, strconv.Itoa(port)), err)
 		}
 		r.listeners = append(r.listeners, ln)
 	}
 
+	// The outcome of the first association attempt decides whether the relay
+	// starts; later changes are only reported.
+	first := make(chan error, 1)
+	var firstOnce sync.Once
+	tp, err := transport.NewSocks5UDPTransportWithOptions(transport.Socks5UDPOptions{
+		ProxyAddr: proxyAddr,
+		Username:  cfg.Username,
+		Password:  cfg.Password,
+		Timeout:   relayAssociateTimeout,
+
+		MaxAttempts: cfg.retry.maxAttempts,
+		BackoffBase: cfg.retry.backoffBase,
+		BackoffMax:  cfg.retry.backoffMax,
+		MinStable:   cfg.retry.minStable,
+
+		OnEvent: func(ev transport.Socks5UDPEvent) {
+			switch ev.Kind {
+			case transport.Socks5UDPAssociated:
+				firstOnce.Do(func() { first <- nil })
+			case transport.Socks5UDPAttemptFailed, transport.Socks5UDPFailed:
+				firstOnce.Do(func() { first <- ev.Err })
+			}
+			r.report(ev)
+		},
+	})
+	if err != nil {
+		r.closeListeners()
+		return nil, fmt.Errorf("upstreamproxy: %w", err)
+	}
+	r.tp = tp
+
 	var wg sync.WaitGroup
 	wg.Add(len(r.listeners) + 1)
-	for i, ln := range r.listeners {
-		go func(ln *net.UDPConn, port int) {
+	for i := range r.listeners {
+		go func(index int) {
 			defer wg.Done()
-			r.pumpLocalToRelay(relayCtx, ln, port)
-		}(ln, cfg.Ports[i])
+			r.pumpLocalToRelay(index)
+		}(i)
 	}
 	go func() {
 		defer wg.Done()
-		r.pumpRelayToLocal(relayCtx)
+		r.pumpRelayToLocal()
 	}()
 	go func() {
 		wg.Wait()
 		close(r.done)
 	}()
 
+	select {
+	case err = <-first:
+	case <-ctx.Done():
+		err = context.Cause(ctx)
+	}
+	if err != nil {
+		r.shutdown()
+		<-r.done
+		return nil, relayStartError(proxyAddr, err)
+	}
+	r.running.Store(true)
 	return r, nil
 }
 
-// Close tears down every listener, the relay-facing socket, and the SOCKS5
-// control connection (which ends the UDP ASSOCIATE session server-side).
+// resolveRelayTarget resolves host locally, preferring IPv4 as the relay
+// always has.
+func resolveRelayTarget(ctx context.Context, host string) (net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip, nil
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		if addr.IP.To4() != nil {
+			return addr.IP, nil
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, errors.New("no address found")
+	}
+	return addrs[0].IP, nil
+}
+
+func relayStartError(proxyAddr string, err error) error {
+	var se *transport.Socks5Error
+	if errors.As(err, &se) {
+		switch se.Stage {
+		case transport.Socks5StageConnect:
+			return fmt.Errorf("upstreamproxy: dial proxy %s: %w", proxyAddr, err)
+		case transport.Socks5StageHandshake:
+			return fmt.Errorf("upstreamproxy: socks5 handshake: %w", err)
+		}
+	}
+	return fmt.Errorf("upstreamproxy: socks5 udp associate: %w", err)
+}
+
+// report writes one line about a change in the proxy association.
+func (r *UDPRelay) report(ev transport.Socks5UDPEvent) {
+	if r.logf == nil {
+		return
+	}
+	switch ev.Kind {
+	case transport.Socks5UDPAssociated, transport.Socks5UDPReassociated:
+		state := "ready"
+		if ev.Kind == transport.Socks5UDPReassociated {
+			state = "re-established"
+		}
+		r.logf("proxy association %s", state)
+		if ev.Relay.Adjustment != transport.Socks5RelayAsAdvertised {
+			r.logf("proxy advertised a relay address that needed interpreting (%s)", ev.Relay.Adjustment)
+		}
+		if ev.CredentialsIgnored {
+			r.logf("proxy has no username/password support; the configured credentials are not used")
+		}
+	case transport.Socks5UDPAssociationLost:
+		r.logf("proxy association lost; re-associating")
+	case transport.Socks5UDPAttemptFailed:
+		// The attempt that keeps the relay from starting is returned to the
+		// caller of StartUDPRelay instead.
+		if r.running.Load() {
+			r.logf("proxy association attempt %d failed: %v", ev.Attempt, ev.Err)
+		}
+	case transport.Socks5UDPFailed:
+		r.logf("proxy association could not be made again; relay stopping")
+	}
+}
+
+// Close tears down every listener and the proxy association (closing the
+// SOCKS5 control connection ends the UDP ASSOCIATE session server-side).
 func (r *UDPRelay) Close() error {
-	r.cancel()
-	r.closeAll()
+	r.shutdown()
 	<-r.done
 	return nil
 }
 
-func (r *UDPRelay) closeAll() {
+// Done is closed when the relay has stopped, whether by Close or because
+// the proxy association was lost for good.
+func (r *UDPRelay) Done() <-chan struct{} { return r.done }
+
+// Err reports why the relay stopped on its own; it is nil while the relay
+// runs and after a plain Close.
+func (r *UDPRelay) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+// LocalAddrs returns the addresses the relay listens on, in the order of
+// UDPRelayConfig.Ports.
+func (r *UDPRelay) LocalAddrs() []*net.UDPAddr {
+	addrs := make([]*net.UDPAddr, 0, len(r.listeners))
 	for _, ln := range r.listeners {
-		ln.Close()
+		if addr, ok := ln.LocalAddr().(*net.UDPAddr); ok {
+			addrs = append(addrs, addr)
+		}
 	}
-	if r.toRelay != nil {
-		r.toRelay.Close()
+	return addrs
+}
+
+// Stats returns the relay's counters.
+func (r *UDPRelay) Stats() UDPRelayStats {
+	stats := UDPRelayStats{
+		Forwarded: r.forwarded.Load(),
+		Returned:  r.returned.Load(),
+		Dropped:   r.dropped.Load(),
 	}
-	if r.ctrl != nil {
-		r.ctrl.Close()
+	if observable, ok := r.tp.(transport.Socks5UDPObservable); ok {
+		stats.Associations = observable.Stats().Associations
+	}
+	return stats
+}
+
+func (r *UDPRelay) isStopped() bool {
+	select {
+	case <-r.stopped:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *UDPRelay) shutdown() {
+	r.stopOnce.Do(func() {
+		close(r.stopped)
+		r.closeListeners()
+		if r.tp != nil {
+			_ = r.tp.Close()
+		}
+	})
+}
+
+func (r *UDPRelay) closeListeners() {
+	for _, ln := range r.listeners {
+		_ = ln.Close()
 	}
 }
 
 // pumpLocalToRelay reads datagrams arriving at a local listener (from
 // charon), remembers the sender so replies can be routed back, and
-// forwards each one to the SOCKS5 relay wrapped in the UDP request header
-// (RFC 1928 §7) addressed at targetIP:targetPort (portMap[port], usually
-// == port -- see UDPRelayConfig.TargetPorts doc comment for the one case
-// it isn't).
-func (r *UDPRelay) pumpLocalToRelay(ctx context.Context, ln *net.UDPConn, port int) {
-	targetPort := r.portMap[port]
+// forwards each one through the proxy to the target port that listener
+// stands for (usually the same port -- see UDPRelayConfig.TargetPorts for
+// the one case it isn't).
+//
+// A datagram that arrives while the proxy association is down is dropped,
+// as on any lossy path: IKE retransmits.
+func (r *UDPRelay) pumpLocalToRelay(index int) {
+	ln := r.listeners[index]
+	target := &net.UDPAddr{IP: r.target, Port: r.targetPorts[index]}
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := ln.ReadFromUDP(buf)
 		if err != nil {
-			if ctx.Err() != nil {
+			if r.isStopped() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			continue
 		}
 		r.mu.Lock()
-		r.peers[port] = peer
+		r.peers[index] = peer
 		r.mu.Unlock()
 
-		packet := encodeSOCKS5UDPHeader(r.targetIP, targetPort, buf[:n])
-		if _, err := r.toRelay.Write(packet); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
+		if _, err := r.tp.SendTo(buf[:n], target); err != nil {
+			r.dropped.Add(1)
 			continue
 		}
+		r.forwarded.Add(1)
 	}
 }
 
-// pumpRelayToLocal reads datagrams coming back from the SOCKS5 relay
-// (each still wrapped in its own UDP request header identifying which
-// target port the payload came from), strips the header, maps that target
-// port back to the listen port that forwards to it, and delivers the
-// payload to that listener -- replying to the last-seen peer on it.
-func (r *UDPRelay) pumpRelayToLocal(ctx context.Context) {
+// pumpRelayToLocal reads datagrams coming back through the proxy, maps the
+// target port each one came from back to the listener that forwards to it,
+// and delivers the payload to the last-seen peer on that listener.
+//
+// The proxy side only fails once the association is lost for good, which
+// ends the relay.
+func (r *UDPRelay) pumpRelayToLocal() {
 	buf := make([]byte, 65535)
 	for {
-		n, err := r.toRelay.Read(buf)
+		n, from, err := r.tp.RecvFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
+			if !r.isStopped() {
+				r.mu.Lock()
+				r.err = err
+				r.mu.Unlock()
+				r.shutdown()
 			}
+			return
+		}
+		if from == nil {
+			r.dropped.Add(1)
 			continue
 		}
-		targetPort, payload, err := decodeSOCKS5UDPHeader(buf[:n])
-		if err != nil {
-			continue
-		}
-		listenPort, ok := r.reversePortMap[targetPort]
+		index, ok := r.byTarget[from.Port]
 		if !ok {
-			continue // response from a port we never sent to -- can't have a peer for it
+			r.dropped.Add(1) // from a port nothing was sent to: no peer to give it to
+			continue
 		}
-
 		r.mu.Lock()
-		peer := r.peers[listenPort]
+		peer := r.peers[index]
 		r.mu.Unlock()
 		if peer == nil {
-			continue // nothing has sent from this local port yet -- nowhere to deliver
+			r.dropped.Add(1) // nothing has sent from this local port yet
+			continue
 		}
-
-		for _, ln := range r.listeners {
-			if ln.LocalAddr().(*net.UDPAddr).Port == listenPort {
-				_, _ = ln.WriteToUDP(payload, peer)
-				break
-			}
+		if _, err := r.listeners[index].WriteToUDP(buf[:n], peer); err != nil {
+			r.dropped.Add(1)
+			continue
 		}
+		r.returned.Add(1)
 	}
-}
-
-// encodeSOCKS5UDPHeader wraps payload per RFC 1928 §7: RSV(2) FRAG(1)
-// ATYP(1) DST.ADDR DST.PORT(2) DATA.
-func encodeSOCKS5UDPHeader(ip net.IP, port int, payload []byte) []byte {
-	v4 := ip.To4()
-	header := make([]byte, 0, 10+len(payload))
-	header = append(header, 0x00, 0x00, 0x00, socks5AtypIPv4)
-	header = append(header, v4...)
-	header = append(header, byte(port>>8), byte(port))
-	return append(header, payload...)
-}
-
-// decodeSOCKS5UDPHeader reverses encodeSOCKS5UDPHeader, returning the
-// encoded port (used here as the local-listener key, since the relay always
-// echoes back whichever address/port the datagram came from) and the
-// stripped payload.
-func decodeSOCKS5UDPHeader(data []byte) (port int, payload []byte, err error) {
-	if len(data) < 4 {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-	atyp := data[3]
-	rest := data[4:]
-	var addrLen int
-	switch atyp {
-	case socks5AtypIPv4:
-		addrLen = 4
-	case socks5AtypIPv6:
-		addrLen = 16
-	default:
-		return 0, nil, fmt.Errorf("unsupported ATYP 0x%02x", atyp)
-	}
-	if len(rest) < addrLen+2 {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-	portBuf := rest[addrLen : addrLen+2]
-	port = int(portBuf[0])<<8 | int(portBuf[1])
-	return port, rest[addrLen+2:], nil
 }
