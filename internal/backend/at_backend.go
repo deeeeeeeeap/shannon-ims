@@ -178,6 +178,11 @@ func (a *ATBackend) SendSMSWithOptions(ctx context.Context, to, body string, opt
 	return a.modem.SendSMSWithOptions(to, body, opts)
 }
 
+// SendPreparedSMS 发送一条已经校验并分段好的短信。
+func (a *ATBackend) SendPreparedSMS(ctx context.Context, submission *smscodec.Submission) error {
+	return a.modem.SendPreparedSMS(submission)
+}
+
 func (a *ATBackend) ReadSMS(ctx context.Context, index int) (*SMS, error) {
 	// 委托给 modem 读取 PDU 并解码
 	pdu, err := a.modem.SMSReadPDU(fmt.Sprintf("%d", index))

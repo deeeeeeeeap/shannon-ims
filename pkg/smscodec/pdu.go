@@ -480,10 +480,24 @@ func BuildSubmitTPDUs(to, text string) ([][]byte, []int, error) {
 
 // BuildSubmitTPDUsWithOptions 编码上行短信为一组 SUBMIT TPDU，并允许调用方指定文本编码策略。
 func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte, []int, error) {
-	normalizedTo := strings.TrimSpace(to)
-	encoding, err := NormalizeSMSEncoding(string(opts.Encoding))
+	bytesList, _, err := encodeSubmit(strings.TrimSpace(to), text, opts)
 	if err != nil {
 		return nil, nil, err
+	}
+	lenList := make([]int, 0, len(bytesList))
+	for _, b := range bytesList {
+		lenList = append(lenList, len(b))
+	}
+	return bytesList, lenList, nil
+}
+
+// encodeSubmit splits text into SMS-SUBMIT TPDUs for the destination to and
+// reports the alphabet the encoder settled on.
+func encodeSubmit(to, text string, opts SubmitOptions) ([][]byte, Alphabet, error) {
+	normalizedTo := to
+	encoding, err := NormalizeSMSEncoding(string(opts.Encoding))
+	if err != nil {
+		return nil, "", err
 	}
 
 	msg := []byte(text)
@@ -498,14 +512,22 @@ func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte,
 	encoder.ConcatRef = &submitConcatReference
 	tpdus, err := encoder.Encode(msg)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
 	if len(tpdus) == 0 {
-		return nil, nil, errors.New("TPDU 编码结果为空")
+		return nil, "", errors.New("TPDU 编码结果为空")
+	}
+	// The part counters of the concatenation header are one octet wide; the
+	// encoder would wrap them and the message could not be reassembled.
+	if len(tpdus) > maxSubmissionParts {
+		return nil, "", ErrMessageTooLong
+	}
+	alphabet := AlphabetGSM7
+	if alpha, alphaErr := tpdus[0].DCS.Alphabet(); alphaErr == nil && alpha == tpdu.AlphaUCS2 {
+		alphabet = AlphabetUCS2
 	}
 
-	var bytesList [][]byte
-	var lenList []int
+	bytesList := make([][]byte, 0, len(tpdus))
 
 	for _, pdu := range tpdus {
 		if opts.RequestStatusReport {
@@ -523,13 +545,12 @@ func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte,
 
 		b, err := pdu.MarshalBinary()
 		if err != nil {
-			return nil, nil, err
+			return nil, "", err
 		}
 		bytesList = append(bytesList, b)
-		lenList = append(lenList, len(b))
 	}
 
-	return bytesList, lenList, nil
+	return bytesList, alphabet, nil
 }
 
 // SetSubmitMessageReference replaces TP-MR in an already encoded

@@ -810,35 +810,44 @@ func (q *QMIBackend) SendSMS(ctx context.Context, to, body string) error {
 }
 
 func (q *QMIBackend) SendSMSWithOptions(ctx context.Context, to, body string, opts smscodec.SubmitOptions) error {
-	tpdus, _, err := smscodec.BuildSubmitTPDUsWithOptions(to, body, opts)
+	submission, err := smscodec.PrepareSubmission(to, body, opts)
 	if err != nil {
 		return fmt.Errorf("PDU 编码失败: %w", err)
 	}
-	if len(tpdus) == 0 {
-		return fmt.Errorf("PDU 编码结果为空")
+	return q.SendPreparedSMS(ctx, submission)
+}
+
+// SendPreparedSMS 逐段发送一条已经校验并分段好的短信。
+func (q *QMIBackend) SendPreparedSMS(ctx context.Context, submission *smscodec.Submission) error {
+	if submission == nil || submission.PartCount() == 0 {
+		return errNoPreparedSMS
 	}
+	parts := submission.PartCount()
 
 	// 逐段发送（支持长短信自动分段）
-	for i, binaryTPDU := range tpdus {
-		pduWithSMSC := append([]byte{0x00}, binaryTPDU...)
+	for i := 0; i < parts; i++ {
+		pduWithSMSC := submission.PDU(i)
 
 		// format=0x06 表示 GW PP (3GPP Point-to-Point)
 		sendStart := time.Now()
 		if err := q.source.WMSSendRawMessage(ctx, 0x06, pduWithSMSC); err != nil {
 			logger.Warn("QMI 短信发送失败",
-				"to", to,
+				"to_fingerprint", logger.Fingerprint(submission.To()),
 				"part", i+1,
-				"parts", len(tpdus),
-				"tpdu_len", len(binaryTPDU),
+				"parts", parts,
+				"tpdu_len", len(pduWithSMSC)-1,
 				"pdu_len", len(pduWithSMSC),
 				"elapsed_ms", time.Since(sendStart).Milliseconds(),
 				"err", err,
 			)
-			return fmt.Errorf("发送第 %d/%d 段失败: %w", i+1, len(tpdus), err)
+			return fmt.Errorf("发送第 %d/%d 段失败: %w", i+1, parts, err)
 		}
 	}
 
-	logger.Info("QMI 短信发送成功", "to", to, "parts", len(tpdus), "encoding", opts.Encoding)
+	logger.Info("QMI 短信发送成功",
+		"to_fingerprint", logger.Fingerprint(submission.To()),
+		"parts", parts,
+		"alphabet", string(submission.Alphabet()))
 	return nil
 }
 

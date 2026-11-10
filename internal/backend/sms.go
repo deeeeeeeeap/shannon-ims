@@ -1,6 +1,21 @@
 package backend
 
-import "context"
+import (
+	"context"
+	"errors"
+
+	"github.com/1239t/vohive/pkg/smscodec"
+)
+
+// PreparedSMSSender 由能够发送“已准备好的短信”的后端实现。
+//
+// 号码校验、编码选择与分段由 smscodec.PrepareSubmission 统一完成，后端只负责
+// 把各段按自己的通道封装送出，因此各通道对同一条短信送出的内容一致。
+type PreparedSMSSender interface {
+	SendPreparedSMS(ctx context.Context, submission *smscodec.Submission) error
+}
+
+var errNoPreparedSMS = errors.New("没有可发送的短信")
 
 // SMSProvider 短信收发接口
 type SMSProvider interface {

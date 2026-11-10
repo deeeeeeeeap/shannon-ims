@@ -14,20 +14,34 @@ func (b *MBIMBackend) SendSMS(ctx context.Context, to, body string) error {
 }
 
 func (b *MBIMBackend) SendSMSWithOptions(ctx context.Context, to, body string, opts smscodec.SubmitOptions) error {
-	tpdus, _, err := smscodec.BuildSubmitTPDUsWithOptions(to, body, opts)
+	submission, err := smscodec.PrepareSubmission(to, body, opts)
 	if err != nil {
 		return fmt.Errorf("PDU 编码失败: %w", err)
 	}
-	if len(tpdus) == 0 {
-		return fmt.Errorf("PDU 编码结果为空")
+	return b.SendPreparedSMS(ctx, submission)
+}
+
+// SendPreparedSMS 逐段发送一条已经校验并分段好的短信。
+func (b *MBIMBackend) SendPreparedSMS(ctx context.Context, submission *smscodec.Submission) error {
+	if submission == nil || submission.PartCount() == 0 {
+		return errNoPreparedSMS
 	}
-	for i, tpdu := range tpdus {
-		pdu := append([]byte{0x00}, tpdu...)
-		if _, err := b.source.SendSMS(ctx, pdu); err != nil {
-			return fmt.Errorf("发送第 %d/%d 段失败: %w", i+1, len(tpdus), err)
+	parts := submission.PartCount()
+	for i := 0; i < parts; i++ {
+		if _, err := b.source.SendSMS(ctx, submission.PDU(i)); err != nil {
+			logger.Warn("MBIM 短信发送失败",
+				"to_fingerprint", logger.Fingerprint(submission.To()),
+				"part", i+1,
+				"parts", parts,
+				"err", err,
+			)
+			return fmt.Errorf("发送第 %d/%d 段失败: %w", i+1, parts, err)
 		}
 	}
-	logger.Info("MBIM 短信发送成功", "to", to, "parts", len(tpdus))
+	logger.Info("MBIM 短信发送成功",
+		"to_fingerprint", logger.Fingerprint(submission.To()),
+		"parts", parts,
+		"alphabet", string(submission.Alphabet()))
 	return nil
 }
 

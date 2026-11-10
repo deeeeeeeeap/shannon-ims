@@ -1985,27 +1985,36 @@ func (m *Manager) SendSMS(phone, message string) error {
 
 // SendSMSWithOptions 使用 PDU 模式发送短信，并允许调用方指定文本编码策略。
 func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.SubmitOptions) error {
+	submission, err := smscodec.PrepareSubmission(phone, message, opts)
+	if err != nil {
+		return fmt.Errorf("构建 PDU 失败: %w", err)
+	}
+	return m.SendPreparedSMS(submission)
+}
+
+// SendPreparedSMS 使用 PDU 模式发送一条已经校验并分段好的短信。
+func (m *Manager) SendPreparedSMS(submission *smscodec.Submission) error {
+	if submission == nil || submission.PartCount() == 0 {
+		return errors.New("没有可发送的短信")
+	}
 	m.SetBusy(true)
 	defer m.SetBusy(false)
 
 	logger.Info(fmt.Sprintf("[%s] 准备发送短信 (PDU)", m.cfg.ID),
-		"to_len", len(phone),
-		"to_fingerprint", logger.Fingerprint(phone))
+		"to_len", len(submission.To()),
+		"to_fingerprint", logger.Fingerprint(submission.To()),
+		"parts", submission.PartCount(),
+		"alphabet", string(submission.Alphabet()))
 
 	// 确保处于 PDU 模式
 	if _, err := m.ExecuteATHigh("AT+CMGF=0", 3*time.Second); err != nil {
 		return fmt.Errorf("设置 PDU 模式失败: %w", err)
 	}
 
-	// 构建 PDUs
-	pduHexList, tpduLenList, err := m.buildSMSPDUsWithOptions(phone, message, opts)
-	if err != nil {
-		return fmt.Errorf("构建 PDU 失败: %w", err)
-	}
-
-	for i, pduHex := range pduHexList {
-		tpduLen := tpduLenList[i]
-		logger.Debug(fmt.Sprintf("[%s] PDU 编码完成 (分片 %d/%d)", m.cfg.ID, i+1, len(pduHexList)),
+	parts := submission.PartCount()
+	for i := 0; i < parts; i++ {
+		tpduLen, pduHex := submission.ATPDU(i)
+		logger.Debug(fmt.Sprintf("[%s] PDU 编码完成 (分片 %d/%d)", m.cfg.ID, i+1, parts),
 			"pdu_len", len(pduHex),
 			"pdu_fingerprint", logger.Fingerprint(pduHex),
 			"tpdu_len", tpduLen)
@@ -2043,41 +2052,13 @@ func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.Submit
 		}
 
 		// 稍微等待下一段发信，防止模组队列溢出
-		if i < len(pduHexList)-1 {
+		if i < parts-1 {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
 
 	logger.Info(fmt.Sprintf("[%s] 短信已发送", m.cfg.ID))
 	return nil
-}
-
-// buildSMSPDUs 构建多段 SMS-SUBMIT PDU
-// 返回: PDU 十六进制字符串列表, TPDU 长度列表 (不含 SMSC), 错误
-func (m *Manager) buildSMSPDUs(phone, message string) ([]string, []int, error) {
-	return m.buildSMSPDUsWithOptions(phone, message, smscodec.SubmitOptions{})
-}
-
-func (m *Manager) buildSMSPDUsWithOptions(phone, message string, opts smscodec.SubmitOptions) ([]string, []int, error) {
-	tpduBytesList, tpduLenList, err := smscodec.BuildSubmitTPDUsWithOptions(phone, message, opts)
-	if err != nil {
-		return nil, nil, fmt.Errorf("PDU 编码失败: %w", err)
-	}
-
-	// SMSC 使用默认 (长度字节为 00)
-	smsc := []byte{0x00}
-	var pduHexList []string
-
-	for _, tpduBytes := range tpduBytesList {
-		// 完整 PDU = SMSC + TPDU
-		fullPDU := append(smsc, tpduBytes...)
-
-		// 转换为十六进制
-		pduHex := strings.ToUpper(hex.EncodeToString(fullPDU))
-		pduHexList = append(pduHexList, pduHex)
-	}
-
-	return pduHexList, tpduLenList, nil
 }
 
 // USSDResult USSD 会话响应结果

@@ -81,6 +81,14 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 	if worker == nil {
 		return messaging.SendOutcome{}, fmt.Errorf("设备 %s 不存在", deviceID)
 	}
+
+	// SMS over IMS always asks the service centre for a status report.
+	opts.RequestStatusReport = true
+	submission, err := smscodec.PrepareSubmission(to, text, opts)
+	if err != nil {
+		return messaging.SendOutcome{}, fmt.Errorf("编码 SMS TPDU 失败: %w", err)
+	}
+
 	smscCtx, smscCancel := context.WithTimeout(ctx, 5*time.Second)
 	smsc, err := worker.getSMSCWithContext(smscCtx)
 	smscCancel()
@@ -91,19 +99,10 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 		return messaging.SendOutcome{}, fmt.Errorf("设备 %s 未配置 SMSC，无法构建 RP-DATA", deviceID)
 	}
 
-	opts.RequestStatusReport = true
-	tpdus, _, err := smscodec.BuildSubmitTPDUsWithOptions(to, text, opts)
-	if err != nil {
-		return messaging.SendOutcome{}, fmt.Errorf("编码 SMS TPDU 失败: %w", err)
-	}
-
-	parts := make([]messaging.SMSPart, 0, len(tpdus))
-	for _, tpdu := range tpdus {
+	parts := make([]messaging.SMSPart, 0, submission.PartCount())
+	for i := 0; i < submission.PartCount(); i++ {
 		mr := nextRPMR()
-		if err := smscodec.SetSubmitMessageReference(tpdu, mr); err != nil {
-			return messaging.SendOutcome{}, fmt.Errorf("设置 SMS TP-MR 失败: %w", err)
-		}
-		body, err := smscodec.BuildRPDataStrict(mr, tpdu, smsc)
+		body, err := submission.RPData(i, mr, smsc)
 		if err != nil {
 			return messaging.SendOutcome{}, fmt.Errorf("构建 RP-DATA 失败: %w", err)
 		}
@@ -115,7 +114,7 @@ func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text 
 		})
 	}
 
-	return inst.SendSMS(ctx, to, text, parts)
+	return inst.SendSMS(ctx, submission.To(), text, parts)
 }
 
 func (p *Pool) IsVoWiFiActive(deviceID string) bool {
