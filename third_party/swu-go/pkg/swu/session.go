@@ -830,6 +830,17 @@ func (s *Session) startNetEventMonitor() {
 					s.Logger.Info("NAT-T 端口悬浮：远端源端口已被底层自动跟随，隧道保持在线",
 						logger.Int("old_port", ev.OldPort),
 						logger.Int("new_port", ev.NewPort))
+				case ipsec.EventPathChanged:
+					// 出口路径更换（代理中继重建等）：对端仍把下行发往旧映射，而 0xFF 保活包未经认证，
+					// 不会让对端更新地址。DPD 是经过认证的 IKE 请求，对端收到后按 NAT-T 规则跟随新的源地址，
+					// 下行随即恢复；即使此刻没有上行业务（待机等来电/短信）也不用等到下一个 DPD 周期。
+					s.Logger.Info("出口路径已更换，立即发起 DPD 让对端更新 NAT 映射",
+						logger.String("reason", ev.Reason))
+					go func() {
+						if err := s.sendDPD(); err != nil {
+							s.Logger.Warn("路径更换后的 DPD 探测失败", logger.Err(err))
+						}
+					}()
 				}
 			}
 		}

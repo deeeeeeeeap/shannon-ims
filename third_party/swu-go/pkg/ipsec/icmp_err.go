@@ -24,6 +24,9 @@ const (
 	EventPathMTU        NetEventType = iota // 收到了 ICMP Frag Needed / Packet Too Big
 	EventNetworkDown                        // 收到了 Host / Net Unreachable (用于 DPD 欺骗预测)
 	EventNATPortChanged                     // NAT-T 端口漂移：远端源端口发生了变化 (RFC 3947)
+	// EventPathChanged 本端出口路径已更换（例如代理中继重新建立），对端看到的源地址/端口随之变化。
+	// 需要尽快发出一个经过认证的 IKE 报文，让对端按 NAT-T 规则更新映射，否则下行会一直发往旧地址。
+	EventPathChanged
 )
 
 // ParseSockExtError 解析 OOB 数据里的 sock_extended_err
