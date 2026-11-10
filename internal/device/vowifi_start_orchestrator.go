@@ -332,7 +332,7 @@ func (p *Pool) prepareVoWiFiStartContext(deviceID, traceID, runtimeEPDGOverride 
 		}
 	}
 
-	startCtx.Proxy = resolveVoWiFiCountryProxy(startProfile.MCC, traceID, deviceID)
+	startCtx.Proxy = resolveVoWiFiHomeNetworkProxy(startProfile.MCC, startProfile.MNC, traceID, deviceID)
 
 	startCtx.NetworkMode = modemIface.GetNetworkMode()
 	startCtx.StartupState = newVoWiFiSIMReadyStartupState(deviceID, swu.DataplaneModeUserspace, startCtx.NetworkMode, time.Now())
@@ -340,8 +340,17 @@ func (p *Pool) prepareVoWiFiStartContext(deviceID, traceID, runtimeEPDGOverride 
 	return startCtx, nil
 }
 
+// resolveVoWiFiCountryProxy selects the proxy for a home network known only
+// by its MCC. See resolveVoWiFiHomeNetworkProxy.
 func resolveVoWiFiCountryProxy(homeMCC, traceID, deviceID string) *runtimehost.ProxyConfig {
-	proxy, countryCode, err := db.GetHomeMCCUpstreamProxy(homeMCC)
+	return resolveVoWiFiHomeNetworkProxy(homeMCC, "", traceID, deviceID)
+}
+
+// resolveVoWiFiHomeNetworkProxy selects the proxy the country rules assign
+// to the SIM's home network, or nil for a direct route. The MNC places a
+// network on an MCC shared by several territories in the right one.
+func resolveVoWiFiHomeNetworkProxy(homeMCC, homeMNC, traceID, deviceID string) *runtimehost.ProxyConfig {
+	proxy, countryCode, err := db.GetHomeNetworkUpstreamProxy(homeMCC, homeMNC)
 	if err != nil {
 		logger.Warn("VoWiFi 启动前读取国家前置代理配置失败",
 			"trace_id", traceID,
@@ -355,8 +364,10 @@ func resolveVoWiFiCountryProxy(homeMCC, traceID, deviceID string) *runtimehost.P
 			"trace_id", traceID,
 			"device", deviceID,
 			"home_mcc", strings.TrimSpace(homeMCC),
+			"home_mnc", strings.TrimSpace(homeMNC),
 			"proxy_country_code", countryCode,
 			"mcc_table_ready", upstreamproxy.CountryTableReady(),
+			"mcc_table_source", upstreamproxy.CountryTableSource(),
 			"proxy_route", "direct")
 		return nil
 	}
@@ -364,7 +375,9 @@ func resolveVoWiFiCountryProxy(homeMCC, traceID, deviceID string) *runtimehost.P
 		"trace_id", traceID,
 		"device", deviceID,
 		"home_mcc", strings.TrimSpace(homeMCC),
+		"home_mnc", strings.TrimSpace(homeMNC),
 		"proxy_country_code", countryCode,
+		"mcc_table_source", upstreamproxy.CountryTableSource(),
 		"upstream_proxy_id", proxy.ID,
 		"proxy_route", "country_rule")
 	return &runtimehost.ProxyConfig{
@@ -382,12 +395,16 @@ func (p *Pool) beforeVoWiFiStart(deviceID string, modemIface runtimehost.Modem, 
 		startupState.RegStatus, startupState.RegStatusText = modemIface.GetRegStatus()
 		p.recordVoWiFiStartupState(deviceID, startupState)
 		if proxyCfg != nil && proxyCfg.Enabled && strings.TrimSpace(proxyCfg.Addr) != "" {
-			probeRes, probeErr := upstreamproxy.ProbeSOCKS5(startCtx, upstreamproxy.ProbeConfig{
+			// A proxy that is restarting or briefly unreachable gets a few
+			// more tries; what the proxy answers itself (wrong credentials,
+			// no UDP support) fails the start at once.
+			probeRes, probeErr := upstreamproxy.ProbeSOCKS5WithRetry(startCtx, upstreamproxy.ProbeConfig{
 				ProxyAddr: proxyCfg.Addr,
 				Username:  proxyCfg.Username,
 				Password:  proxyCfg.Password,
 				Timeout:   5 * time.Second,
-			})
+			}, voWiFiProxyProbeRetry)
+			logVoWiFiProxyProbe(deviceID, proxyCfg.ID, probeRes, probeErr)
 			if probeErr != nil {
 				startupState.LastErrorClass = "proxy"
 				startupState.LastError = probeErr.Error()

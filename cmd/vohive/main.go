@@ -160,21 +160,17 @@ func main() {
 		dbResolvedPath = absPath
 	}
 	logger.Info("数据库已初始化", "path", dbPath, "resolved_path", dbResolvedPath)
-	countryResult := upstreamproxy.InitCountryTable(appCtx, upstreamproxy.CountryTableOptions{
-		CachePath: layout.CountryTable,
-	})
-	if countryResult.Err != nil {
-		logger.Warn("MCC/MNC 国家表不可用，VoWiFi 国家代理规则将按未知国家直连",
-			"path", countryResult.CachePath,
-			"source_url", countryResult.SourceURL,
-			"source", countryResult.Source,
-			"err", countryResult.Err)
-	} else {
-		logger.Info("MCC/MNC 国家表已加载",
-			"path", countryResult.CachePath,
-			"source", countryResult.Source,
-			"rows", countryResult.RowCount,
-			"countries", countryResult.Countries)
+	// Without a cached or downloadable MCC/MNC table the built-in one keeps
+	// the VoWiFi country proxy rules working, and startup does not wait for
+	// an unreachable download.
+	countryOpts := upstreamproxy.CountryTableOptions{
+		CachePath:       layout.CountryTable,
+		BuiltinFallback: true,
+	}
+	if loadCountryTable(appCtx, countryOpts) {
+		appLifecycle.Go(func(ctx context.Context) {
+			refreshCountryTableInBackground(ctx, countryOpts)
+		})
 	}
 	appLifecycle.Go(func(ctx context.Context) {
 		select {

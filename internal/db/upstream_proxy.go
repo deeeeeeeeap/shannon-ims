@@ -139,11 +139,37 @@ func GetCountryUpstreamProxy(countryCode string) (*UpstreamProxy, error) {
 	return proxy, nil
 }
 
+// GetHomeMCCUpstreamProxy returns the proxy the country rules assign to a
+// home network known only by its MCC. See GetHomeNetworkUpstreamProxy.
 func GetHomeMCCUpstreamProxy(homeMCC string) (*UpstreamProxy, string, error) {
-	countryCode, ok := upstreamproxy.CountryCodeFromHomeMCC(homeMCC)
-	if !ok {
+	return GetHomeNetworkUpstreamProxy(homeMCC, "")
+}
+
+// GetHomeNetworkUpstreamProxy returns the proxy the country rules assign to
+// a home network, and the country that decided it.
+//
+// A network the country table lists by MCC and MNC belongs to one country
+// and only that country's rule applies. Otherwise the countries sharing the
+// MCC are tried, the main one first, and the first with an enabled rule
+// wins: a rule for a territory that shares its MCC with a larger country
+// (Jersey on 234, Guam on 310) is not lost just because the table at hand
+// cannot tell the networks apart.
+//
+// Without a matching rule the proxy is nil and the country is the most
+// likely one, or "" when the MCC is unknown.
+func GetHomeNetworkUpstreamProxy(homeMCC, homeMNC string) (*UpstreamProxy, string, error) {
+	countryCodes := upstreamproxy.CountryCodesForHomeNetwork(homeMCC, homeMNC)
+	for _, countryCode := range countryCodes {
+		proxy, err := GetCountryUpstreamProxy(countryCode)
+		if err != nil {
+			return nil, countryCode, err
+		}
+		if proxy != nil {
+			return proxy, countryCode, nil
+		}
+	}
+	if len(countryCodes) == 0 {
 		return nil, "", nil
 	}
-	proxy, err := GetCountryUpstreamProxy(countryCode)
-	return proxy, countryCode, err
+	return nil, countryCodes[0], nil
 }
