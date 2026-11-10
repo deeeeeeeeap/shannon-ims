@@ -238,9 +238,7 @@ func New(cfg config.DeviceConfig) (*Manager, error) {
 		return nil, errors.New("AT port not configured")
 	}
 
-	m.portMode = &serial.Mode{
-		BaudRate: 115200,
-	}
+	m.portMode = serialMode(cfg.SerialSettings())
 
 	return m, nil
 }
@@ -508,7 +506,7 @@ func (m *Manager) Start() error {
 
 	var err error
 	for attempt := 0; attempt < 8; attempt++ {
-		m.port, err = serial.Open(m.atPort, m.portMode)
+		m.port, err = openSerialPort(m.atPort, m.portMode)
 		if err == nil {
 			break
 		}
@@ -521,7 +519,10 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("打开串口 %s 失败: %w", m.atPort, err)
 	}
 
-	m.port.SetReadTimeout(100 * time.Millisecond)
+	if err := m.port.SetReadTimeout(100 * time.Millisecond); err != nil {
+		// 读取仍然可用：没有超时的读会一直阻塞到有数据或串口关闭，Stop 关闭串口即可唤醒它。
+		logger.Warn(fmt.Sprintf("[%s] 设置串口读超时失败", m.cfg.ID), "port", m.atPort, "err", err)
+	}
 	m.markATResponseStreamReady()
 	m.setRunning(true)
 
@@ -544,6 +545,7 @@ func (m *Manager) Start() error {
 	go func() {
 		defer m.loopWG.Done()
 		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-m.stop:
@@ -563,7 +565,9 @@ func isRetryableSerialOpenErr(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(msg, "resource busy") ||
+	// 串口库把 open 返回的 EBUSY 换成了自己的 "Serial port busy"，系统原始的错误文本不会出现。
+	return strings.Contains(msg, "port busy") ||
+		strings.Contains(msg, "resource busy") ||
 		strings.Contains(msg, "device or resource busy") ||
 		strings.Contains(msg, "temporarily unavailable")
 }
@@ -592,6 +596,25 @@ func (m *Manager) handleFatalSerialRuntimeErr(err error, phase string, cmd strin
 	m.setHealthy(false)
 	m.Stop()
 	m.notifyDisconnect("serial_runtime_error")
+}
+
+// handleReadLoopExit 在命令等待响应期间收到读协程上报的错误时结束管理器。
+// 读协程上报错误后即退出，无论错误文本是什么，这个串口都不会再有数据到达；
+// runLoop 在空闲时遇到同样的情况也是立即停止并通知掉线，而不是等下一条命令超时。
+func (m *Manager) handleReadLoopExit(err error, cmd string) {
+	running, _ := m.stateSnapshot()
+	if !running {
+		return
+	}
+	reason := "serial_read_error"
+	if isFatalSerialRuntimeErr(err) {
+		reason = "serial_runtime_error"
+	}
+	logger.Warn(fmt.Sprintf("[%s] AT 命令等待响应时串口读取失败，触发恢复", m.cfg.ID),
+		"cmd", cmd, "port", m.atPort, "reason", reason, "err", err)
+	m.setHealthy(false)
+	m.Stop()
+	m.notifyDisconnect(reason)
 }
 
 // Stop 停止管理器
@@ -657,6 +680,10 @@ func (m *Manager) runLoop() {
 		case msg := <-m.rxChan:
 			// 空闲状态下的数据处理（主要是 URC）
 			if msg.Err != nil {
+				if m.stopped() {
+					// 已被主动停止：这个错误只是串口被关闭的结果，不是掉线，不能再触发重连。
+					return
+				}
 				logger.Error(fmt.Sprintf("[%s] 串口读取错误，模块可能已掉线", m.cfg.ID), "err", msg.Err)
 				m.Stop()
 				m.notifyDisconnect("serial_read_error")
@@ -715,10 +742,15 @@ RespLoop:
 			}
 			return
 
+		case <-m.stop:
+			// 停止后读协程不再上报任何内容，不在这里返回就要等到命令自己的超时才能退出主循环。
+			req.errChan <- errors.New("manager stopped")
+			return
+
 		case msg := <-m.rxChan:
 			if msg.Err != nil {
 				req.errChan <- msg.Err
-				m.handleFatalSerialRuntimeErr(msg.Err, "read", req.cmd)
+				m.handleReadLoopExit(msg.Err, req.cmd)
 				return
 			}
 
@@ -761,7 +793,20 @@ RespLoop:
 
 				if req.interactive && req.waitPrompt && req.followUp != "" {
 					// 收到提示符，立即发送后续指令
-					m.port.Write([]byte(req.followUp))
+					if _, err := m.port.Write([]byte(req.followUp)); err != nil {
+						// 模组可能仍停在输入提示符上，之后的命令会被当作输入内容吞掉：
+						// 与超时路径一样尽力取消并隔离响应流，而不是等到命令超时才发现。
+						if len(req.cancelSequence) > 0 {
+							if _, cancelErr := m.port.Write(req.cancelSequence); cancelErr != nil {
+								logger.Warn(fmt.Sprintf("[%s] 交互式命令取消序列写入失败", m.cfg.ID), "port", m.atPort, "cmd", req.cmd, "err", cancelErr)
+							}
+						}
+						m.quarantineATResponseStream()
+						logger.Warn(fmt.Sprintf("[%s] 交互式命令后续内容写入失败", m.cfg.ID), "port", m.atPort, "cmd", req.cmd, "err", err)
+						req.errChan <- err
+						m.handleFatalSerialRuntimeErr(err, "write", req.cmd)
+						return
+					}
 					// 继续等待最终响应 (OK/ERROR)
 					// 重置 waitPrompt 防止重复触发
 					req.waitPrompt = false
@@ -833,23 +878,18 @@ func (m *Manager) readLoop() {
 					case <-m.stop:
 						return
 					default:
-						logger.Warn(fmt.Sprintf("[%s] 串口连续 %d 次 EOF，判定设备已断开", m.cfg.ID, m.eofCount))
-						m.rxChan <- rxMsg{Err: fmt.Errorf("连续 %d 次 EOF，判定设备已断开", m.eofCount)}
-						return
 					}
+					logger.Warn(fmt.Sprintf("[%s] 串口连续 %d 次 EOF，判定设备已断开", m.cfg.ID, m.eofCount))
+					m.reportReadLoopError(fmt.Errorf("连续 %d 次 EOF，判定设备已断开", m.eofCount))
+					return
 				}
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 			m.eofCount = 0 // 非 EOF 错误时重置计数
 
-			select {
-			case <-m.stop:
-				return
-			default:
-				m.rxChan <- rxMsg{Err: err}
-				return
-			}
+			m.reportReadLoopError(err)
+			return
 		}
 
 		if n > 0 {
@@ -857,10 +897,7 @@ func (m *Manager) readLoop() {
 			lines, parseErr := parser.Feed(buf[:n])
 			if parseErr != nil {
 				m.quarantineATResponseStream()
-				select {
-				case m.rxChan <- rxMsg{Err: parseErr}:
-				case <-m.stop:
-				}
+				m.reportReadLoopError(parseErr)
 				return
 			}
 			for _, line := range lines {
@@ -871,6 +908,21 @@ func (m *Manager) readLoop() {
 				}
 			}
 		}
+	}
+}
+
+// reportReadLoopError 把读协程的终止原因交给主循环，调用后读协程必须退出。
+// 管理器已停止时不上报：Stop 关闭串口本身就会让读取报错，那不是掉线；
+// 停止后也没有人再读 rxChan，不能无条件阻塞在发送上。
+func (m *Manager) reportReadLoopError(err error) {
+	select {
+	case <-m.stop:
+		return
+	default:
+	}
+	select {
+	case m.rxChan <- rxMsg{Err: err}:
+	case <-m.stop:
 	}
 }
 
@@ -892,31 +944,63 @@ func (m *Manager) initModem() {
 	}
 
 	// 2. 初始化命令序列
-	initCmds := []string{
-		"ATE0",              // 关闭回显
-		"AT+CMGF=0",         // PDU 模式
-		"AT+CNMI=2,1,0,0,0", // 新短信上报 +CMTI
-		"AT+CLIP=1",         // 启用来电号码显示 (+CLIP URC)
-		"AT+QPCMV=1,2",      // 开启 UAC 语音模式 (PCM → ALSA 桥接必须)
+	initCmds := []struct {
+		cmd      string
+		purpose  string
+		optional bool // 只影响通话相关功能，数据/短信模组不支持属正常
+	}{
+		{cmd: "ATE0", purpose: "关闭回显"},
+		{cmd: "AT+CMGF=0", purpose: "短信 PDU 模式"},
+		{cmd: "AT+CNMI=2,1,0,0,0", purpose: "新短信上报 +CMTI"},
+		{cmd: "AT+CLIP=1", purpose: "来电号码显示 +CLIP", optional: true},
+		{cmd: "AT+QPCMV=1,2", purpose: "UAC 语音模式 (PCM → ALSA 桥接必须)", optional: true},
 	}
 
-	for _, cmd := range initCmds {
+	for _, step := range initCmds {
+		if m.stopped() {
+			m.markReady()
+			return
+		}
 		// 这些初始化命令使用 ExecuteATSilent 降低日志噪音，避免用户误解全在走 AT
-		m.ExecuteATSilent(cmd, 2*time.Second)
+		if _, err := m.ExecuteATSilent(step.cmd, 2*time.Second); err != nil {
+			// 失败不终止初始化（不同模组支持的命令不同），但必须留下记录：
+			// 前三项失败会直接影响响应解析和短信收发，排障时需要知道。
+			if step.optional {
+				logger.Debug(fmt.Sprintf("[%s] 模组可选初始化命令未生效", m.cfg.ID), "cmd", step.cmd, "purpose", step.purpose, "err", err)
+			} else {
+				logger.Warn(fmt.Sprintf("[%s] 模组初始化命令失败", m.cfg.ID), "cmd", step.cmd, "purpose", step.purpose, "err", err)
+			}
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	m.markReady()
+	if m.stopped() {
+		return
+	}
 
 	// 3. 采集设备信息
 	m.collectDeviceInfo()
+	m.infoMu.RLock()
+	imei, iccid := m.imei, m.iccid
+	m.infoMu.RUnlock()
 	logger.Info(fmt.Sprintf("[%s] 模组初始化完成", m.cfg.ID),
-		"imei_present", m.imei != "",
-		"imei_len", len(m.imei),
-		"imei_fingerprint", logger.Fingerprint(m.imei),
-		"iccid_present", m.iccid != "",
-		"iccid_len", len(m.iccid),
-		"iccid_fingerprint", logger.Fingerprint(m.iccid))
+		"imei_present", imei != "",
+		"imei_len", len(imei),
+		"imei_fingerprint", logger.Fingerprint(imei),
+		"iccid_present", iccid != "",
+		"iccid_len", len(iccid),
+		"iccid_fingerprint", logger.Fingerprint(iccid))
+}
+
+// stopped 报告管理器是否已被停止。
+func (m *Manager) stopped() bool {
+	select {
+	case <-m.stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // RefreshDeviceInfo 重新采集设备信息（切卡后需要更新缓存）

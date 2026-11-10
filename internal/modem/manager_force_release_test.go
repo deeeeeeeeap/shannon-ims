@@ -30,6 +30,8 @@ func TestIsRetryableSerialOpenErr(t *testing.T) {
 		want bool
 	}{
 		{name: "busy", err: assertErr("device or resource busy"), want: true},
+		{name: "busy as the serial library reports it", err: assertErr("Serial port busy"), want: true},
+		{name: "not found", err: assertErr("Serial port not found"), want: false},
 		{name: "temp unavailable", err: assertErr("temporarily unavailable"), want: true},
 		{name: "permission", err: assertErr("permission denied"), want: false},
 		{name: "nil", err: nil, want: false},

@@ -2,11 +2,10 @@ package modem
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
-
-	"go.bug.st/serial"
 )
 
 // imeiCacheItem 存储 IMEI 缓存条目及对应的获取时间戳
@@ -61,15 +60,8 @@ func ProbeIMEI(atPort string, timeout time.Duration) (string, error) {
 		timeout = 1500 * time.Millisecond
 	}
 
-	// 配置标准的 3 线异步串口波特率与帧校验格式
-	mode := &serial.Mode{
-		BaudRate: 115200,
-		DataBits: 8,
-		StopBits: serial.OneStopBit,
-		Parity:   serial.NoParity,
-	}
-
-	p, err := serial.Open(atPort, mode)
+	// 探测发生在设备发现阶段，此时还没有该端口的设备配置，使用默认的 115200 8N1。
+	p, err := openSerialPort(atPort, defaultSerialMode())
 	if err != nil {
 		return "", err
 	}
@@ -100,9 +92,11 @@ func ProbeIMEI(atPort string, timeout time.Duration) (string, error) {
 			}
 		}
 		if rerr != nil {
-			if strings.Contains(strings.ToLower(rerr.Error()), "timeout") {
+			if isSerialReadTimeout(rerr) {
 				continue
 			}
+			// 串口库用 (0, nil) 表示读超时，这里的错误说明串口已经不可用，继续读只会空转到超时。
+			return "", fmt.Errorf("imei probe read failed: %w", rerr)
 		}
 	}
 

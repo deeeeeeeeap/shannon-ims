@@ -41,12 +41,15 @@ func TestExecuteManualATOnPortUsesTransientSerialSession(t *testing.T) {
 
 	fake := &fakeManualATSession{resp: "OK\r\n"}
 	var gotPort string
-	openManualATSession = func(port string) (manualATSession, error) {
+	var gotSettings config.SerialSettings
+	openManualATSession = func(port string, settings config.SerialSettings) (manualATSession, error) {
 		gotPort = port
+		gotSettings = settings
 		return fake, nil
 	}
 
-	resp, err := executeManualATOnPort("/dev/ttyUSB2", "AT+CSQ", 7*time.Second)
+	wantSettings := config.SerialSettings{BaudRate: 9600, DataBits: 7, StopBits: 2, Parity: "E"}
+	resp, err := executeManualATOnPort("/dev/ttyUSB2", wantSettings, "AT+CSQ", 7*time.Second)
 	if err != nil {
 		t.Fatalf("executeManualATOnPort() error = %v", err)
 	}
@@ -55,6 +58,9 @@ func TestExecuteManualATOnPortUsesTransientSerialSession(t *testing.T) {
 	}
 	if gotPort != "/dev/ttyUSB2" {
 		t.Fatalf("open port = %q, want /dev/ttyUSB2", gotPort)
+	}
+	if gotSettings != wantSettings {
+		t.Fatalf("open settings = %+v, want %+v", gotSettings, wantSettings)
 	}
 	if fake.cmd != "AT+CSQ" || fake.timeout != 7*time.Second {
 		t.Fatalf("Execute() got cmd=%q timeout=%s", fake.cmd, fake.timeout)
@@ -65,7 +71,7 @@ func TestExecuteManualATOnPortUsesTransientSerialSession(t *testing.T) {
 }
 
 func TestExecuteManualATOnPortRejectsEmptyPort(t *testing.T) {
-	if _, err := executeManualATOnPort(" ", "AT", time.Second); err == nil {
+	if _, err := executeManualATOnPort(" ", config.SerialSettings{}, "AT", time.Second); err == nil {
 		t.Fatal("executeManualATOnPort() error = nil, want empty-port error")
 	}
 }
@@ -74,11 +80,11 @@ func TestExecuteManualATOnPortReturnsOpenError(t *testing.T) {
 	orig := openManualATSession
 	defer func() { openManualATSession = orig }()
 
-	openManualATSession = func(port string) (manualATSession, error) {
+	openManualATSession = func(port string, _ config.SerialSettings) (manualATSession, error) {
 		return nil, errors.New("busy")
 	}
 
-	if _, err := executeManualATOnPort("/dev/ttyUSB2", "AT", time.Second); err == nil || err.Error() != "打开 AT 端口 /dev/ttyUSB2 失败: busy" {
+	if _, err := executeManualATOnPort("/dev/ttyUSB2", config.SerialSettings{}, "AT", time.Second); err == nil || err.Error() != "打开 AT 端口 /dev/ttyUSB2 失败: busy" {
 		t.Fatalf("executeManualATOnPort() error = %v", err)
 	}
 }
@@ -90,8 +96,10 @@ func TestHandleDeviceMgmtExecuteATUsesTransientSessionForMBIMBackend(t *testing.
 
 	fake := &fakeManualATSession{resp: "OK\r\n"}
 	var gotPort string
-	openManualATSession = func(port string) (manualATSession, error) {
+	var gotSettings config.SerialSettings
+	openManualATSession = func(port string, settings config.SerialSettings) (manualATSession, error) {
 		gotPort = port
+		gotSettings = settings
 		return fake, nil
 	}
 
@@ -99,8 +107,11 @@ func TestHandleDeviceMgmtExecuteATUsesTransientSessionForMBIMBackend(t *testing.
 	be := &ussdDeviceBackendStub{mode: backend.BackendMBIM}
 	setNestedPrivateField(t, p, []string{"workers"}, map[string]*device.Worker{
 		"dev-mbim": {
-			ID:      "dev-mbim",
-			Config:  config.DeviceConfig{ID: "dev-mbim", DeviceBackend: backend.BackendMBIM, ATPort: "/dev/ttyUSB9"},
+			ID: "dev-mbim",
+			Config: config.DeviceConfig{
+				ID: "dev-mbim", DeviceBackend: backend.BackendMBIM, ATPort: "/dev/ttyUSB9",
+				BaudRate: 57600,
+			},
 			Backend: be,
 		},
 	})
@@ -119,6 +130,9 @@ func TestHandleDeviceMgmtExecuteATUsesTransientSessionForMBIMBackend(t *testing.
 	}
 	if gotPort != "/dev/ttyUSB9" {
 		t.Fatalf("open port = %q, want /dev/ttyUSB9", gotPort)
+	}
+	if want := (config.SerialSettings{BaudRate: 57600, DataBits: 8, StopBits: 1, Parity: "N"}); gotSettings != want {
+		t.Fatalf("open settings = %+v, want the device entry's %+v", gotSettings, want)
 	}
 	if fake.cmd != "AT+CSQ" || fake.timeout != 7*time.Second {
 		t.Fatalf("Execute() got cmd=%q timeout=%s", fake.cmd, fake.timeout)

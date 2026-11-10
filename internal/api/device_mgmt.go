@@ -1579,16 +1579,16 @@ type manualATSession interface {
 	Close() error
 }
 
-var openManualATSession = func(port string) (manualATSession, error) {
-	return modem.NewSerialAT(port, 115200, 8, 1, "N")
+var openManualATSession = func(port string, settings config.SerialSettings) (manualATSession, error) {
+	return modem.OpenSerialAT(port, settings)
 }
 
-func executeManualATOnPort(port, cmd string, timeout time.Duration) (string, error) {
+func executeManualATOnPort(port string, settings config.SerialSettings, cmd string, timeout time.Duration) (string, error) {
 	port = strings.TrimSpace(port)
 	if port == "" {
 		return "", fmt.Errorf("当前设备没有可用 AT 端口")
 	}
-	session, err := openManualATSession(port)
+	session, err := openManualATSession(port, settings)
 	if err != nil {
 		return "", fmt.Errorf("打开 AT 端口 %s 失败: %w", port, err)
 	}
@@ -1632,7 +1632,7 @@ func (s *Server) handleDeviceMgmtExecuteAT(c *gin.Context) {
 	}
 
 	if worker.Backend != nil && isTransientATBackend(worker.Backend.Mode()) {
-		resp, err := executeManualATOnPort(manualATPortForWorker(worker), cmd, timeout)
+		resp, err := executeManualATOnPort(manualATPortForWorker(worker), worker.Config.SerialSettings(), cmd, timeout)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
 			return
