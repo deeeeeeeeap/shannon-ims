@@ -38,11 +38,7 @@ func (i *Instance) establishSWu(
 	port string,
 	generation uint64,
 ) (*swuSessionLease, error) {
-	resolver := req.epdgResolver
-	if resolver == nil {
-		resolver = net.DefaultResolver
-	}
-	addresses, err := resolver.LookupIPAddr(ctx, host)
+	addresses, err := epdgResolverFor(req).LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, errEPDGDNS
 	}
