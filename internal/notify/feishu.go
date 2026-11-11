@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/1239t/vohive/internal/config"
 	"github.com/1239t/vohive/pkg/logger"
@@ -74,13 +75,7 @@ func NewFeishuChannel(cfg config.FeishuConfig) (*FeishuChannel, error) {
 		logger.Warn("飞书渠道已启用但未配置 chat_ids/chat_id，消息不会推送")
 	}
 
-	sdkLogger := &feishuLogger{}
-
-	// 创建飞书 API 客户端（自动管理 tenant_access_token）
-	client := lark.NewClient(cfg.AppID, cfg.AppSecret,
-		lark.WithLogLevel(larkcore.LogLevelInfo),
-		lark.WithLogger(sdkLogger),
-	)
+	client := newFeishuAPIClient(cfg)
 
 	logger.Info("飞书 Bot 客户端已创建", "app_id", cfg.AppID)
 
@@ -90,6 +85,21 @@ func NewFeishuChannel(cfg config.FeishuConfig) (*FeishuChannel, error) {
 		handlers: make(map[string]CommandHandler),
 		cfg:      cfg,
 	}, nil
+}
+
+// feishuRequestTimeout 是单次飞书 API 请求的时限。不设置时 SDK 用不限时的默认客户端发请求，
+// 而重新加载通知设置要等在途的请求结束。
+var feishuRequestTimeout = 15 * time.Second
+
+// newFeishuAPIClient 创建飞书 API 客户端（自动管理 tenant_access_token）。
+// extra 供测试把客户端指向本机的模拟服务。
+func newFeishuAPIClient(cfg config.FeishuConfig, extra ...lark.ClientOptionFunc) *lark.Client {
+	options := []lark.ClientOptionFunc{
+		lark.WithLogLevel(larkcore.LogLevelInfo),
+		lark.WithLogger(&feishuLogger{}),
+		lark.WithReqTimeout(feishuRequestTimeout),
+	}
+	return lark.NewClient(cfg.AppID, cfg.AppSecret, append(options, extra...)...)
 }
 
 func (f *FeishuChannel) Name() string { return "feishu" }

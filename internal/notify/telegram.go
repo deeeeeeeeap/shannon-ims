@@ -3,9 +3,12 @@ package notify
 import (
 	"fmt"
 	"html"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -38,14 +41,18 @@ func NewTelegramChannel(cfg config.TelegramConfig) (*TelegramChannel, error) {
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if cfg.Proxy != "" {
+		// 代理地址里可能带用户名和密码。
 		proxyURL, err := url.Parse(cfg.Proxy)
 		if err != nil {
-			logger.Error("解析 Telegram 代理地址失败", "proxy", cfg.Proxy, "err", err)
+			logger.Error("解析 Telegram 代理地址失败", "proxy", loggableURL(cfg.Proxy), "err", loggableError(err))
 		} else {
 			transport.Proxy = http.ProxyURL(proxyURL)
-			logger.Info("Telegram Bot 使用代理", "proxy", cfg.Proxy)
+			logger.Info("Telegram Bot 使用代理", "proxy", loggableURL(cfg.Proxy))
 		}
 	}
+	telegramLibraryLogOnce.Do(func() {
+		_ = tgbotapi.SetLogger(telegramLibraryReports)
+	})
 
 	httpClient := &http.Client{
 		Transport: transport,
@@ -96,10 +103,33 @@ func (t *TelegramChannel) Send(text string) error {
 	msg := buildTelegramTextMessage(t.chatID, text)
 	_, err := t.api.Send(msg)
 	if err != nil {
+		// bot token 是请求 URL 的一部分，网络层失败的请求会在错误里带上这个 URL。
+		err = loggableError(err)
 		logger.Error("发送 telegram 消息失败", "err", err)
 		return err
 	}
 	return nil
+}
+
+var (
+	telegramLibraryLogOnce sync.Once
+	// telegramLibraryReports 的输出位置和格式与库自带的默认日志相同：
+	// 标准错误，带日期和时间。
+	telegramLibraryReports = telegramLibraryLog{out: log.New(os.Stderr, "", log.LstdFlags)}
+)
+
+// telegramLibraryLog 是 Telegram 客户端库输出日志的去处。它去掉 bot token：
+// 库会打印每一次失败的轮询，而网络层失败的请求其错误里带着请求 URL。
+type telegramLibraryLog struct {
+	out *log.Logger
+}
+
+func (l telegramLibraryLog) Println(v ...interface{}) {
+	l.out.Print(scrubTelegramToken(fmt.Sprintln(v...)))
+}
+
+func (l telegramLibraryLog) Printf(format string, v ...interface{}) {
+	l.out.Print(scrubTelegramToken(fmt.Sprintf(format, v...)))
 }
 
 func (t *TelegramChannel) RegisterCommand(cmd string, handler CommandHandler) {

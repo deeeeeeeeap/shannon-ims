@@ -121,10 +121,12 @@ func (b *BarkChannel) SendWithContextDetailed(ctx NotificationContext) (SendBark
 		go func(targetURL string) {
 			defer wg.Done()
 
+			// 设备密钥是 URL 的一部分，而请求失败时错误会带上 URL：
+			// 日志和返回的错误里只留服务地址。
 			req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
 			if err != nil {
 				mu.Lock()
-				lastErr = fmt.Errorf("创建请求失败: %w", err)
+				lastErr = fmt.Errorf("创建请求失败: %w", loggableError(err))
 				failedURLs = append(failedURLs, targetURL)
 				mu.Unlock()
 				return
@@ -133,11 +135,12 @@ func (b *BarkChannel) SendWithContextDetailed(ctx NotificationContext) (SendBark
 
 			resp, err := b.client.Do(req)
 			if err != nil {
+				err = loggableError(err)
 				mu.Lock()
 				lastErr = fmt.Errorf("请求发送失败: %w", err)
 				failedURLs = append(failedURLs, targetURL)
 				mu.Unlock()
-				logger.Warn("Bark 推送失败", "url", targetURL, "err", err)
+				logger.Warn("Bark 推送失败", "url", loggableURL(targetURL), "err", err)
 				return
 			}
 			defer resp.Body.Close()
@@ -148,7 +151,7 @@ func (b *BarkChannel) SendWithContextDetailed(ctx NotificationContext) (SendBark
 				lastErr = fmt.Errorf("HTTP 状态码错误: %d", resp.StatusCode)
 				failedURLs = append(failedURLs, targetURL)
 				mu.Unlock()
-				logger.Warn("Bark 推送返回错误状态码", "url", targetURL, "status", resp.StatusCode)
+				logger.Warn("Bark 推送返回错误状态码", "url", loggableURL(targetURL), "status", resp.StatusCode)
 			}
 		}(u)
 	}

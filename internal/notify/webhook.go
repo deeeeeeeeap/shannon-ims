@@ -170,11 +170,13 @@ func (w *WebhookChannel) SendWithContextDetailed(ctx NotificationContext) (SendW
 		go func(targetURL string) {
 			defer wg.Done()
 			if err := w.postWithRetry(targetURL, body, signature); err != nil {
+				// Webhook 地址里常带 token：错误和日志只写服务地址，
+				// 完整地址放在 FailedURLs 里。
 				mu.Lock()
-				lastErr = fmt.Errorf("%s: %w", targetURL, err)
+				lastErr = fmt.Errorf("%s: %w", loggableURL(targetURL), err)
 				failedURLs = append(failedURLs, targetURL)
 				mu.Unlock()
-				logger.Warn("Webhook 推送失败", "url", targetURL, "err", err)
+				logger.Warn("Webhook 推送失败", "url", loggableURL(targetURL), "err", err)
 			}
 		}(u)
 	}
@@ -241,7 +243,7 @@ func (w *WebhookChannel) postWithRetry(targetURL string, body []byte, signature 
 		if err != nil {
 			lastErr = err
 			logger.Debug("Webhook POST 失败，准备重试",
-				"url", targetURL, "attempt", attempt+1, "err", err)
+				"url", loggableURL(targetURL), "attempt", attempt+1, "err", err)
 			continue
 		}
 
@@ -258,7 +260,7 @@ func (w *WebhookChannel) postWithRetry(targetURL string, body []byte, signature 
 		// 5xx 服务端错误，继续重试
 		lastErr = fmt.Errorf("webhook 返回 %d", statusCode)
 		logger.Debug("Webhook 返回 5xx，准备重试",
-			"url", targetURL, "attempt", attempt+1, "status", statusCode)
+			"url", loggableURL(targetURL), "attempt", attempt+1, "status", statusCode)
 	}
 
 	return fmt.Errorf("webhook 推送失败（已重试 %d 次）: %w", w.retryMax, lastErr)
@@ -268,7 +270,7 @@ func (w *WebhookChannel) postWithRetry(targetURL string, body []byte, signature 
 func (w *WebhookChannel) doPost(targetURL string, body []byte, signature string) (int, error) {
 	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
-		return 0, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+		return 0, fmt.Errorf("创建 HTTP 请求失败: %w", loggableError(err))
 	}
 
 	// 先注入用户自定义头，随后由系统头覆盖（受保护的系统头始终生效）
@@ -286,7 +288,7 @@ func (w *WebhookChannel) doPost(targetURL string, body []byte, signature string)
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, loggableError(err)
 	}
 	defer resp.Body.Close()
 	// 读取并丢弃 response body，确保连接可复用
