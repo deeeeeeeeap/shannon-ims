@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +41,8 @@ type simulatedDevice struct {
 
 func startSimulatedDevice(t *testing.T, sim *atsim.Modem) *simulatedDevice {
 	t.Helper()
+	// What tests before this one have left running is not this test's to wait for.
+	earlier := poolGoroutines()
 	// Before the pool: a pool takes the database as it is when it is created.
 	openIncomingSMSTestDB(t)
 	port := fmt.Sprintf("sim://device-test-%d", simulatedDevicePortSeq.Add(1))
@@ -54,13 +57,81 @@ func startSimulatedDevice(t *testing.T, sim *atsim.Modem) *simulatedDevice {
 	}
 	d.pool.SetNotifier(d.notifier)
 	d.pool.rescanAndReconnectForTest = d.rescan
-	t.Cleanup(func() { _ = d.pool.Shutdown() })
+	t.Cleanup(func() { d.stop(earlier) })
 
 	if _, err := d.pool.AddWorkerFromConfig(d.cfg); err != nil {
 		t.Fatalf("AddWorkerFromConfig() error = %v", err)
 	}
 	d.waitFor("the SIM identity to be read", 10*time.Second, func() bool { return d.worker().GetIMSI() != "" })
 	return d
+}
+
+// stop shuts the pool down and waits until none of its goroutines is left.
+//
+// The shutdown of the pool does not wait for the goroutines the pool started
+// for a worker. One that is in the middle of reading the state of the modem,
+// as the warm-up of the caches and the warm-up of the radio state are, goes on
+// until it has its answers, and then records them. The product never closes
+// the database, so there that does no harm; here it would write to the
+// database of a test that has ended and closed it.
+func (d *simulatedDevice) stop(earlier map[int]string) {
+	d.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := d.pool.ShutdownContext(ctx); err != nil {
+		d.t.Errorf("the pool did not shut down: %v", err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		left := poolGoroutines()
+		for id := range earlier {
+			delete(left, id)
+		}
+		if len(left) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			stacks := make([]string, 0, len(left))
+			for _, stack := range left {
+				stacks = append(stacks, stack)
+			}
+			sort.Strings(stacks)
+			d.t.Errorf("%d goroutines of the pool are still running after its shutdown:\n%s", len(left), strings.Join(stacks, "\n\n"))
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// poolGoroutines returns the stacks, by goroutine number, of the goroutines
+// other than the caller's that run code of the device pool or of a worker, or
+// were started by such code.
+func poolGoroutines() map[int]string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	found := make(map[int]string)
+	for i, stack := range strings.Split(string(buf), "\n\n") {
+		// The caller's own stack comes first.
+		if i == 0 {
+			continue
+		}
+		if !strings.Contains(stack, "/internal/device.(*Pool).") && !strings.Contains(stack, "/internal/device.(*Worker).") {
+			continue
+		}
+		var id int
+		if _, err := fmt.Sscanf(stack, "goroutine %d ", &id); err == nil {
+			found[id] = stack
+		}
+	}
+	return found
 }
 
 // rescan does what the scan for hardware does for one device: a worker whose
